@@ -405,8 +405,13 @@ C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE,
 C2P_PARAM("web.cors_origin", WebOps, STRING, LIVE, C_LTC, LIT, "", NONE, "CORS origin")
   C2P_ALIAS("web.cors_origin", BIN_LTC, "--cors-origin", VALUE)
 
-C2P_PARAM("web.analytics_id", WebOps, STRING, LIVE, C_LTC, LIT, "", NONE, "analytics id")
+C2P_PARAM("web.analytics_id", WebOps, STRING, LIVE, C_ALL, LIT, "", NONE, "Google Analytics measurement ID (G-XXXXXXXXXX): its tag and a consent bar (default denied) go into every HTML page the node serves; empty = off (default). A value that is not a measurement ID is refused on the command line and ignored with a warning in a settings file")
+  C2P_ALIAS("web.analytics_id", BIN_DASH, "--analytics-id", VALUE)
   C2P_ALIAS("web.analytics_id", BIN_LTC, "--analytics-id", VALUE)
+  C2P_ALIAS("web.analytics_id", BIN_BTC, "--analytics-id", VALUE)
+  C2P_ALIAS("web.analytics_id", BIN_DGB, "--analytics-id", VALUE)
+  C2P_ALIAS("web.analytics_id", BIN_BCH, "--analytics-id", VALUE)
+  C2P_ALIAS("web.analytics_id", BIN_BIP110, "--analytics-id", VALUE)
 
 C2P_PARAM("global.rss_limit_mb", Global, INT64, LIVE, C_LTC, LIT, "4000", NONE, "RSS limit MB (abort over)")
   C2P_ALIAS("global.rss_limit_mb", BIN_LTC, "--rss-limit-mb", VALUE)

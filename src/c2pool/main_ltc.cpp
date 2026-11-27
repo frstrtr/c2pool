@@ -49,6 +49,7 @@
 #include <core/log.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>
+#include <core/analytics_tag.hpp>         // --analytics-id / web.analytics_id
 #include <core/hash.hpp>
 #include <core/address_utils.hpp>
 #include <core/config.hpp>
@@ -719,7 +720,9 @@ void print_help() {
     std::cout << "  --payout-window N         PPLNS payout window in seconds (default: 86400)\n";
     std::cout << "  --storage-save-interval N Periodic sharechain save interval in seconds (default: 300)\n";
     std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n";
-    std::cout << "  --analytics-id ID         Google Analytics measurement ID (e.g. G-XXXXXXXXXX)\n\n";
+    std::cout << "  --analytics-id ID         Google Analytics measurement ID (G-XXXXXXXXXX): its tag and a\n";
+    std::cout << "                            consent bar (default denied) go into every HTML page the\n";
+    std::cout << "                            node serves (default: off)\n\n";
 
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -1849,7 +1852,11 @@ int main(int argc, char* argv[]) {
             cli_explicit.insert("dashboard_dir");
         }
         else if (arg == "--analytics-id" && i + 1 < argc) {
-            analytics_id = argv[++i];
+            if (!core::parse_analytics_id(argv[++i], analytics_id)) {
+                LOG_ERROR << "Bad value: --analytics-id " << argv[i]
+                          << " (expected a Google Analytics measurement ID, G-XXXXXXXXXX)";
+                return 1;
+            }
             cli_explicit.insert("analytics_id");
         }
         // Seed node: -n HOST:PORT (p2pool compat)
@@ -2122,7 +2129,8 @@ int main(int argc, char* argv[]) {
             if (!cli_explicit.count("dashboard_dir") && cfg["dashboard_dir"])
                 dashboard_dir = cfg["dashboard_dir"].as<std::string>();
             if (!cli_explicit.count("analytics_id") && cfg["analytics_id"])
-                analytics_id = cfg["analytics_id"].as<std::string>();
+                core::apply_analytics_id_setting("analytics_id", cfg["analytics_id"].as<std::string>(),
+                                                 analytics_id);
             if (cfg["explorer"])
                 explorer_enabled = cfg["explorer"].as<bool>();
             if (cfg["explorer_url"])
@@ -2248,6 +2256,9 @@ int main(int argc, char* argv[]) {
         // Apply file-sourced (L1) values into the locals the node consumes.
         if (rc.file_set("web.port"))         http_port  = static_cast<int>(rc.get_u16("web.port").value_or(static_cast<uint16_t>(http_port)));
         if (rc.file_set("web.host"))         http_host  = rc.get_string("web.host").value_or(http_host);
+        if (rc.file_set("web.analytics_id"))   // --analytics-id: a bad value is warned about and ignored
+            core::apply_analytics_id_setting("web.analytics_id", rc.get_string("web.analytics_id").value_or(""),
+                                             analytics_id);
         if (rc.file_set("stratum.http") && !cli_explicit.count("stratum_http"))   // true / false / auto
             core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""), stratum_http_mode);
         if (rc.file_set("stratum.http_budget") && !cli_explicit.count("stratum_http_budget"))

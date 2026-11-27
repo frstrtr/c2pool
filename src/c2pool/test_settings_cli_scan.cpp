@@ -151,6 +151,33 @@ int main() {
         CHECK(rc.get_string("web.port").value_or("") == "7", "ltc " + arg + " consumes no value token");
     }
 
+    // (8) --analytics-id ID on every binary with a settings file: the value is
+    //     captured into web.analytics_id with Source::Cli (so a settings-file
+    //     web.analytics_id never overrides it), and it is off (empty) when absent.
+    for (Bin b : bins) {
+        const std::string name = bin_name(b);
+        {
+            std::vector<std::string> s = {"prog", "--analytics-id", "G-TEST1234"};
+            std::vector<char*> p; for (auto& x : s) p.push_back(const_cast<char*>(x.c_str()));
+            CliTracker tr; ResolvedConfig rc; rc.seed_compiled_defaults(coin_of_bin(b));
+            scan_cli((int)p.size(), p.data(), b, tr, rc);
+            CHECK(tr.has("web.analytics_id"), name + " --analytics-id marks web.analytics_id");
+            CHECK(rc.get_string("web.analytics_id").value_or("") == "G-TEST1234",
+                  name + " --analytics-id G-TEST1234 -> web.analytics_id=G-TEST1234");
+            CHECK(rc.source_of("web.analytics_id") == Source::Cli, name + " --analytics-id source=cli");
+        }
+        {
+            std::vector<std::string> s = {"prog"};
+            std::vector<char*> p; for (auto& x : s) p.push_back(const_cast<char*>(x.c_str()));
+            CliTracker tr; ResolvedConfig rc; rc.seed_compiled_defaults(coin_of_bin(b));
+            scan_cli((int)p.size(), p.data(), b, tr, rc);
+            const ParamRow* row = find_by_canon("web.analytics_id");
+            CHECK(!tr.has("web.analytics_id") && !rc.has("web.analytics_id")
+                      && row && row->default_literal.empty(),
+                  name + " no --analytics-id -> web.analytics_id unset, compiled default off (empty)");
+        }
+    }
+
     if (g_fail == 0) std::cout << "\ntest_settings_cli_scan: ALL PASS\n";
     else std::cout << "\ntest_settings_cli_scan: " << g_fail << " FAILURE(S)\n";
     return g_fail == 0 ? 0 : 1;

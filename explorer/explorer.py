@@ -53,6 +53,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import struct
 import sys
 import threading
@@ -71,6 +72,113 @@ from html import escape
 # option existed. When set (e.g. "/explorer") it is prepended to generated
 # links and stripped from incoming request paths in ExplorerHandler.
 URL_PREFIX = ""
+
+# Google Analytics measurement ID (set from --analytics-id in main()). Empty
+# string = off (the default): every generated page is byte-identical to before
+# this option existed. When set, every HTML page gets the same tag and consent
+# bar the c2pool node puts in its own pages (src/core/analytics_tag.hpp; the
+# node's core_test checks the two produce the same bytes).
+ANALYTICS_ID = ""
+
+_ANALYTICS_ID_RE = re.compile(r"G-[A-Z0-9]{4,20}|UA-[0-9]{4,10}-[0-9]{1,4}", re.ASCII)
+_ANALYTICS_MARKER = "<!-- c2pool-analytics -->"
+_ANALYTICS_CONSENT_MARKER = "<!-- c2pool-analytics-consent -->"
+_ANALYTICS_CONSENT_KEY = "c2pool_ga_consent"
+
+
+def is_valid_analytics_id(value):
+    """A measurement ID the explorer will put in a page: "G-" + 4..20 of
+    [A-Z0-9], or "UA-" + 4..10 digits + "-" + 1..4 digits. Nothing else."""
+    return isinstance(value, str) and _ANALYTICS_ID_RE.fullmatch(value) is not None
+
+
+def analytics_head_snippet(analytics_id, restore_choice):
+    """The <head> part: consent defaults (all denied), the stored-choice
+    restore when the page also gets the consent bar, gtag.js, then config."""
+    s = (_ANALYTICS_MARKER + "\n<script>\n"
+         "window.dataLayer=window.dataLayer||[];\n"
+         "function gtag(){dataLayer.push(arguments);}\n"
+         "gtag('consent','default',{analytics_storage:'denied',ad_storage:'denied',"
+         "ad_user_data:'denied',ad_personalization:'denied'});\n")
+    if restore_choice:
+        s += ("try{if(window.localStorage.getItem('" + _ANALYTICS_CONSENT_KEY +
+              "')==='granted'){gtag('consent','update',{analytics_storage:'granted'});}}catch(e){}\n")
+    s += ("</script>\n"
+          "<script async src=\"https://www.googletagmanager.com/gtag/js?id=" + analytics_id +
+          "\"></script>\n"
+          "<script>\n"
+          "gtag('js',new Date());\n"
+          "gtag('config','" + analytics_id + "');\n"
+          "</script>\n")
+    return s
+
+
+def analytics_consent_banner():
+    """The consent bar, put before </body>: Accept grants analytics_storage
+    only, Decline keeps it denied; the choice is kept in localStorage."""
+    return (_ANALYTICS_CONSENT_MARKER + "\n"
+            "<div id=\"c2pool-ga-consent\" role=\"region\" aria-label=\"Analytics consent\" "
+            "style=\"display:none;position:fixed;left:8px;right:8px;bottom:8px;z-index:2147483647;"
+            "box-sizing:border-box;max-width:560px;margin:0 auto;padding:6px 10px;"
+            "align-items:center;flex-wrap:wrap;gap:6px 12px;"
+            "background:#f5f5f5;color:#111;border:1px solid #777;border-radius:6px;"
+            "box-shadow:0 2px 8px rgba(0,0,0,.35);"
+            "font:13px/1.4 -apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;text-align:left\">\n"
+            "<span style=\"flex:1 1 auto;color:#111\">This site uses Google Analytics cookies to count visits.</span>\n"
+            "<span style=\"display:inline-flex;gap:6px\">"
+            "<button type=\"button\" data-c2pool-ga=\"granted\" "
+            "style=\"margin:0;padding:3px 12px;border:1px solid #111;border-radius:4px;"
+            "background:#111;color:#fff;font:inherit;font-weight:600;cursor:pointer\">Accept</button>"
+            "<button type=\"button\" data-c2pool-ga=\"denied\" "
+            "style=\"margin:0;padding:3px 12px;border:1px solid #777;border-radius:4px;"
+            "background:#fff;color:#111;font:inherit;cursor:pointer\">Decline</button>"
+            "</span>\n"
+            "</div>\n"
+            "<script>\n"
+            "(function(){\n"
+            "var k='" + _ANALYTICS_CONSENT_KEY +
+            "',bar=document.getElementById('c2pool-ga-consent'),v=null,pad=null;\n"
+            "if(!bar){return;}\n"
+            "try{v=window.localStorage.getItem(k);}catch(e){}\n"
+            "if(v==='granted'||v==='denied'){bar.parentNode.removeChild(bar);return;}\n"
+            "function pick(c){\n"
+            "try{window.localStorage.setItem(k,c);}catch(e){}\n"
+            "if(c==='granted'&&typeof gtag==='function'){gtag('consent','update',{analytics_storage:'granted'});}\n"
+            "if(pad&&pad.parentNode){pad.parentNode.removeChild(pad);}\n"
+            "if(bar.parentNode){bar.parentNode.removeChild(bar);}\n"
+            "}\n"
+            "var b=bar.getElementsByTagName('button');\n"
+            "for(var i=0;i<b.length;i++){b[i].onclick=function(){pick(this.getAttribute('data-c2pool-ga'));};}\n"
+            "bar.style.display='flex';\n"
+            "pad=document.createElement('div');\n"
+            "pad.style.height=(bar.offsetHeight+16)+'px';\n"
+            "bar.parentNode.insertBefore(pad,bar);\n"
+            "})();\n"
+            "</script>\n")
+
+
+def inject_analytics_tag(html, analytics_id):
+    """Put the tag in one HTML page, at most once: the <head> part before the
+    first </head>, the consent bar before the last </body>. Nothing is put in
+    for an empty or invalid ID, a page without </head>, or a page that already
+    carries a gtag.js tag; without </body> only the <head> part goes in, with
+    consent left denied. Returns the (possibly unchanged) page."""
+    if not analytics_id or not is_valid_analytics_id(analytics_id):
+        return html
+    if _ANALYTICS_MARKER in html or "googletagmanager.com/gtag/js" in html:
+        return html
+    head = re.search(r"</head>", html, re.IGNORECASE | re.ASCII)
+    if head is None:
+        return html
+    body = None
+    for m in re.finditer(r"</body>", html, re.IGNORECASE | re.ASCII):
+        body = m
+    if body is not None and body.start() < head.start():
+        body = None
+    if body is not None:
+        html = html[:body.start()] + analytics_consent_banner() + html[body.start():]
+    h = head.start()
+    return html[:h] + analytics_head_snippet(analytics_id, body is not None) + html[h:]
 
 # ============================================================================
 # COIN PROFILES — data-driven per-coin configuration.
@@ -2070,6 +2178,11 @@ class ExplorerHandler(http.server.BaseHTTPRequestHandler):
                        .replace('href="/', f'href="{URL_PREFIX}/')
                        .replace('action="/', f'action="{URL_PREFIX}/')
                        .replace('EventSource("/', f'EventSource("{URL_PREFIX}/'))
+        # Analytics tag + consent bar on every HTML page (--analytics-id).
+        if ANALYTICS_ID and content_type.startswith("text/html"):
+            if isinstance(content, bytes):
+                content = content.decode()
+            content = inject_analytics_tag(content, ANALYTICS_ID)
         if isinstance(content, str):
             content = content.encode()
         self.wfile.write(content)
@@ -2261,7 +2374,16 @@ def main():
                         help="Serve under a sub-path (e.g. /explorer) behind a reverse "
                              "proxy. Prepended to every generated link and stripped from "
                              "incoming request paths. Default \"\" = root (byte-identical).")
+    parser.add_argument("--analytics-id", default="", metavar="ID",
+                        help="Google Analytics measurement ID (G-XXXXXXXXXX): its tag and a "
+                             "consent bar (default denied) go into every HTML page. "
+                             "Default \"\" = off.")
     args = parser.parse_args()
+    if args.analytics_id and not is_valid_analytics_id(args.analytics_id):
+        parser.error("bad value: --analytics-id %s (expected a Google Analytics "
+                     "measurement ID, G-XXXXXXXXXX)" % args.analytics_id)
+    global ANALYTICS_ID
+    ANALYTICS_ID = args.analytics_id
 
     # URL sub-path support (reverse-proxy mount). Normalised to leading-slash,
     # no trailing slash; empty string leaves every generated page byte-identical.

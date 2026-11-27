@@ -78,6 +78,7 @@
 #include <core/log.hpp>
 #include <core/stratum_server.hpp>
 #include <core/web_server.hpp>       // H-STATS.944: operator dashboard + graph_db persist
+#include <core/analytics_tag.hpp>    // --analytics-id (core::analytics_id_setting)
 #include <core/config_endpoint.hpp>  // M1 control-plane READ-ONLY endpoints
 #include <core/filesystem.hpp>      // config_path() for the graph_db location
 #include <core/found_block_lookups.hpp> // header-bits difficulty by block hash
@@ -857,6 +858,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         // src/impl/bch only (PER-COIN ISOLATION); zero src/core edits.
         mi->set_dashboard_always_ready(true);
         web_server->set_dashboard_dir("web-static");
+        web_server->set_analytics_id(core::analytics_id_setting());   // --analytics-id (default off)
 
         // D-BCH dashboard feeds (integrator 2026-08-03): wire the live BCH
         // data sources into the MiningInterface the H-STATS.944 seam already

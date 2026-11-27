@@ -87,6 +87,7 @@
 #include <core/hash.hpp>
 #include <core/stratum_server.hpp>
 #include <core/address_utils.hpp>       // core::address_to_script (node-owner fee destination)
+#include <core/analytics_tag.hpp>        // --analytics-id / web.analytics_id
 #include <core/web_server.hpp>          // H-STATS.944: operator dashboard + graph_db persist
 #include <btclibs/util/strencodings.h>
 
@@ -164,6 +165,9 @@ static void print_usage()
         "                  at once from one address, one /64 for IPv6: at most N;\n"
         "                  others are answered 503 (default 6; 0 = no limit below\n"
         "                  --stratum-http-budget).\n"
+        "  --analytics-id ID  Google Analytics measurement ID (G-XXXXXXXXXX): its\n"
+        "                  tag and a consent bar (default denied) go into every\n"
+        "                  HTML page the --http dashboard serves. default off.\n"
         "  --sharechain-port P  bind the sharechain (pool P2P) listener on\n"
         "                  port P instead of the default 9333, so a SECOND\n"
         "                  isolated c2pool-btc instance can run on one host\n"
@@ -472,6 +476,14 @@ int main(int argc, char* argv[])
             dev_donation    = std::strtod(argv[++i], nullptr);
             give_author_set = true;
         }
+        else if (arg == "--analytics-id" && i + 1 < argc)
+        {
+            if (!core::parse_analytics_id(argv[++i], core::analytics_id_setting())) {
+                std::cerr << "bad value: --analytics-id " << argv[i]
+                          << " (expected a Google Analytics measurement ID, G-XXXXXXXXXX)\n";
+                return 1;
+            }
+        }
         else if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0)
         {
             // --stratum-http[=true|false|auto]: the web API on the stratum port
@@ -541,6 +553,9 @@ int main(int argc, char* argv[])
             else { h = v.substr(0, c); p = static_cast<uint16_t>(std::stoi(v.substr(c + 1))); }
         };
         if (rc.file_set("web.port"))          http_port = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
+        if (rc.file_set("web.analytics_id"))   // --analytics-id: a bad value is warned about and ignored
+            core::apply_analytics_id_setting("web.analytics_id", rc.get_string("web.analytics_id").value_or(""),
+                                             core::analytics_id_setting());
         if (rc.file_set("stratum.http"))   // --stratum-http: true / false / auto
             core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""),
                                              core::stratum_http_mode_setting());
@@ -2792,6 +2807,7 @@ int main(int argc, char* argv[])
         // web-static so "/" resolves. Display-only — no share/reward/consensus.
         mi->set_dashboard_always_ready(true);
         web_server->set_dashboard_dir("web-static");
+        web_server->set_analytics_id(core::analytics_id_setting());   // --analytics-id (default off)
 
         // D-BTC dashboard feeds (integrator 2026-08-03): mirror of D-BCH
         // (PR #1055) into the live MiningInterface the H-STATS.944 seam already

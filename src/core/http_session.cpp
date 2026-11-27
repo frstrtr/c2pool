@@ -16,6 +16,7 @@
 
 #include <core/host_port.hpp>
 #include "web_server.hpp"
+#include "analytics_tag.hpp"       // --analytics-id: the tag in every served HTML page
 #include "config_endpoint.hpp"   // #157 Slice B: check_control_token() on the submit route
 #include "filesystem.hpp"
 #include "p2p_message_stats.hpp"
@@ -1501,24 +1502,10 @@ void HttpSession::process_request()
                         std::string contents((std::istreambuf_iterator<char>(file)),
                                              std::istreambuf_iterator<char>());
 
-                        // Inject analytics tag into HTML pages if configured
-                        const auto& analytics_id = mining_interface_->get_analytics_id();
-                        if (!analytics_id.empty() && (ext == ".html" || ext == ".htm")) {
-                            auto pos = contents.find("</head>");
-                            if (pos == std::string::npos) pos = contents.find("</HEAD>");
-                            if (pos != std::string::npos) {
-                                std::string tag =
-                                    "<!-- analytics -->\n"
-                                    "<script async src=\"https://www.googletagmanager.com/gtag/js?id=" + analytics_id + "\"></script>\n"
-                                    "<script>\n"
-                                    "window.dataLayer=window.dataLayer||[];\n"
-                                    "function gtag(){dataLayer.push(arguments);}\n"
-                                    "gtag('js',new Date());\n"
-                                    "gtag('config','" + analytics_id + "');\n"
-                                    "</script>\n";
-                                contents.insert(pos, tag);
-                            }
-                        }
+                        // Analytics tag + consent bar (core/analytics_tag.hpp), when
+                        // --analytics-id / web.analytics_id is set.
+                        if (ext == ".html" || ext == ".htm")
+                            core::inject_analytics_tag(contents, mining_interface_->get_analytics_id());
 
                         // Per-coin payout-scheme label (empty on every coin but
                         // c2pool-v37-xmr, whose scheme is WRS / PPR, never PPLNS).
