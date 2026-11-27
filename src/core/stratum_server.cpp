@@ -20,6 +20,9 @@
 #include <cstring>
 #include <exception>
 #include <boost/algorithm/string.hpp>
+#ifndef _WIN32
+#include <signal.h>   // sigaction: the SIGHUP disposition the TLS listener restores
+#endif
 #ifdef __linux__
 #include <cerrno>
 #include <sys/socket.h>
@@ -351,6 +354,435 @@ StratumServer::http_error_logger(const std::string& peer_ip) const
     };
 }
 
+// ── The TLS listener (core/stratum_tls.hpp) ─────────────────────────────────
+// A second acceptor feeding admit(), the plain listener's admission path, with
+// the certificate store's current context: same caps, same sessions.
+
+#ifndef _WIN32
+namespace {
+// SIGHUP's disposition before the first TLS listener of the process took it,
+// and how many listeners hold it now. A process normally has one TLS
+// listener; with several, the disposition goes back when the last closes
+// (asio keeps its handler while any signal_set still has SIGHUP).
+struct HupState {
+    std::mutex mutex;
+    int open = 0;
+    struct sigaction saved {};
+    bool saved_ok = false;
+};
+HupState& hup_state()
+{
+    static HupState s;
+    return s;
+}
+void hup_listener_opened()
+{
+    auto& st = hup_state();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    if (st.open++ == 0)
+        st.saved_ok = ::sigaction(SIGHUP, nullptr, &st.saved) == 0;
+}
+void hup_listener_closed()
+{
+    auto& st = hup_state();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    if (st.open > 0 && --st.open == 0 && st.saved_ok)
+        ::sigaction(SIGHUP, &st.saved, nullptr);
+}
+}  // namespace
+#endif
+
+struct StratumServer::TlsListener {
+    TlsListener(net::io_context& ioc, const TlsOptions& o)
+        : acceptor(ioc)
+        , certs(o.cert_file, o.key_file)
+        , limiter(o.accept_rate, o.accept_burst, o.accept_rate_per_ip, o.accept_burst_per_ip)
+        , options(o)
+#ifndef _WIN32
+        , reload_signal(ioc)
+#endif
+    {
+    }
+    tcp::acceptor acceptor;
+    StratumTlsCertStore certs;
+    StratumTlsAcceptLimiter limiter;        // io-thread state
+    StratumTlsHandshakeGate handshake_gate;
+    TlsOptions options;
+    std::string bind_address;
+    uint16_t port = 0;
+#ifndef _WIN32
+    net::signal_set reload_signal;   // SIGHUP: re-read the certificate and key
+    bool hup_registered = false;     // counted in hup_listener_opened()
+#endif
+    // Failed handshakes: one line, then the rest of the minute counted into
+    // the next one. io-thread state.
+    RefusalLogLimiter failure_log{std::chrono::seconds(60)};
+    std::atomic<uint64_t> failure_log_lines{0};
+    std::atomic<uint64_t> handshakes{0};
+    std::atomic<uint64_t> failures{0};
+    std::atomic<uint64_t> refused_rate{0};
+    std::atomic<uint64_t> refused_rate_per_ip{0};
+    std::atomic<uint64_t> refused_handshakes{0};
+};
+
+bool StratumServer::start_tls(const TlsOptions& options, std::string* error)
+{
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    if (!running_)
+        return fail("the stratum listener is not running");
+    if (tls_)
+        return fail("the TLS listener is already open");
+    if (!stratum_tls_supported())
+        return fail("this build has no TLS support (built without OpenSSL: CMake option C2POOL_STRATUM_TLS=OFF)");
+    const std::string host = options.bind_address.empty() ? bind_address_ : options.bind_address;
+    if (options.port != 0 && options.port == port_ && host == bind_address_)
+        return fail(host + ":" + std::to_string(options.port) + " is the plain stratum listener's own address");
+    auto l = std::make_unique<TlsListener>(ioc_, options);
+    std::string why;
+    if (!l->certs.reload(why))
+        return fail(why);
+    try {
+        const tcp::endpoint endpoint{net::ip::make_address(host), options.port};
+        l->acceptor.open(endpoint.protocol());
+        l->acceptor.set_option(net::socket_base::reuse_address(true));
+        l->acceptor.bind(endpoint);
+        l->acceptor.listen(net::socket_base::max_listen_connections);
+        l->port = l->acceptor.local_endpoint().port();
+    } catch (const std::exception& e) {
+        return fail("cannot listen on " + host + ":" + std::to_string(options.port) + ": " + e.what());
+    }
+    l->bind_address = host;
+#ifndef _WIN32
+    // SA_RESTART: a restartable system call interrupted by SIGHUP in another
+    // thread resumes instead of failing with EINTR. Waits that are never
+    // restarted (poll, epoll_wait, and so zmq receives) still see EINTR and
+    // retry themselves. The disposition before (SIG_IGN under nohup, say) is
+    // put back when the last TLS listener of the process closes.
+    hup_listener_opened();
+    l->hup_registered = true;
+    boost::system::error_code sig_ec;
+    l->reload_signal.add(SIGHUP, net::signal_set::flags::restart, sig_ec);
+    if (sig_ec)
+        LOG_WARNING << "stratum TLS: SIGHUP will not re-read the certificate: " << sig_ec.message();
+#endif
+    tls_ = std::move(l);
+    accept_tls_connections();
+    arm_tls_reload_signal();
+    return true;
+}
+
+void StratumServer::accept_tls_connections()
+{
+    tls_->acceptor.async_accept(
+        [this](boost::system::error_code ec, tcp::socket socket)
+        {
+            handle_tls_accept(ec, std::move(socket));
+        });
+}
+
+void StratumServer::handle_tls_accept(boost::system::error_code ec, tcp::socket socket)
+{
+    if (ec == net::error::operation_aborted)
+        return;   // stop() closed the listener
+    std::shared_ptr<StratumTlsContext> ctx;
+    std::shared_ptr<StratumTlsHandshakeGate::Slot> slot;
+    bool refused = false;
+    if (!ec) {
+        // Before any TLS work: the accept rate (all addresses, then this
+        // address's) and the handshakes in progress (total, then this
+        // address's). Over any: closed here, counted, logged rate-limited.
+        boost::system::error_code ep_ec;
+        const auto ep = socket.remote_endpoint(ep_ec);
+        const auto key = ep_ec ? boost::asio::ip::address{} : per_ip_cap_key(ep.address());
+        const std::string peer_ip = ep_ec ? std::string{} : ep.address().to_string();
+        const std::string peer = ep_ec ? std::string{}
+            : " peer=" + peer_ip + ":" + std::to_string(ep.port());
+        const auto& o = tls_->options;
+        std::string detail;
+        const auto now = StratumTlsAcceptLimiter::clock::now();
+        // The rate is checked first and spent last: an accept the handshake
+        // bound refuses takes no token.
+        const auto verdict = tls_->limiter.check(key, now);
+        if (verdict == StratumTlsAcceptLimiter::Verdict::Rate) {
+            tls_->refused_rate.fetch_add(1);
+            std::ostringstream d;
+            d << "TLS accept rate " << o.accept_rate << "/s (burst " << o.accept_burst << ") reached";
+            detail = d.str();
+        } else if (verdict == StratumTlsAcceptLimiter::Verdict::RatePerIp) {
+            tls_->refused_rate_per_ip.fetch_add(1);
+            std::ostringstream d;
+            d << "TLS accept rate from one address, IPv6 /64, " << o.accept_rate_per_ip
+              << "/s (burst " << o.accept_burst_per_ip << ") reached";
+            detail = d.str();
+        } else if (!(slot = tls_->handshake_gate.try_acquire(
+                         key, o.max_handshakes, o.max_handshakes_per_ip, now,
+                         // Evict for the newcomer only when admit() would take it.
+                         would_admit(ep_ec ? boost::asio::ip::address{} : ep.address())
+                             ? std::chrono::duration_cast<StratumTlsHandshakeGate::clock::duration>(o.evict_after)
+                             : StratumTlsHandshakeGate::clock::duration::max()))) {
+            tls_->refused_handshakes.fetch_add(1);
+            detail = std::to_string(tls_->handshake_gate.in_progress()) + " TLS handshakes in progress, "
+                   + std::to_string(tls_->handshake_gate.in_progress_from(key))
+                   + " from one address, none older than " + std::to_string(o.evict_after.count())
+                   + " ms to evict (at most " + std::to_string(o.max_handshakes) + ", "
+                   + std::to_string(o.max_handshakes_per_ip) + " per address)";
+        } else {
+            tls_->limiter.take(key);
+        }
+        if (!detail.empty()) {
+            refused = true;
+            const uint64_t total = tls_->refused_rate.load() + tls_->refused_rate_per_ip.load()
+                                 + tls_->refused_handshakes.load();
+            // Counted by per_ip_cap_key: an IPv6 /64 is one entry.
+            log_refusal(tls_refusal_log_, ep_ec ? std::string{} : key.to_string(), peer, detail,
+                        "refused_tls_total", total);
+            boost::system::error_code ignore;
+            socket.shutdown(tcp::socket::shutdown_both, ignore);
+            socket.close(ignore);
+        } else {
+            ctx = tls_->certs.current();   // re-read first when a file changed
+            if (!ctx) {
+                refused = true;
+                boost::system::error_code ignore;
+                socket.close(ignore);
+            }
+        }
+    }
+    if (!refused)
+        admit(ec, std::move(socket), std::move(ctx), std::move(slot));
+    if (running_ && tls_->acceptor.is_open())
+        accept_tls_connections();
+}
+
+void StratumServer::arm_tls_reload_signal()
+{
+#ifndef _WIN32
+    tls_->reload_signal.async_wait([this](const boost::system::error_code& ec, int) {
+        if (ec)
+            return;   // cancelled: stop()
+        LOG_INFO << "stratum TLS: SIGHUP: re-reading the certificate and key";
+        reload_tls();
+        if (running_)
+            arm_tls_reload_signal();
+    });
+#endif
+}
+
+void StratumServer::stop_tls_listener()
+{
+    if (!tls_)
+        return;
+    boost::system::error_code ec;
+    tls_->acceptor.cancel(ec);
+    tls_->acceptor.close(ec);
+#ifndef _WIN32
+    tls_->reload_signal.cancel(ec);
+    tls_->reload_signal.clear(ec);   // asio sets SIG_DFL when no signal_set has SIGHUP left
+    if (tls_->hup_registered) {
+        tls_->hup_registered = false;
+        hup_listener_closed();       // the last one: the disposition before goes back
+    }
+#endif
+}
+
+bool StratumServer::is_tls_running() const
+{
+    return tls_ && tls_->acceptor.is_open();
+}
+
+std::string StratumServer::get_tls_bind_address() const
+{
+    return tls_ ? tls_->bind_address : std::string{};
+}
+
+uint16_t StratumServer::get_tls_port() const
+{
+    return tls_ && tls_->acceptor.is_open() ? tls_->port : 0;
+}
+
+bool StratumServer::reload_tls(std::string* error)
+{
+    if (!tls_) {
+        if (error) *error = "the TLS listener is not open";
+        return false;
+    }
+    std::string why;
+    if (!tls_->certs.reload(why)) {
+        LOG_WARNING << "stratum TLS: " << tls_->certs.cert_file() << " / " << tls_->certs.key_file()
+                    << " did not load (" << why
+                    << "); new connections keep the certificate loaded before";
+        if (error) *error = why;
+        return false;
+    }
+    LOG_INFO << "stratum TLS: reloaded " << tls_->certs.cert_file() << " / " << tls_->certs.key_file()
+             << " (" << get_tls_certificate_summary() << "); new connections use it";
+    if (auto ctx = tls_->certs.current(); ctx && stratum_tls_validity_problem(*ctx))
+        LOG_WARNING << "stratum TLS: the certificate " << tls_->certs.cert_file() << " is "
+                    << *stratum_tls_validity_problem(*ctx) << "; miners that verify it will refuse it";
+    return true;
+}
+
+uint64_t StratumServer::get_tls_reloads() const
+{
+    return tls_ ? tls_->certs.reloads() : 0;
+}
+
+uint64_t StratumServer::get_tls_reload_failures() const
+{
+    return tls_ ? tls_->certs.reload_failures() : 0;
+}
+
+uint64_t StratumServer::get_tls_handshakes() const
+{
+    return tls_ ? tls_->handshakes.load() : 0;
+}
+
+uint64_t StratumServer::get_tls_handshake_failures() const
+{
+    return tls_ ? tls_->failures.load() : 0;
+}
+
+uint64_t StratumServer::get_tls_handshake_log_lines() const
+{
+    return tls_ ? tls_->failure_log_lines.load() : 0;
+}
+
+uint64_t StratumServer::get_tls_refused_rate() const
+{
+    return tls_ ? tls_->refused_rate.load() : 0;
+}
+
+uint64_t StratumServer::get_tls_refused_rate_per_ip() const
+{
+    return tls_ ? tls_->refused_rate_per_ip.load() : 0;
+}
+
+uint64_t StratumServer::get_tls_refused_handshakes() const
+{
+    return tls_ ? tls_->refused_handshakes.load() : 0;
+}
+
+uint64_t StratumServer::get_tls_handshake_evictions() const
+{
+    return tls_ ? tls_->handshake_gate.evictions() : 0;
+}
+
+StratumServer::TlsOptions StratumServer::get_tls_options() const
+{
+    return tls_ ? tls_->options : TlsOptions{};
+}
+
+std::chrono::milliseconds StratumServer::tls_first_byte_timeout() const
+{
+    return tls_ ? tls_->options.first_byte_timeout : kStratumTlsFirstByteTimeout;
+}
+
+std::size_t StratumServer::get_tls_handshakes_in_progress() const
+{
+    return tls_ ? tls_->handshake_gate.in_progress() : 0;
+}
+
+std::chrono::milliseconds StratumServer::tls_handshake_timeout() const
+{
+    return tls_ ? tls_->options.handshake_timeout : kStratumTlsHandshakeTimeout;
+}
+
+std::string StratumServer::get_tls_certificate_summary() const
+{
+    if (!tls_)
+        return {};
+    auto ctx = tls_->certs.current();
+    return ctx ? describe_stratum_tls_context(*ctx) : std::string{};
+}
+
+std::optional<std::string> StratumServer::get_tls_certificate_validity_problem() const
+{
+    if (!tls_)
+        return std::nullopt;
+    auto ctx = tls_->certs.current();
+    return ctx ? stratum_tls_validity_problem(*ctx) : std::nullopt;
+}
+
+void StratumServer::record_tls_handshake(bool ok, const std::string& peer_key, const std::string& peer_ip,
+                                         const std::string& what)
+{
+    if (!tls_)
+        return;
+    if (ok) {
+        tls_->handshakes.fetch_add(1);
+        return;
+    }
+    const uint64_t total = tls_->failures.fetch_add(1) + 1;
+    const std::string why = printable(what, 160);
+    const auto now = RefusalLogLimiter::clock::now();
+    if (auto summary = tls_->failure_log.flush(now)) {
+        LOG_INFO << "Stratum TLS handshakes failed: " << *summary
+                 << " tls_handshake_failures_total=" << (total - 1);
+        tls_->failure_log_lines.fetch_add(1);
+    }
+    if (tls_->failure_log.record(now, peer_key, why)) {
+        LOG_INFO << "Stratum TLS handshake failed: " << why
+                 << (peer_ip.empty() ? std::string{} : " peer=" + peer_ip)
+                 << " tls_handshake_failures_total=" << total
+                 << " (the next 60 s are counted, and summarised with the first failure after)";
+        tls_->failure_log_lines.fetch_add(1);
+    }
+}
+
+bool configure_stratum_tls(StratumServer* stratum, const StratumTlsSettings& s)
+{
+    if (!s.enabled())
+        return false;
+    if (!stratum) {
+        LOG_WARNING << "stratum TLS: not started: --stratum-tls " << s.bind
+                    << " needs the stratum listener, which is disabled or did not start";
+        return false;
+    }
+    std::string host;
+    uint16_t port = 0;
+    if (!parse_stratum_tls_bind(s.bind, host, port)) {
+        LOG_ERROR << "stratum TLS: not started: --stratum-tls " << s.bind << " is not [HOST:]PORT";
+        return false;
+    }
+    StratumServer::TlsOptions options;
+    options.bind_address = host;
+    options.port = port;
+    options.cert_file = s.cert;
+    options.key_file = s.key;
+    options.accept_rate_per_ip = s.rate_per_ip;
+    options.accept_burst_per_ip = static_cast<double>(s.burst_per_ip);
+    options.max_handshakes = s.max_handshakes;
+    options.max_handshakes_per_ip = s.max_handshakes_per_ip;
+    std::string why;
+    if (!stratum->start_tls(options, &why)) {
+        // As for the plain stratum listener: logged, the node runs on
+        // without it (the flags themselves were checked at start).
+        LOG_ERROR << "stratum TLS: not started: " << why;
+        return false;
+    }
+    const std::string bound = stratum->get_tls_bind_address();
+    LOG_INFO << "stratum TLS: listening on "
+             << (bound.find(':') != std::string::npos ? "[" + bound + "]" : bound) << ":"
+             << stratum->get_tls_port() << " (stratum+ssl://, TLS 1.2+; "
+             << stratum->get_tls_certificate_summary() << "; " << s.cert << " / " << s.key
+             << " re-read when either changes, and on SIGHUP; " << stratum_tls_library_version() << ")";
+    LOG_INFO << "stratum TLS: accept limits: " << options.accept_rate << "/s in total (burst "
+             << options.accept_burst << "), " << options.accept_rate_per_ip << "/s per address (burst "
+             << options.accept_burst_per_ip << "), " << options.max_handshakes << " handshakes in progress ("
+             << options.max_handshakes_per_ip << " per address; 0 = no limit), first byte within "
+             << options.first_byte_timeout.count() << " ms, handshake within "
+             << options.handshake_timeout.count() << " ms";
+    if (auto problem = stratum->get_tls_certificate_validity_problem())
+        LOG_WARNING << "stratum TLS: the certificate " << s.cert << " is " << *problem
+                    << "; miners that verify it will refuse it";
+    if (auto problem = stratum_tls_key_permissions_problem(s.key))
+        LOG_WARNING << "stratum TLS: " << *problem;
+    return true;
+}
+
 StratumServer::~StratumServer()
 {
     stop();
@@ -390,6 +822,7 @@ void StratumServer::stop()
         boost::system::error_code ec;
         acceptor_.cancel(ec);
         acceptor_.close(ec);
+        stop_tls_listener();           // the TLS acceptor and its SIGHUP wait, if open
         idle_reap_timer_.cancel();     // stop the zombie-session reaper
         refusal_log_timer_.cancel();   // a pending refusal summary is dropped at shutdown
         running_ = false;
@@ -432,6 +865,45 @@ void StratumServer::accept_connections()
 }
 
 void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket socket)
+{
+    admit(ec, std::move(socket), nullptr);
+
+    // Continue accepting new connections
+    if (running_) {
+        accept_connections();
+    }
+}
+
+bool StratumServer::would_admit(const boost::asio::ip::address& peer) const
+{
+    // admit()'s refusals, read only: the drain gate, the node cap and the
+    // per-IP cap over the connected sessions (admit() would also close the
+    // ones the hygiene knobs condemn; not counted here, so this errs toward
+    // "no").
+    if (!accepting_.load())
+        return false;
+    const core::stratum::StratumConfig* cfg =
+        mining_interface_ ? &mining_interface_->get_stratum_config() : nullptr;
+    const size_t cap = cfg ? cfg->max_stratum_connections : 0;
+    const size_t ip_cap = cfg ? cfg->max_stratum_connections_per_ip : 0;
+    if (cap == 0 && ip_cap == 0)
+        return true;
+    const bool per_ip = ip_cap > 0 && !peer.is_unspecified();
+    const auto ip_key = per_ip ? per_ip_cap_key(peer) : boost::asio::ip::address{};
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    size_t live = http_state_->total();
+    size_t from_ip = per_ip ? http_state_->from(ip_key) : 0;
+    for (const auto& s : sessions_) {
+        if (!s->is_connected()) continue;
+        ++live;
+        if (per_ip && per_ip_cap_key(s->peer_address()) == ip_key) ++from_ip;
+    }
+    return !(cap > 0 && live >= cap) && !(per_ip && from_ip >= ip_cap);
+}
+
+void StratumServer::admit(boost::system::error_code ec, tcp::socket socket,
+                          std::shared_ptr<StratumTlsContext> tls,
+                          std::shared_ptr<StratumTlsHandshakeGate::Slot> tls_slot)
 {
     if (!ec && !accepting_.load()) {
         // ── Drain mode (#866 action 2): refuse every new connection so miners
@@ -530,17 +1002,15 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
             socket.close(ignore);
         } else {
             // Create, register, and start Stratum session
-            auto session = std::make_shared<StratumSession>(std::move(socket), mining_interface_, this);
+            auto session = std::make_shared<StratumSession>(std::move(socket), mining_interface_, this,
+                                                            std::move(tls));
+            if (tls_slot)
+                session->hold_tls_handshake_slot(std::move(tls_slot));
             register_session(session);
             session->start();
         }
     } else {
         LOG_ERROR << "Stratum accept error: " << ec.message();
-    }
-
-    // Continue accepting new connections
-    if (running_) {
-        accept_connections();
     }
 }
 
@@ -578,7 +1048,7 @@ void StratumServer::arm_refusal_log_timer()
         return;
     std::optional<RefusalLogLimiter::clock::time_point> next;
     for (const auto* lim : {&cap_refusal_log_, &per_ip_refusal_log_,
-                            &http_budget_refusal_log_, &http_share_refusal_log_})
+                            &http_budget_refusal_log_, &http_share_refusal_log_, &tls_refusal_log_})
         if (auto d = lim->due(); d && (!next || *d < *next))
             next = d;
     // Armed already for this summary or an earlier one: keep it.
@@ -616,6 +1086,11 @@ void StratumServer::flush_refusal_logs()
     if (auto summary = http_share_refusal_log_.flush(now)) {
         LOG_WARNING << "Stratum connections refused: " << *summary
                     << " refused_http_share_total=" << refused_http_share_.load();
+        refusal_lines_logged_.fetch_add(1);
+    }
+    if (auto summary = tls_refusal_log_.flush(now)) {
+        LOG_WARNING << "Stratum connections refused: " << *summary << " refused_tls_total="
+                    << (get_tls_refused_rate() + get_tls_refused_rate_per_ip() + get_tls_refused_handshakes());
         refusal_lines_logged_.fetch_add(1);
     }
     arm_refusal_log_timer();   // the other cap's summary may fall due later
@@ -849,8 +1324,8 @@ void StratumServer::start_idle_reaper()
 
 /// StratumSession Implementation
 StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
-                               StratumServer* server)
-    : socket_(std::move(socket))
+                               StratumServer* server, std::shared_ptr<StratumTlsContext> tls)
+    : socket_(std::move(socket), std::move(tls))
     , mining_interface_(mining_interface)
     , server_(server)
     , connected_at_(std::chrono::steady_clock::now())
@@ -858,6 +1333,7 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> 
     , last_notify_at_(connected_at_)
     , work_push_timer_(socket_.get_executor())
     , handshake_timer_(socket_.get_executor())
+    , tls_handshake_timer_(socket_.get_executor())
 {
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
@@ -882,10 +1358,127 @@ void StratumSession::start()
 {
     boost::system::error_code ec;
     auto ep = socket_.remote_endpoint(ec);
-    if (ec) return; // socket closed before start() was dispatched
-    LOG_INFO << "StratumSession started for client: " << ep;
+    if (ec) {        // socket closed before start() was dispatched
+        tls_handshake_slot_.reset();
+        return;
+    }
+    if (socket_.is_tls())
+        LOG_INFO << "StratumSession started for client: " << ep << " (TLS)";
+    else
+        LOG_INFO << "StratumSession started for client: " << ep;
     apply_socket_keepalive();   // OS keepalive (no-op unless enabled) -- reaps NAT-dead peers
     arm_handshake_timer();      // authorize deadline (no-op unless configured)
+    if (socket_.is_tls()) {
+        start_tls_handshake();  // then read_message()
+        return;
+    }
+    read_message();
+}
+
+void StratumSession::start_tls_handshake()
+{
+    // The TLS handshake has its own bounds, whatever the authorize deadline
+    // (which, when set, counts from the accept and so covers it too): the
+    // first byte (the ClientHello) within the first-byte timeout, the whole
+    // handshake within the handshake timeout, both from here. A client that
+    // never sends (a plaintext client waiting for the server to speak, a
+    // silent slot holder) or never finishes (a stalled scanner) is closed.
+    const auto total = server_ ? server_->tls_handshake_timeout() : kStratumTlsHandshakeTimeout;
+    const auto first = server_ ? server_->tls_first_byte_timeout() : kStratumTlsFirstByteTimeout;
+    const auto now = std::chrono::steady_clock::now();
+    tls_handshake_deadline_ = now + total;
+    tls_waiting_first_byte_ = true;
+    arm_tls_handshake_timer(now + std::min(first, total));
+    auto self = shared_from_this();
+    socket_.lowest_layer().async_wait(tcp::socket::wait_read, [self](const boost::system::error_code& ec) {
+        if (ec || !self->is_connected()) {
+            boost::system::error_code e = ec;
+            if (!e) e = boost::asio::error::operation_aborted;
+            self->finish_tls_handshake(e);
+            return;
+        }
+        self->tls_waiting_first_byte_ = false;
+        self->arm_tls_handshake_timer(self->tls_handshake_deadline_);
+        self->socket_.async_handshake([self](const boost::system::error_code& hec) {
+            self->finish_tls_handshake(hec);
+        });
+    });
+}
+
+void StratumSession::arm_tls_handshake_timer(std::chrono::steady_clock::time_point at)
+{
+    // expires_at() aborts a wait already armed (its handler sees ec), except
+    // one whose expiry is already queued with success: the generation tells
+    // that stale run apart (a ClientHello read at the first-byte boundary).
+    const uint64_t generation = ++tls_timer_generation_;
+    tls_handshake_timer_.expires_at(at);
+    std::weak_ptr<StratumSession> weak = shared_from_this();
+    tls_handshake_timer_.async_wait([weak, generation](const boost::system::error_code& ec) {
+        if (ec) return;   // re-armed, the handshake ended, or the session closed
+        auto self = weak.lock();
+        if (!self || generation != self->tls_timer_generation_) return;   // re-armed since
+        if (self->tls_handshake_done_ || !self->is_connected()) return;
+        // Closing the socket ends the pending wait or handshake, whose
+        // handler counts and logs it (rate-limited).
+        self->tls_handshake_timed_out_ = true;
+        self->cancel_timers();
+    });
+}
+
+void StratumSession::evict_tls_handshake()
+{
+    if (tls_handshake_done_ || !is_connected())
+        return;
+    tls_handshake_evicted_ = true;
+    cancel_timers();   // the pending wait or handshake ends; counted there
+}
+
+void StratumSession::hold_tls_handshake_slot(std::shared_ptr<StratumTlsHandshakeGate::Slot> slot)
+{
+    tls_handshake_slot_ = std::move(slot);
+    if (tls_handshake_slot_)
+        tls_handshake_slot_->on_evict([weak = weak_from_this()] {
+            if (auto self = weak.lock())
+                self->evict_tls_handshake();
+        });
+}
+
+void StratumSession::finish_tls_handshake(const boost::system::error_code& ec)
+{
+    tls_handshake_slot_.reset();   // the handshake is over, whatever the outcome
+    ++tls_timer_generation_;       // any expiry still queued is stale
+    tls_handshake_timer_.cancel();
+    // Closed under the handshake by stop(), a reaper or a cap (neither by the
+    // timeouts nor by an eviction): no failure, and server_ may be stopping.
+    if (ec && !is_connected() && !tls_handshake_timed_out_ && !tls_handshake_evicted_)
+        return;
+    const std::string peer_ip = peer_address_.is_unspecified() ? std::string{} : peer_address_.to_string();
+    const std::string peer_key =
+        peer_address_.is_unspecified() ? std::string{} : per_ip_cap_key(peer_address_).to_string();
+    if (ec) {
+        // A plaintext client on the TLS port, a client that refused the
+        // certificate, a timeout, an eviction: the session ends here, as a
+        // disconnect before any stratum line does.
+        if (server_) {
+            std::string what;
+            if (tls_handshake_evicted_)
+                what = "evicted: TLS handshakes in progress at their limit, this one the oldest";
+            else if (tls_handshake_timed_out_ && tls_waiting_first_byte_)
+                what = "no ClientHello within "
+                     + std::to_string(std::min(server_->tls_first_byte_timeout(), server_->tls_handshake_timeout()).count())
+                     + " ms";
+            else if (tls_handshake_timed_out_)
+                what = "no handshake within " + std::to_string(server_->tls_handshake_timeout().count()) + " ms";
+            else
+                what = ec.message();
+            server_->record_tls_handshake(false, peer_key, peer_ip, what);
+        }
+        cancel_timers();
+        return;
+    }
+    tls_handshake_done_ = true;
+    if (server_)
+        server_->record_tls_handshake(true, peer_key, peer_ip, {});
     read_message();
 }
 
@@ -1018,7 +1611,8 @@ void StratumSession::process_message(std::size_t bytes_read)
 bool StratumSession::skip_leading_blank_line(std::size_t bytes_read)
 {
     static constexpr int kMaxLeadingBlankLines = 4;
-    if (!server_ || blank_lines_skipped_ >= kMaxLeadingBlankLines
+    // HTTP on the stratum port is served on the plain listener only.
+    if (!server_ || socket_.is_tls() || blank_lines_skipped_ >= kMaxLeadingBlankLines
         || !(bytes_read == 1 || bytes_read == 2))
         return false;
     const char* bytes = static_cast<const char*>(buffer_.data().data());
@@ -1032,7 +1626,9 @@ bool StratumSession::skip_leading_blank_line(std::size_t bytes_read)
 
 bool StratumSession::try_http_handoff(std::size_t bytes_read)
 {
-    if (!server_)
+    // HTTP on the stratum port is served on the plain listener only: on a TLS
+    // connection an HTTP request line is an invalid stratum line.
+    if (!server_ || socket_.is_tls())
         return false;
     // The first line is the front of buffer_ (async_read_until's bytes_read
     // includes its '\n'); boost::asio::streambuf keeps its input contiguous.
@@ -1102,7 +1698,7 @@ bool StratumSession::try_http_handoff(std::size_t bytes_read)
 
     req->head.assign(bytes, buffered);
     buffer_.consume(buffered);
-    req->socket = std::move(socket_);
+    req->socket = std::move(socket_.lowest_layer());
 
     if (refusal != StratumServer::HttpRefusal::None) {
         server_->record_http_refusal(refusal, peer_ip, cfg.max_stratum_connections, http.limits);
@@ -3037,6 +3633,7 @@ void StratumSession::cancel_timers()
     // Timer is a member, so it outlives all its callbacks (no use-after-free).
     work_push_timer_.cancel();
     handshake_timer_.cancel();
+    tls_handshake_timer_.cancel();
     // Close socket so is_connected() returns false for any already-dequeued
     // callbacks that fire with ec=success after cancel().
     boost::system::error_code ec;
@@ -3052,7 +3649,7 @@ void StratumSession::apply_socket_keepalive()
     // normal disconnect -- socket_.is_open() alone never falsifies for a
     // half-open drop. No-op unless the coin enabled tcp_keepalive_enabled
     // (DASH, BTC, LTC).
-    apply_stratum_tcp_liveness(socket_, mining_interface_->get_stratum_config());
+    apply_stratum_tcp_liveness(socket_.lowest_layer(), mining_interface_->get_stratum_config());
 }
 
 void apply_stratum_tcp_liveness(tcp::socket& socket, const core::stratum::StratumConfig& cfg)

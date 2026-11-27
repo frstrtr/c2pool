@@ -35,6 +35,7 @@
 #include <core/featured_node.hpp>
 #include <core/stratum_types.hpp>
 #include <core/stratum_http.hpp>
+#include <core/stratum_tls.hpp>
 #include <core/hashing_elsewhere.hpp>
 #include <core/stratum_work_source.hpp>
 #include <c2pool/payout/payout_manager.hpp>
@@ -3292,6 +3293,8 @@ class WebServer
     // through (cleared in stop(); a cleared gate declines).
     StratumHttpMode stratum_http_mode_ = StratumHttpMode::Off;
     StratumHttpLimits stratum_http_limits_{};
+    // --stratum-tls for this server's own stratum acceptor (core/stratum_tls.hpp).
+    StratumTlsSettings stratum_tls_{};
     std::atomic<bool> http_serving_{false};
     struct StratumHttpGate {
         std::mutex mutex;
@@ -3388,6 +3391,10 @@ public:
     /// before start().
     void set_stratum_http_limits(StratumHttpLimits limits) { stratum_http_limits_ = limits; }
     StratumHttpMode get_stratum_http_mode() const { return stratum_http_mode_; }
+    /// --stratum-tls / --stratum-tls-cert / --stratum-tls-key for that
+    /// acceptor: its TLS listener is opened when it starts (unset: none). Set
+    /// before start().
+    void set_stratum_tls(StratumTlsSettings tls) { stratum_tls_ = std::move(tls); }
     /// The HTTP listener is up and its thread is serving.
     bool is_http_serving() const { return http_serving_.load(); }
     const std::string& get_bind_address() const { return bind_address_; }

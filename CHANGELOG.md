@@ -34,6 +34,49 @@
 - DGB is unchanged (`--redistribute` stays opt-in); a DGB spec naming `split`
   is warned about and binds no policy.
 
+### --stratum-tls: a stratum listener that speaks TLS (stratum+ssl://)
+- On plain Stratum V1 a miner cannot verify who sends it work: anything on the
+  path can pose as the pool and take the hashrate. `--stratum-tls [HOST:]PORT`
+  (every coin; settings key `stratum.tls_bind`, LTC YAML `stratum_tls`) opens
+  a second stratum listener that speaks TLS, for firmware that connects with
+  `stratum+ssl://` and verifies the pool's certificate. `PORT` alone binds the
+  plain stratum listener's address. It needs `--stratum-tls-cert FILE` (PEM,
+  the full chain; `stratum.tls_cert`, `stratum_tls_cert`) and
+  `--stratum-tls-key FILE` (PEM, no passphrase; `stratum.tls_key`,
+  `stratum_tls_key`). Default: off; without the flags nothing changes.
+- A TLS connection is an ordinary session of the same stratum server after the
+  handshake: the same JSON-RPC, vardiff and limits, the caps counted together
+  with the plain port and keyed on the real remote address, the same refusal
+  log, drain mode, miner list and dashboard rows.
+- TLS 1.2 and 1.3 only (TLS 1.2 suites: ECDHE with AES-GCM or
+  ChaCha20-Poly1305), no compression, no renegotiation, no session
+  resumption, no client certificates. A handshake not done 10 s after the
+  accept, or one that fails, closes the connection; failures are counted and
+  logged at most once a minute.
+- The certificate and key are read again when either file's modification time
+  or size changes (checked at each new connection) and on SIGHUP. New
+  connections use the new pair, open ones keep theirs; a pair that does not
+  load is logged and the last good one stays in use.
+- New TLS connections are limited before the handshake: 200/s from all
+  addresses (burst 400), 5/s from one address or IPv6 /64 (burst 20), at most
+  32 handshakes in progress (8 per address); the per-address rate and burst
+  and both handshake limits are settings (`--stratum-tls-rate-per-ip`,
+  `--stratum-tls-burst-per-ip`, `--stratum-tls-handshakes`,
+  `--stratum-tls-handshakes-per-ip`; keys `stratum.tls_*`). Over a limit:
+  closed at the accept, counted, logged rate-limited per address (IPv6 /64).
+  At the handshake limit the oldest handshake in progress 1.5 s or more is
+  evicted for the new connection. No byte 3 s after the accept: closed. The
+  plain port is not limited. An ECDSA P-256 certificate is recommended.
+- HTTP on the stratum port (`--stratum-http`) stays on the plain port.
+- `--version` names `tls=on` or `tls=off` on every binary.
+- An incomplete set of flags, a host that is not an IP address, or a
+  certificate or key that does not load is refused at start.
+- Build: CMake option `C2POOL_STRATUM_TLS` (OpenSSL >= 1.1.1 via
+  `find_package(OpenSSL)`). Not set: ON on Linux when OpenSSL is found, OFF on
+  macOS and Windows. `C2POOL_STRATUM_TLS_STATIC_OPENSSL` (default ON) links
+  the static libraries, so no binary gains a shared-library dependency. A
+  build without TLS refuses the three flags.
+
 ### With --stratum-http on, the REST API answers on the stratum port too
 - python p2pool served its web API on the worker port, and p2pool-aware
   trackers (miningpoolstats and others) poll `http://host:<worker port>/global_stats`.

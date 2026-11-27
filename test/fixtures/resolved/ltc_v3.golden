@@ -1,0 +1,9 @@
+meta.data_dir=<DATADIR> source=cli
+money.give_author_pct=0.1 source=compiled
+sharechain.listen=0.0.0.0:9326 source=compiled
+stratum.tls_bind=3334 source=cli
+stratum.tls_cert=/etc/c2pool/fullchain.pem source=cli
+stratum.tls_handshakes_per_ip=0 source=cli
+stratum.tls_key=/etc/c2pool/privkey.pem source=cli
+stratum.tls_rate_per_ip=2.5 source=cli
+web.port=8080 source=compiled

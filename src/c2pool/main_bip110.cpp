@@ -138,6 +138,21 @@ void print_banner(const char* argv0)
         "                       once from one address, one /64 for IPv6: at most N;\n"
         "                       others are answered 503 (default 6; 0 = no limit\n"
         "                       below --stratum-http-budget)\n"
+        "  --stratum-tls [HOST:]PORT  a second stratum listener that speaks TLS\n"
+        "                       (stratum+ssl://), so miners can verify the pool's\n"
+        "                       certificate; PORT alone binds the --stratum host.\n"
+        "                       Same sessions, limits and miner list as the plain\n"
+        "                       port; TLS 1.2+, no client certificates (default off)\n"
+        "  --stratum-tls-cert FILE  PEM certificate chain (leaf first) for\n"
+        "                       --stratum-tls; re-read with the key when either\n"
+        "                       file changes, and on SIGHUP\n"
+        "  --stratum-tls-key FILE  PEM private key for --stratum-tls (no passphrase)\n"
+        "  --stratum-tls-rate-per-ip R / --stratum-tls-burst-per-ip N  TLS accepts a\n"
+        "                       second from one address (IPv6: one /64) and how many\n"
+        "                       back to back (default 5 and 20; 0 = no limit)\n"
+        "  --stratum-tls-handshakes N / --stratum-tls-handshakes-per-ip N  TLS\n"
+        "                       handshakes in progress at once, in total and from one\n"
+        "                       address (default 32 and 8; 0 = no limit)\n"
         "  --node-owner-address ADDR  subsidy fallback / donation payout when a\n"
         "                       miner has no resolvable payout address (base58/bech32)\n"
         "  --bip110-sharechain  ARM the M3 v36 sharechain MINT (DEFAULT OFF): start\n"
@@ -2850,6 +2865,8 @@ int run_embedded(bool coin_p2p_discover,
         core::configure_stratum_http(*stratum_server, web_server.get(),
                                      core::stratum_http_mode_setting(),
                                      core::stratum_http_limits_setting());
+    // The TLS stratum listener (--stratum-tls), when set.
+    core::configure_stratum_tls(stratum_server.get(), core::stratum_tls_setting());
 
     // Periodic tip log — the live-proof capture line.
     auto tip_timer = std::make_shared<io::steady_timer>(ioc);
@@ -3040,7 +3057,10 @@ int main(int argc, char** argv)
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--version") { std::printf("c2pool-bip110 %s\n", C2POOL_VERSION); return 0; }
+        if (arg == "--version") {   // tls=: the TLS stratum listener is built in (on) or not
+            std::printf("c2pool-bip110 %s tls=%s\n", C2POOL_VERSION, core::stratum_tls_supported() ? "on" : "off");
+            return 0;
+        }
         if (arg == "--help" || arg == "-h") { print_banner(argv[0]); return 0; }
         else if (arg == "--selftest") { selftest = true; run = false; }
         else if (arg == "--run") { run = true; selftest = false; }
@@ -3106,6 +3126,27 @@ int main(int argc, char** argv)
                 return 1;
             }
         }
+        // --stratum-tls [HOST:]PORT / --stratum-tls-cert FILE / --stratum-tls-key
+        // FILE: the TLS stratum listener (core/stratum_tls.hpp); checked once
+        // every flag is read (check_stratum_tls_settings).
+        else if (arg == "--stratum-tls" && i + 1 < argc) {
+            core::stratum_tls_setting().bind = argv[++i];
+        }
+        else if (arg == "--stratum-tls-cert" && i + 1 < argc) {
+            core::stratum_tls_setting().cert = argv[++i];
+        }
+        else if (arg == "--stratum-tls-key" && i + 1 < argc) {
+            core::stratum_tls_setting().key = argv[++i];
+        }
+        else if ((arg == "--stratum-tls-rate-per-ip" || arg == "--stratum-tls-burst-per-ip"
+                  || arg == "--stratum-tls-handshakes" || arg == "--stratum-tls-handshakes-per-ip")
+                 && i + 1 < argc) {
+            std::string err;
+            if (!core::parse_stratum_tls_limit_flag(arg, argv[++i], core::stratum_tls_setting(), err)) {
+                std::fprintf(stderr, "c2pool-bip110: %s\n", err.c_str());
+                return 1;
+            }
+        }
         else if ((arg == "--node-owner-address" || arg == "--donation") && i + 1 < argc) {
             donation_address = argv[++i];
         }
@@ -3136,6 +3177,15 @@ int main(int argc, char** argv)
                 static_cast<uint16_t>(std::stoi(ep.substr(colon + 1))));
         }
     }
+
+    // --stratum-tls / --stratum-tls-cert / --stratum-tls-key: a complete set
+    // this build supports, whose certificate and key load; else refused here.
+    if (auto why = core::check_stratum_tls_settings(core::stratum_tls_setting())) {
+        std::fprintf(stderr, "c2pool-bip110: %s\n", why->c_str());
+        return 1;
+    }
+    if (!run && core::stratum_tls_setting().any_set())
+        std::fprintf(stderr, "c2pool-bip110: warning: --stratum-tls has no effect without --run (no stratum listener)\n");
 
     if (run) {
         if (!coin_p2p_discover && explicit_peers.empty()) {
