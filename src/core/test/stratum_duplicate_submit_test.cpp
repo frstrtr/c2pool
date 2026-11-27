@@ -333,6 +333,7 @@ TEST(StratumDuplicateSubmit, OnlyTheCanonicalSpellingIsTaken)
     v.push_back(Submit{"0000000", "6ae2a090", "00000002", ""});      // extranonce2 one digit short
     v.push_back(Submit{"0000000000", "6ae2a090", "00000002", ""});   // and one byte long
     v.push_back(Submit{"00000000", "6ae2a09", "00000002", ""});      // ntime short
+    v.push_back(Submit{"00000000", "6ae2a0900", "00000002", ""});    // ntime 9 digits
     v.push_back(Submit{"00000000", "6ae2a090", "00000002", "1fffe0000"});   // version_bits 9 digits
     v.push_back(Submit{"00000000", "6ae2a090", "00000001", ""});      // the canonical one again
     const auto r = run_submits(true, v, 256);

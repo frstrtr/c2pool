@@ -32,6 +32,11 @@
 #include <system_error>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace dgb {
 
 /// Bump whenever a change makes shares verified by an older build untrustworthy.
@@ -93,6 +98,13 @@ bool reverify_store_if_rules_changed(StorageT& storage, const std::filesystem::p
     std::error_code ec;
     std::filesystem::create_directories(marker.parent_path(), ec);
     core::durable_file::replace(marker.string(), std::string(kDgbShareRulesEpoch) + "\n");
+#if !defined(_WIN32)
+    // The rename itself is durable once its directory is synced.
+    if (const int dfd = ::open(marker.parent_path().c_str(), O_RDONLY | O_DIRECTORY); dfd >= 0) {
+        (void)::fsync(dfd);
+        ::close(dfd);
+    }
+#endif
     if (read_rules_epoch(marker) != kDgbShareRulesEpoch)
         LOG_ERROR << "[Pool] the DGB share rules marker " << marker.string()
                   << " cannot be written: the store's flags are cleared, and are checked again on the next start";
