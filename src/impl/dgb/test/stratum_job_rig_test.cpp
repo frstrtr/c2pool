@@ -703,12 +703,12 @@ TEST(DgbStratumJobs, ANamedDogeAddressIsCaseFourNotSplit)
     EXPECT_EQ(p, owner);
 }
 
-// The same through a real core::StratumServer with DOGE configured: each
-// login form that names a DOGE address and no DGB one is either refused at
-// authorize (the core does not read an empty primary in that form: safe,
-// nothing is paid elsewhere) or gets a case-4 job (the DGB parent is the DOGE
-// P2SH script, the node's donation); never a split job. At least one form
-// reaches case 4.
+// The same through a real core::StratumServer with DOGE configured, per login
+// form that names a DOGE address and no DGB one (review c6c1c0cff NIT 3):
+// the comma, pipe, semicolon and space forms are refused at authorize (the
+// core reads no empty primary in them: nothing is paid); "/98:DOGEADDR" and
+// mining.set_merged_addresses get case-4 jobs (the DGB parent is the DOGE
+// P2SH script, the node's donation). Never a split job.
 TEST(DgbStratumJobs, NamedDogeLoginFormsAreCaseFourThroughTheServer)
 {
     const Bytes owner{0x76, 0xa9, 0x14, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
@@ -717,10 +717,10 @@ TEST(DgbStratumJobs, NamedDogeLoginFormsAreCaseFourThroughTheServer)
                                  0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x4b, 0x87};
     const std::string doge = core::script_to_address(doge_p2sh_script, "", 30, 22);   // DOGE mainnet P2SH
     ASSERT_FALSE(doge.empty());
-    struct Form { const char* name; std::string login; bool set_merged; };
-    int case4 = 0;
-    for (const Form& f : {Form{"comma", "," + doge, false}, Form{"slash", "/98:" + doge, false},
-                          Form{"pipe", "|" + doge, false}, Form{"set_merged_addresses", "", true}}) {
+    struct Form { const char* name; std::string login; bool set_merged; bool refused; };
+    for (const Form& f : {Form{"comma", "," + doge, false, true}, Form{"slash", "/98:" + doge, false, false},
+                          Form{"pipe", "|" + doge, false, true}, Form{"semicolon", ";" + doge, false, true},
+                          Form{"space", " " + doge, false, true}, Form{"set_merged_addresses", "", true, false}}) {
         SCOPED_TRACE(f.name);
         JobRig rig;
         boost::asio::io_context mioc;
@@ -756,6 +756,7 @@ TEST(DgbStratumJobs, NamedDogeLoginFormsAreCaseFourThroughTheServer)
         auto auth = c.pump(2000, 2);
         ASSERT_TRUE(auth.has_value());
         const bool accepted = (*auth)["result"].is_boolean() && (*auth)["result"].get<bool>();
+        EXPECT_EQ(accepted, !f.refused) << *auth;
         if (!accepted)
             continue;   // refused: nothing is paid for the login
         for (int i = 0; i < 40; ++i) {
@@ -770,7 +771,5 @@ TEST(DgbStratumJobs, NamedDogeLoginFormsAreCaseFourThroughTheServer)
             EXPECT_EQ(rig.payouts[i], doge_p2sh_script) << "the login's job is not case 4";
             EXPECT_FALSE(rig.donations[i].has_value()) << "the login's job was split";
         }
-        ++case4;
     }
-    EXPECT_GE(case4, 1) << "no login form reached case 4";
 }
