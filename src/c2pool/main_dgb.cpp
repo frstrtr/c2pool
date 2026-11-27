@@ -68,6 +68,7 @@
 #include <impl/dgb/stratum_job_push.hpp>        // clean jobs on a new tip / best share (1 s watch)
 #include <impl/dgb/stratum_work_gate.hpp>        // no work without sharechain peers / digibyted contact
 #include <impl/dgb/sharechain_stats.hpp>         // dashboard sharechain stats (guarded)
+#include <impl/dgb/dashboard_sharechain.hpp>     // delta / share page / current payouts (core::sharechain_views)
 #include <impl/dgb/coin/work_ref_hash.hpp>      // make_work_ref_hash_params (ref preimage SSOT)
 #include <impl/dgb/coin/coinbase_scriptsig.hpp>   // build_coinbase_scriptsig (BIP34 height + /c2pool-dgb/ tag, #902)
 #include <impl/dgb/run_loop_mint.hpp>              // parse_min_header_80 + mint_local_share_at_frozen_version (#884/#294)
