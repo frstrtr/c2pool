@@ -65,6 +65,7 @@
 #include "coin/template_builder.hpp" // bch::coin::get_block_subsidy (display Current Payouts subsidy)
 #include "dashboard_pplns.hpp"  // bch::dashboard::pplns_payouts_current — pool-wide Current Payouts read-model (#1508, read-only)
 #include "dashboard_sharechain.hpp" // bch::dashboard window / delta / tip / share detail / stats (read-only)
+#include "dashboard_start.hpp"      // bch::start_dashboard (a failed bind keeps the server)
 #include "config_coin.hpp"      // bch::address_acceptance (#961 cross-lane payout publish)
 #include "coin/cashaddr.hpp"    // bch::coin::cashaddr::register_cashaddr_decoder (#961 CashAddr payout)
 #include "share_check.hpp"      // bch::create_local_share (transitive via node.hpp)
@@ -1291,7 +1292,9 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             LOG_INFO << "[BCH-POOL] graph_db stats persistence -> " << graph_db_path;
         }
 
-        if (web_server->start()) {
+        // A failed bind keeps the server (dashboard_start.hpp): the hooks
+        // installed above hold `mi` for the whole run.
+        if (start_dashboard(web_server, http_addr, http_port)) {
             // LTC-parity site 3/3: periodic save_stat_log every 100s (matches
             // p2pool graph_db + main_ltc.cpp:7429). Self-rescheduling steady_timer
             // on the SAME ioc the run-loop drives; captured by shared_ptr so it
@@ -1308,10 +1311,6 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             stats_timer->async_wait(*save_fn);
             LOG_INFO << "[BCH-POOL] dashboard live on http://" << http_addr << ":"
                      << http_port << " (graph_db persist every 100s).";
-        } else {
-            LOG_ERROR << "[BCH-POOL] WebServer FAILED to bind " << http_addr << ":"
-                      << http_port << " -- dashboard disabled, run-loop continues.";
-            web_server.reset();
         }
         } // if (mi != nullptr)
     } else {

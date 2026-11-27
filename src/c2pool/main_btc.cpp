@@ -3562,10 +3562,12 @@ int main(int argc, char* argv[])
                       << http_port << " â dashboard disabled, run-loop continues.";
             // Keep the WebServer alive on a failed bind (do NOT reset). A
             // failed-start server holds no listener and serves nothing; all
-            // later use is `if (web_server)`-guarded. This mirrors the DASH
-            // fix: freeing here would dangle any pre-start raw-pointer capture
-            // into the WebServer / MiningInterface. BTC installs no such capture
-            // today, so this is defensive parity, not a live-bug fix.
+            // later use is `if (web_server)`-guarded. Not resetting is
+            // required: the work source's Best Share sink
+            // (set_best_pseudoshare_fn, above) holds the raw MiningInterface
+            // for the whole run, so freeing it here would leave the next rig
+            // submit calling into freed memory. The DASH and BCH lanes keep
+            // theirs the same way.
         }
         } // if (mi != nullptr)
     } else {
