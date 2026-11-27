@@ -246,11 +246,16 @@ public:
     /// emitted coinbase is byte-identical to the verifier's
     /// generate_share_transaction() BY CONSTRUCTION: both delegate to the single
     /// compute_pplns_payout_split() SSOT via build_connection_coinbase_from_pplns.
+    /// `aux_mm_scriptsig`: the tagged DOGE merged-mining commitment
+    /// ([0x2c][44 B]) the producer appends to the coinbase scriptSig BEFORE it
+    /// builds the ref preimage and the coinbase; empty when merged mining is
+    /// off or has no commitment yet.
     using PplnsInputsFn = std::function<std::optional<dgb::coin::ConnCoinbasePplnsInputs>(
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)>;
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+        const std::vector<unsigned char>& aux_mm_scriptsig)>;
     void set_pplns_inputs_fn(PplnsInputsFn fn);
 
     /// External-daemon GBT tip fallback (the fallback V36 mandates PERSIST).

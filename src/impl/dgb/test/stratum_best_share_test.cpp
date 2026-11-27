@@ -219,7 +219,7 @@ TEST(DgbStratumBestShare, UnbuildableCoinbaseIsHeldNotEmpty)
     EXPECT_TRUE(r.coinb1.empty());
     // Producer declines (null / unknown prev, tracker busy).
     ws->set_pplns_inputs_fn([](const uint256&, const std::string&, const Bytes&,
-                               const std::vector<std::pair<uint32_t, Bytes>>&)
+                               const std::vector<std::pair<uint32_t, Bytes>>&, const Bytes&)
                                 -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> { return std::nullopt; });
     r = ws->build_connection_coinbase(uint256(), "00", Bytes{0x01}, {});
     EXPECT_TRUE(r.held);

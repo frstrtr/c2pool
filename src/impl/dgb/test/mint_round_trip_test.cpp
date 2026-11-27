@@ -25,6 +25,8 @@
 // ---------------------------------------------------------------------------
 
 #include <impl/dgb/conn_job_producer.hpp>
+#include <impl/dgb/coin/aux_doge_payout_provider.hpp>
+#include "doge_backend_fixture.hpp"
 #include <impl/dgb/run_loop_mint.hpp>
 #include <impl/dgb/share.hpp>
 #include <impl/dgb/share_check.hpp>
@@ -42,12 +44,14 @@
 #include <core/uint256.hpp>
 
 #include <btclibs/util/strencodings.h>
+#include <boost/asio/io_context.hpp>
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -132,7 +136,7 @@ struct RtRig {
         auto submit = [](const std::vector<unsigned char>&, uint32_t) -> bool { return false; };
         ws = std::make_unique<dgb::stratum::DGBWorkSource>(hc, mempool, false, submit, kRtSubsidy);
         ws->set_pplns_inputs_fn([this](const uint256& prev, const std::string&, const Bytes& payout,
-                                       const std::vector<std::pair<uint32_t, Bytes>>& merged)
+                                       const std::vector<std::pair<uint32_t, Bytes>>& merged, const Bytes& aux)
                                     -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             dgb::ConnJobRequest req;
             req.prev_share_hash = prev;
@@ -141,6 +145,7 @@ struct RtRig {
             req.next_block_height = 20000000;
             req.now = chain.tip_ts + 15;
             req.donation = 66;
+            req.aux_mm_scriptsig = aux;
             last_inputs = dgb::build_conn_job_inputs(chain.tracker, params, req, [this]() {
                 return std::pair<int64_t, uint64_t>{mint_version, 36};
             });
@@ -360,4 +365,124 @@ TEST(DgbMintRoundTrip, V35ShareAddressDecodesWithTheDgbNetworkVersions)
         s.m_address.m_data.assign(addr.begin(), addr.end());
         EXPECT_EQ(dgb::get_share_script(&s), script);
     }
+}
+
+namespace {
+
+// dgb::NodeImpl's surface for the DOGE payout provider, over the rig's tracker.
+struct RtNode {
+    dgb::ShareTracker& tracker;
+    uint256 best;
+    std::shared_mutex mtx;
+    struct Guard {
+        std::shared_lock<std::shared_mutex> lk;
+        dgb::ShareTracker* t;
+        explicit operator bool() const { return lk.owns_lock(); }
+        dgb::ShareTracker& operator*() { return *t; }
+    };
+    Guard read_tracker() { return Guard{std::shared_lock<std::shared_mutex>(mtx, std::try_to_lock), &tracker}; }
+    uint256 best_share_hash() { return best; }
+};
+
+std::string to_hex(const std::vector<unsigned char>& b)
+{
+    static const char* H = "0123456789abcdef";
+    std::string out;
+    for (auto c : b) { out += H[c >> 4]; out += H[c & 0xf]; }
+    return out;
+}
+
+} // namespace
+
+// --merged DOGE on: the DOGE commitment is in the coinbase scriptSig the ref
+// commits to, so the local share is still credited and the verifier rebuilds
+// the mined coinbase. Before, the commitment was appended after the ref: every
+// local share was declined once DOGE was on (the mutant below).
+TEST(DgbMintRoundTrip, MergedDogeCommitmentIsInTheRefAndTheShareIsCredited)
+{
+    for (int64_t ver : {int64_t(35), int64_t(36)}) {
+        SCOPED_TRACE(ver);
+        RtRig rig;
+        rig.mint_version = ver;
+        RtNode node{rig.chain.tracker, rig.chain.tip};
+        boost::asio::io_context ioc;
+        dgb_test::MergedMiningManager mm(ioc);
+        dgb_test::add_doge(mm);
+        rig.ws->set_merged_mining_manager(&mm);
+        ASSERT_TRUE(dgb::coin::wire_doge_merged_payouts(&mm, node, rig.ws.get()));
+        mm.refresh_aux_work();
+        const auto commitment = mm.get_cached_header_infos_and_commitment().second;
+        ASSERT_EQ(commitment.size(), 44u);
+
+        auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", stratum_payout(miner_login()), {});
+        ASSERT_FALSE(cbr.coinb1.empty());
+        EXPECT_NE((cbr.coinb1 + cbr.coinb2).find("2c" + to_hex(std::vector<unsigned char>(commitment.begin(), commitment.end()))),
+                  std::string::npos) << "the DGB coinbase does not commit to the DOGE block";
+        ASSERT_TRUE(rig.last_inputs.has_value());
+
+        auto j = rig.job(cbr, 0x2100ffffu);
+        const std::string en1 = "cafef00d", en2 = "0000002a", ntime = "6a1b2c3d", nonce = "00c0ffee";
+        Bytes coinbase;
+        const Bytes header = miner_header(j, en1, en2, ntime, nonce, &coinbase);
+        auto r = rig.ws->mining_submit(miner_login(), "job", en1, en2, ntime, nonce, "rid", {}, &j);
+        ASSERT_TRUE(r.is_boolean() && r.get<bool>()) << r.dump();
+        ASSERT_FALSE(rig.minted.IsNull()) << "the local share was not credited with DOGE on";
+        EXPECT_EQ(rig.minted, Hash(std::span<const unsigned char>(header.data(), header.size())));
+        const uint256 cb_txid = Hash(std::span<const unsigned char>(coinbase.data(), coinbase.size()));
+        rig.chain.tracker.chain.get(rig.minted).share.invoke([&](auto* s) {
+            EXPECT_EQ(dgb::generate_share_transaction(*s, rig.chain.tracker, rig.params, false,
+                                                      core::version_gate::is_v36_active(ver)),
+                      cb_txid) << "a peer would reject this share (gentx mismatch)";
+        });
+    }
+}
+
+// The pre-fix order: the producer builds the ref without the commitment and
+// the commitment is appended to the scriptSig afterwards. The share does not
+// match the coinbase the miner hashed.
+TEST(DgbMintRoundTrip, CommitmentAppendedAfterTheRefIsNotCredited)
+{
+    RtRig rig;
+    RtNode node{rig.chain.tracker, rig.chain.tip};
+    boost::asio::io_context ioc;
+    dgb_test::MergedMiningManager mm(ioc);
+    dgb_test::add_doge(mm);
+    ASSERT_TRUE(dgb::coin::wire_doge_merged_payouts(&mm, node, rig.ws.get()));
+    mm.refresh_aux_work();
+    const auto commitment = mm.get_cached_header_infos_and_commitment().second;
+    ASSERT_EQ(commitment.size(), 44u);
+    Bytes tagged{0x2c};
+    tagged.insert(tagged.end(), commitment.begin(), commitment.end());
+    // Producer without the commitment, then the old late splice.
+    rig.ws->set_pplns_inputs_fn([&rig, tagged](const uint256& prev, const std::string&, const Bytes& payout,
+                                               const std::vector<std::pair<uint32_t, Bytes>>& merged, const Bytes&)
+                                    -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
+        dgb::ConnJobRequest req;
+        req.prev_share_hash = prev;
+        req.payout_script = payout;
+        req.merged_addrs = merged;
+        req.next_block_height = 20000000;
+        req.now = rig.chain.tip_ts + 15;
+        req.donation = 66;
+        auto in = dgb::build_conn_job_inputs(rig.chain.tracker, rig.params, req, []() {
+            return std::pair<int64_t, uint64_t>{36, 36};
+        });
+        if (in)
+            in->aux_mm_commitment = tagged;
+        return in;
+    });
+    auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", stratum_payout(miner_login()), {});
+    ASSERT_FALSE(cbr.coinb1.empty());
+    auto j = rig.job(cbr, 0x2100ffffu);
+    const std::string en1 = "cafef00d", en2 = "0000002a", ntime = "6a1b2c3d", nonce = "00c0ffee";
+    Bytes coinbase;
+    (void)miner_header(j, en1, en2, ntime, nonce, &coinbase);
+    (void)rig.ws->mining_submit(miner_login(), "job", en1, en2, ntime, nonce, "rid", {}, &j);
+    const uint256 cb_txid = Hash(std::span<const unsigned char>(coinbase.data(), coinbase.size()));
+    bool matched = false;
+    if (!rig.minted.IsNull() && rig.chain.tracker.chain.contains(rig.minted))
+        rig.chain.tracker.chain.get(rig.minted).share.invoke([&](auto* s) {
+            matched = dgb::generate_share_transaction(*s, rig.chain.tracker, rig.params, false, true) == cb_txid;
+        });
+    EXPECT_FALSE(matched) << "the late splice matched the share's ref";
 }

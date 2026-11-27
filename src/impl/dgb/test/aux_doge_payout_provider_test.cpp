@@ -20,6 +20,7 @@
 // ---------------------------------------------------------------------------
 
 #include <impl/dgb/coin/aux_doge_payout_provider.hpp>
+#include "doge_backend_fixture.hpp"
 
 #include <impl/dgb/address_encoding.hpp>       // dgb::address_acceptance
 #include <impl/dgb/best_share_cell.hpp>        // wire_best_share (the one best-change hook)
@@ -176,51 +177,8 @@ struct FakeNode {
     void set_on_best_share_changed(std::function<void()> fn) { on_best = std::move(fn); }
 };
 
-// The embedded DOGE backend's shape (src/core/test/web_server_merged_drop_test.cpp).
-struct DogeBackend : c2pool::merged::IAuxChainBackend {
-    c2pool::merged::AuxChainConfig cfg;
-    std::string tip = std::string(62, '0') + "c1";
-    DogeBackend()
-    {
-        cfg.symbol = "DOGE";
-        cfg.chain_id = kDoge;
-        cfg.multiaddress = true;
-    }
-    c2pool::merged::AuxWork get_work_template() override
-    {
-        c2pool::merged::AuxWork w;
-        w.chain_id = kDoge;
-        w.height = 5'000'001;
-        w.coinbase_value = 1000000000000ULL;
-        w.block_hash.SetHex(tip);
-        w.target.SetHex(std::string(8, '0') + std::string(56, 'f'));
-        w.prev_block_hash = tip;
-        w.block_template = {
-            {"previousblockhash", tip}, {"height", 5'000'001}, {"bits", "1a01d2c3"},
-            {"curtime", 1793210000}, {"version", 0x620004}, {"coinbasevalue", 1000000000000LL},
-            {"transactions", nlohmann::json::array()},
-        };
-        return w;
-    }
-    c2pool::merged::AuxWork create_aux_block(const std::string&) override { return get_work_template(); }
-    bool connect() override { return true; }
-    bool submit_block(const std::string&) override { return true; }
-    bool submit_aux_block(const uint256&, const std::string&) override { return true; }
-    std::string get_block_hex(const std::string&) override { return {}; }
-    std::string get_best_block_hash() override { return tip; }
-    std::vector<NetService> getpeerinfo() override { return {}; }
-    const c2pool::merged::AuxChainConfig& config() const override { return cfg; }
-};
-
-// Registers the DOGE backend. The config is read through a raw pointer kept
-// before the move: `add_chain(backend->cfg, std::move(backend))` may move the
-// unique_ptr first (unspecified argument order) and dereference null.
-void add_doge(MergedMiningManager& mm)
-{
-    auto backend = std::make_unique<DogeBackend>();
-    auto* raw = backend.get();
-    mm.add_chain(raw->cfg, std::move(backend));
-}
+using dgb_test::DogeBackend;
+using dgb_test::add_doge;
 
 const core::SubsidyFunc kSubsidy = [](uint32_t h) -> uint64_t { return dgb::CoinParams::subsidy(h); };
 
@@ -251,9 +209,15 @@ dgb::coin::ConnCoinbasePplnsInputs pplns_inputs()
 void bind_inputs(dgb::stratum::DGBWorkSource& ws)
 {
     const auto in = pplns_inputs();
+    // As the producer does (conn_job_producer.hpp): the tagged commitment ends
+    // the coinbase scriptSig.
     ws.set_pplns_inputs_fn([in](const uint256&, const std::string&, const Bytes&,
-                                const std::vector<std::pair<uint32_t, Bytes>>&)
-                               -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> { return in; });
+                                const std::vector<std::pair<uint32_t, Bytes>>&, const Bytes& aux)
+                               -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
+        auto r = in;
+        r.coinbase_script.insert(r.coinbase_script.end(), aux.begin(), aux.end());
+        return r;
+    });
 }
 
 std::string coinbase_hex(dgb::stratum::DGBWorkSource& ws)

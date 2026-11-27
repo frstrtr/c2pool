@@ -936,7 +936,7 @@ TEST(DgbWorkSource, ConnectionCoinbaseDelegatesToPplnsSsotByteIdentical)
     // Bind a producer that hands back the fixed inputs regardless of args.
     ws->set_pplns_inputs_fn(
         [&](const uint256&, const std::string&, const Script&,
-            const std::vector<std::pair<uint32_t, Script>>&)
+            const std::vector<std::pair<uint32_t, Script>>&, const Script&)
             -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             return inputs;
         });
@@ -968,7 +968,7 @@ TEST(DgbWorkSource, ConnectionCoinbaseFreezesProducerVersionOnSnapshot)
         inputs.desired_version = 36;
         ws->set_pplns_inputs_fn(
             [&](const uint256&, const std::string&, const Script&,
-                const std::vector<std::pair<uint32_t, Script>>&)
+                const std::vector<std::pair<uint32_t, Script>>&, const Script&)
                 -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
                 return inputs;
             });
@@ -985,7 +985,7 @@ TEST(DgbWorkSource, ConnectionCoinbaseProducerNulloptYieldsEmptyJob)
     auto ws = fx.make();
     ws->set_pplns_inputs_fn(
         [&](const uint256&, const std::string&, const Script&,
-            const std::vector<std::pair<uint32_t, Script>>&)
+            const std::vector<std::pair<uint32_t, Script>>&, const Script&)
             -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             return std::nullopt;  // tip not yet known
         });

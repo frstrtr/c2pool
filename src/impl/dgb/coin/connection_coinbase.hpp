@@ -164,8 +164,11 @@ struct ConnCoinbasePplnsInputs
     // mint so a won DGB block carries the DOGE merged-mining commitment the aux
     // verifier decodes.  DEFAULT nullopt -> coinbase_script is emitted unchanged,
     // so the assembled coinbase is BYTE-IDENTICAL to the standalone-parent build.
-    // The producer (main_dgb seam) only ever populates this under #ifdef AUX_DOGE;
-    // sourcing a LIVE aux merkle root is the gated DC routing slice, not this one.
+    // Production does NOT set it: the producer (conn_job_producer.hpp) puts the
+    // commitment into coinbase_script itself, BEFORE it computes ref_hash, so
+    // the ref commits to it. Appending it here after ref_hash was computed
+    // makes the share minted from this coinbase commit to a scriptSig its own
+    // OP_RETURN ref does not (every such share is declined).
     std::optional<std::vector<unsigned char>> aux_mm_commitment;
 };
 

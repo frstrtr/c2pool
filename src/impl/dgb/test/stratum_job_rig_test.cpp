@@ -173,7 +173,7 @@ struct JobRig {
         });
         // main_dgb's producer shape: decline a null or unknown prev share.
         ws->set_pplns_inputs_fn([this](const uint256& prev, const std::string&, const Bytes& payout,
-                                       const std::vector<std::pair<uint32_t, Bytes>>&)
+                                       const std::vector<std::pair<uint32_t, Bytes>>&, const Bytes&)
                                     -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             std::lock_guard<std::mutex> l(mu);
             if (prev.IsNull() || prev != known_share)

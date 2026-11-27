@@ -522,37 +522,20 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     const std::vector<unsigned char> eff_payout_script =
         effective_payout_script(payout_script, prev_share_hash, extranonce1_hex);
 
-    std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs =
-        fn(prev_share_hash, extranonce1_hex, eff_payout_script, merged_addrs);
-    if (!inputs)
-        return held();  // producer declined (no or unknown prev share, tracker busy): no job.
-
-    // ── DGB-as-DOGE-parent merged-mining commitment snapshot ──────────────────
-    // Runtime-armed (no -DAUX_DOGE compile fence): when a --merged DOGE spec has
-    // stood up the embedded aux backend, splice the cached 44-byte AuxPoW
-    // commitment into the coinbase scriptSig so a won DGB block carries the DOGE
-    // merged-mining tag a Dogecoin node decodes. Mirrors the live-proven BTC->NMC
-    // parent lane (btc work_source.cpp:450-497): ONE lock-free read of the
-    // pre-built commitment (built per work cycle in rebuild_cached_blocks with a
-    // payout provider), gated so a merged-off / pre-sync node leaves the coinbase
-    // BYTE-IDENTICAL to standalone DGB.
-    //
-    // Layout matches the parent lane exactly: [push opcode 0x2c][44-byte blob],
-    // where the blob is the cross-coin SSOT c2pool::merged::build_auxpow_commitment
-    // output (fabe6d6d || aux_root32 BE || size4 LE || nonce4 LE). connection_
-    // coinbase.hpp appends aux_mm_commitment to the scriptSig AFTER the BIP34
-    // height + pool tag; DOGE's AuxPoW check searches the whole scriptSig for the
-    // fabe6d6d magic and only requires it be contiguous, single, and immediately
-    // followed by the aux root — all of which this framing satisfies.
-    //
-    // DGB divergence from BTC (deliberate, single-parent deployment): the DGB
-    // share does NOT freeze a per-chain merged_coinbase_info blob. The DGB
-    // verifier verify_merged_coinbase_commitment (share_check.hpp:1429) skips when
-    // m_merged_coinbase_info is empty, and the mint reads the scriptSig back off
-    // the actually-hashed coinbase (extract_coinbase_scriptsig), so the spliced
-    // bytes are self-consistent through gentx-txid / ref_hash with no split-brain
-    // reject. The DOGE block itself is assembled+relayed by the manager from its
-    // own cached aux work (try_submit_merged_blocks), not from the share blob.
+    // ── DGB-as-DOGE-parent merged-mining commitment ───────────────────────────
+    // Runtime-armed (--merged DOGE): the cached 44-byte AuxPoW commitment, as
+    // [push 0x2c][fabe6d6d || aux_root32 BE || size4 LE || nonce4 LE] (the
+    // cross-coin SSOT c2pool::merged::build_auxpow_commitment), read ONCE here
+    // (rebuilt first when the payouts are dirty; no tracker lock is held yet,
+    // the payout provider takes its own) and handed to the producer, which puts
+    // it in the coinbase scriptSig BEFORE the ref preimage and the coinbase are
+    // built (conn_job_producer.hpp). DOGE's AuxPoW check searches the whole
+    // scriptSig for the magic. Before, it was appended to the scriptSig after
+    // the producer had computed the ref: the share minted from that coinbase
+    // committed to a scriptSig the OP_RETURN ref did not, so every local share
+    // was declined once DOGE was on. Empty (merged off / no commitment yet):
+    // the coinbase is byte-identical to standalone DGB.
+    std::vector<unsigned char> aux_mm_scriptsig;
     if (mm_manager_ && mm_manager_->has_chains()) {
         if (mm_manager_->is_pplns_dirty())
             mm_manager_->rebuild_cached_blocks();
@@ -560,13 +543,16 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
         const std::vector<uint8_t>& mm_commitment = mm_snap.second;
         // Push opcode == length for a 1..75-byte push; the commitment is 44 B => 0x2c.
         if (mm_commitment.size() == dgb::coin::AUX_MM_COMMITMENT_SIZE) {
-            std::vector<unsigned char> tagged;
-            tagged.reserve(1 + mm_commitment.size());
-            tagged.push_back(static_cast<unsigned char>(mm_commitment.size()));
-            tagged.insert(tagged.end(), mm_commitment.begin(), mm_commitment.end());
-            inputs->aux_mm_commitment = std::move(tagged);
+            aux_mm_scriptsig.reserve(1 + mm_commitment.size());
+            aux_mm_scriptsig.push_back(static_cast<unsigned char>(mm_commitment.size()));
+            aux_mm_scriptsig.insert(aux_mm_scriptsig.end(), mm_commitment.begin(), mm_commitment.end());
         }
     }
+
+    std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs =
+        fn(prev_share_hash, extranonce1_hex, eff_payout_script, merged_addrs, aux_mm_scriptsig);
+    if (!inputs)
+        return held();  // producer declined (no or unknown prev share, tracker busy): no job.
 
     dgb::coin::ConnCoinbaseParts parts =
         dgb::coin::build_connection_coinbase_from_pplns(*inputs);

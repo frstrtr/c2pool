@@ -1712,7 +1712,8 @@ int run_node(const core::CoinParams& params, bool testnet,
                 const uint256& prev_share_hash,
                 const std::string& /*extranonce1_hex*/,
                 const std::vector<unsigned char>& payout_script,
-                const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)
+                const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+                const std::vector<unsigned char>& aux_mm_scriptsig)
                 -> std::optional<dgb::coin::ConnCoinbasePplnsInputs>
             {
                 // Non-blocking tracker read. Contended -> decline (the job is held).
@@ -1731,6 +1732,7 @@ int run_node(const core::CoinParams& params, bool testnet,
                 req.next_block_height = header_chain.next_block_height();
                 req.now               = static_cast<uint32_t>(std::time(nullptr));
                 req.donation          = donation_u16;
+                req.aux_mm_scriptsig  = aux_mm_scriptsig;
                 return dgb::build_conn_job_inputs(
                     pplns_tracker, params, req,
                     [&]() -> std::pair<int64_t, uint64_t> {

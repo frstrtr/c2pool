@@ -45,6 +45,9 @@ struct ConnJobRequest {
     uint32_t next_block_height = 0;             // header_chain.next_block_height()
     uint32_t now = 0;                           // wall clock (seconds)
     uint16_t donation = 0;                      // share donation (u16, --give-author)
+    // The tagged DOGE merged-mining commitment ([0x2c][44 B], empty when merged
+    // mining is off): part of the coinbase scriptSig, so of the ref preimage.
+    std::vector<unsigned char> aux_mm_scriptsig;
 };
 
 /// {mint version, vote version} for the job, asked once (the AutoRatchet in
@@ -138,10 +141,14 @@ std::optional<coin::ConnCoinbasePplnsInputs> build_conn_job_inputs(
     // subsidy for the prospective NEXT block (== create_local_share subsidy arg).
     const uint64_t subsidy = params.subsidy_func ? params.subsidy_func(absheight) : 0;
 
-    // #902 -- coinbase scriptSig: [BIP34 height push][/c2pool-dgb/ tag]. The
-    // SAME bytes feed the ref preimage and the emitted coinbase.
-    const std::vector<unsigned char> coinbase_scriptsig =
+    // #902 -- coinbase scriptSig: [BIP34 height push][/c2pool-dgb/ tag], then
+    // the DOGE merged-mining commitment when merged mining is on. The SAME bytes
+    // feed the ref preimage and the emitted coinbase, so the share minted from
+    // this coinbase commits to the scriptSig its OP_RETURN ref commits to.
+    std::vector<unsigned char> coinbase_scriptsig =
         coin::build_coinbase_scriptsig(req.next_block_height);
+    coinbase_scriptsig.insert(coinbase_scriptsig.end(), req.aux_mm_scriptsig.begin(),
+                              req.aux_mm_scriptsig.end());
 
     // REF half -- the ref preimage via the SSOT.
     coin::WorkRefHashInputs rin;
