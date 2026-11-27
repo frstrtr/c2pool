@@ -91,3 +91,28 @@ TEST(DgbStartDifficulty, MainDgbBindsTheNodeRate)
     ASSERT_NE(unbind, std::string::npos);
     EXPECT_LT(unbind, s.find("    stratum_server.reset();", unbind));
 }
+
+// Review 7793bfb6c NIT: a failed getblocktemplate is cached as long as a
+// good one, so the sessions' 1 s template retries do not each run the
+// blocking RPC while digibyted fails; rebinding the seam drops it.
+TEST(DgbGbtFallback, AFailureIsCachedForTheTtl)
+{
+    c2pool::dgb::HeaderChain hc;
+    dgb::coin::Mempool mempool;
+    dgb::stratum::DGBWorkSource ws(hc, mempool, false, [](const std::vector<unsigned char>&, uint32_t) { return false; },
+                                   [](uint32_t h) -> uint64_t { return dgb::CoinParams::subsidy(h); });
+    int calls = 0;
+    ws.set_gbt_tip_fn([&calls]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+        ++calls;
+        return std::nullopt;
+    });
+    for (int i = 0; i < 5; ++i)
+        EXPECT_TRUE(ws.get_current_gbt_prevhash().empty());
+    EXPECT_EQ(calls, 1) << "every read ran the failing RPC";
+    ws.set_gbt_tip_fn([&calls]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+        ++calls;
+        return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1a00ffff", 20000000};
+    });
+    EXPECT_EQ(ws.get_current_gbt_prevhash(), std::string(64, '1'));
+    EXPECT_EQ(calls, 2);
+}

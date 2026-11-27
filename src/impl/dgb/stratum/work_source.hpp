@@ -544,6 +544,7 @@ private:
     GbtTipFn                      gbt_tip_fn_;
     mutable std::optional<GbtTip> gbt_tip_cache_;
     mutable int64_t               gbt_tip_cache_time_ = 0;
+    mutable int64_t               gbt_tip_fail_time_ = 0;   // last failed GBT (negative cache)
     static constexpr int64_t      GBT_TIP_TTL_SECONDS = 5;
 
     // Resolve the external-daemon GBT tip fallback (previousblockhash + bits),

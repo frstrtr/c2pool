@@ -1469,6 +1469,7 @@ void DGBWorkSource::set_gbt_tip_fn(GbtTipFn fn)
     gbt_tip_fn_ = std::move(fn);
     gbt_tip_cache_.reset();     // drop any stale cache when the seam is (re)bound
     gbt_tip_cache_time_ = 0;
+    gbt_tip_fail_time_ = 0;
 }
 
 std::optional<DGBWorkSource::GbtTip> DGBWorkSource::resolve_gbt_tip_fallback() const
@@ -1483,16 +1484,26 @@ std::optional<DGBWorkSource::GbtTip> DGBWorkSource::resolve_gbt_tip_fallback() c
         std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
         if (gbt_tip_cache_ && (now - gbt_tip_cache_time_) < GBT_TIP_TTL_SECONDS)
             return gbt_tip_cache_;
+        // A failure is cached as long (review 7793bfb6c NIT): while digibyted
+        // fails, each session's 1 s template retry would otherwise run its own
+        // blocking getblocktemplate on the IO thread.
+        if (gbt_tip_fail_time_ != 0 && (now - gbt_tip_fail_time_) < GBT_TIP_TTL_SECONDS)
+            return std::nullopt;
         fn = gbt_tip_fn_;  // copy so a concurrent set_gbt_tip_fn() cannot tear it out
     }
     if (!fn)
         return std::nullopt;   // unbound (no digibyted creds armed) -> truthful absence
 
     std::optional<GbtTip> tip = fn();   // blocking getblocktemplate; nullopt on RPC failure
-    if (tip) {
+    {
         std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
-        gbt_tip_cache_      = tip;
-        gbt_tip_cache_time_ = now;
+        if (tip) {
+            gbt_tip_cache_      = tip;
+            gbt_tip_cache_time_ = now;
+            gbt_tip_fail_time_  = 0;
+        } else {
+            gbt_tip_fail_time_  = now;
+        }
     }
     return tip;
 }
