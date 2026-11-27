@@ -122,7 +122,7 @@ PerCoinParams bchDefault()
     p.payoutAddress = "bitcoincash:qexample";
     p.fee = 1.0;
     p.giveAuthorSet = true; p.giveAuthor = 0.5;
-    p.redistribute = "fee";
+    p.redistribute = "fee"; p.redistributeSet = true;
     p.messageBlob = "deadbeef";
     return p;
 }
@@ -141,7 +141,7 @@ PerCoinParams dgbDefault()
     p.sharechainPort = 5024;
     p.addnodes = {"5.6.7.8:5024"};
     p.payoutAddress = "DExampleDgbAddress";
-    p.redistribute = "boost:70,donate:30";
+    p.redistribute = "boost:70,donate:30"; p.redistributeSet = true;
     return p;
 }
 
@@ -393,6 +393,30 @@ int main()
         check(!contains(argv0, "--embedded-tx-inject")
                   && !contains(argv0, "--control-plane-token-file"),
               "DASH default argv carries neither tx-inject arming flag");
+    }
+
+    // --redistribute (split is the LTC/DASH default): only a mode the operator
+    //     set in the form is passed on. A value loaded from a settings store
+    //     written before (every save stored the combo's "pplns") carries no
+    //     user-set marker: omitted, the binary's default applies; on DGB the
+    //     flag is never passed unless set; split itself is never passed.
+    {
+        for (PerCoinParams p : {dashDefault(), dgbDefault()}) {
+            p.redistribute = "pplns";
+            p.redistributeSet = false;
+            check(!contains(build_percoin_argv(p), "--redistribute"),
+                  "a legacy saved pplns (no user-set marker) is not passed on");
+            p.redistributeSet = true;
+            const auto argv = build_percoin_argv(p);
+            check(contains(argv, "--redistribute") && contains(argv, "pplns"),
+                  "a pplns the operator set is passed on");
+            p.redistribute = "split";
+            check(!contains(build_percoin_argv(p), "--redistribute"), "split (the default) is not passed");
+        }
+        PerCoinParams g = dgbDefault();
+        g.redistributeSet = false;
+        check(!contains(build_percoin_argv(g), "--redistribute"),
+              "DGB: --redistribute only when the operator set it");
     }
 
     std::printf(failures == 0 ? "ALL PASS\n" : "FAILURES: %d\n", failures);

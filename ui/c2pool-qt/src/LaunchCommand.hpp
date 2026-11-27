@@ -87,7 +87,11 @@ struct PerCoinParams {
     bool        giveAuthorSet = false;          ///< operator explicitly overrides the binary default
     double      giveAuthor = 0.0;               ///< money.give_author_pct value
     bool        giveAuthorExplicitZeroAck = false; ///< required to emit an explicit 0
-    std::string redistribute;                   ///< money.redistribute (omit when "split", the default)
+    std::string redistribute;                   ///< money.redistribute value
+    /// The operator chose `redistribute` in the form (not a value loaded from a
+    /// settings store written before split became the default). Unset: omitted,
+    /// the binary's default applies (split on LTC/DASH; DGB: no policy).
+    bool        redistributeSet = false;
 
     std::string messageBlob;                    ///< global.message_blob_hex
 
@@ -259,8 +263,10 @@ inline std::vector<std::string> build_percoin_argv(const PerCoinParams& p)
     }
 
     {
+        // Only a mode the operator set, and not split (the LTC/DASH default;
+        // on DGB a spec naming split binds no policy, as without the flag).
         const std::string rd = trim(p.redistribute);
-        if (!rd.empty() && rd != "split")
+        if (p.redistributeSet && !rd.empty() && rd != "split")
             emit_value(a, bin, "money.redistribute", rd);
     }
 

@@ -379,6 +379,12 @@ void PageLaunch::setupUi()
             "  boost  - give to active miners with zero PPLNS weight\n"
             "  donate - 100% to donation address");
         form->addRow("Redistribute mode:", redistributeCombo_);
+        // A choice the operator makes (not a programmatic load) is the one
+        // passed on (redistributeUserSet_).
+        connect(redistributeCombo_, &QComboBox::activated, this, [this](int) {
+            redistributeUserSet_ = true;
+            onBuildPreview();
+        });
 
         vbox->addWidget(g);
     }
@@ -815,9 +821,9 @@ QString PageLaunch::buildLegacyCommand() const
     if (!nodeOwnerScript.isEmpty())
         parts << "--node-owner-script" << nodeOwnerScript;
 
-    // Redistribute (only if non-default)
+    // Redistribute: only a mode the operator chose, and not the default
     const QString redistribute = redistributeCombo_->currentText();
-    if (redistribute != "split")
+    if (redistributeUserSet_ && redistribute != "split")
         parts << "--redistribute" << redistribute;
 
     // Merged mining
@@ -960,6 +966,7 @@ c2pool_qt::PerCoinParams PageLaunch::marshalPerCoinParams() const
         giveAuthorZeroAckCheck_ && giveAuthorZeroAckCheck_->isChecked();
     pp.giveAuthorSet = pp.giveAuthor > 0.0 || pp.giveAuthorExplicitZeroAck;
     pp.redistribute  = redistributeCombo_->currentText().toStdString();
+    pp.redistributeSet = redistributeUserSet_;
     pp.messageBlob   = messageBlobEdit_->text().trimmed().toStdString();
 
     // ── DGB/BCH deeper run-loop controls (emitted only where the catalog has
@@ -1398,6 +1405,7 @@ void PageLaunch::saveSettings() const
     s.setValue("nodeOwnerAddr", nodeOwnerAddrEdit_->text());
     s.setValue("giveAuthor",    giveAuthorSpinBox_->value());
     s.setValue("redistribute",  redistributeCombo_->currentText());
+    s.setValue("redistributeUserSet", redistributeUserSet_);
     s.setValue("maxConns",      maxConnsSpinBox_->value());
     s.setValue("coindP2pPort",  coindP2pPortSpin_->value());
     s.setValue("coindP2pAddr",  coindP2pAddrEdit_->text());
@@ -1468,7 +1476,12 @@ void PageLaunch::loadSettings()
     nodeOwnerAddrEdit_->setText(s.value("nodeOwnerAddr").toString());
     giveAuthorSpinBox_->setValue(s.value("giveAuthor", 0.0).toDouble());
     {
-        const int idx = redistributeCombo_->findText(s.value("redistribute", "split").toString());
+        // A mode saved without the user-set marker (before split became the
+        // default, when every save stored the combo's "pplns") is not applied:
+        // the default (split) is shown and nothing is passed on.
+        redistributeUserSet_ = s.value("redistributeUserSet", false).toBool();
+        const QString saved = redistributeUserSet_ ? s.value("redistribute", "split").toString() : QString("split");
+        const int idx = redistributeCombo_->findText(saved);
         redistributeCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
     }
     maxConnsSpinBox_->setValue(s.value("maxConns", 0).toInt());
