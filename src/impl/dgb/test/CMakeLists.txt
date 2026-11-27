@@ -339,7 +339,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # the IWorkSource contract + real-now surface (config/atomics/workers).
     # Links dgb_stratum + the same proven SCC set as the sibling dgb tests.
     # MUST also be in the build.yml --target allowlist (#143 NOT_BUILT trap).
-    add_executable(dgb_work_source_test work_source_test.cpp)
+    # aux_doge_payout_provider_test.cpp: --merged DOGE pays (provider registered,
+    # non-empty commitment in the DGB coinbase, PPLNS + merged-address outputs,
+    # the single-P2PKH fallback address, has_merged_chain() login paths, and
+    # no binding / byte-identical coinbase without --merged). Same folding rule.
+    add_executable(dgb_work_source_test work_source_test.cpp aux_doge_payout_provider_test.cpp)
     target_link_libraries(dgb_work_source_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb dgb_stratum

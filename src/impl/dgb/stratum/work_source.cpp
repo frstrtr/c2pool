@@ -236,12 +236,15 @@ uint64_t DGBWorkSource::get_work_generation() const
     return work_generation_.load(std::memory_order_relaxed);
 }
 
-bool DGBWorkSource::has_merged_chain(uint32_t /*chain_id*/) const
+bool DGBWorkSource::has_merged_chain(uint32_t chain_id) const
 {
-    // DGB V36 default build: standalone Scrypt parent, no merged mining.
-    // The DGB-as-DOGE-parent dual-parent path (-DAUX_DOGE=ON) is a V36
-    // STRETCH, parked behind the shared DOGE-aux settle — not wired here.
-    return false;
+    // The merged-mining manager main_dgb binds for --merged DOGE decides (as
+    // btc work_source.cpp has_merged_chain). No manager (standalone DGB, or
+    // no --merged) or a chain it does not mine => false. True arms the core
+    // stratum login resolution for that chain: the "DGB,DOGE" login form, the
+    // DOGE address auto-derived from the primary's key, and the #961 door
+    // accepting the chain's addresses (stratum_server.cpp, merged_chain_addr.hpp).
+    return mm_manager_ != nullptr && mm_manager_->has_chain(chain_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

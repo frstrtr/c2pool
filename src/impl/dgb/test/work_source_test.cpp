@@ -105,9 +105,11 @@ TEST(DgbWorkSource, NoMergedChainInDefaultBuild)
 {
     Fixture fx;
     auto ws = fx.make();
-    // DGB V36 default build is a standalone Scrypt parent (no merged mining;
-    // -DAUX_DOGE dual-parent is a parked STRETCH).
+    // No merged-mining manager bound (standalone DGB, no --merged): no chain is
+    // merged. With --merged DOGE the manager decides
+    // (aux_doge_payout_provider_test.cpp HasMergedChainFollowsTheManager).
     EXPECT_FALSE(ws->has_merged_chain(0x0001));
+    EXPECT_FALSE(ws->has_merged_chain(98));
 }
 
 TEST(DgbWorkSource, BestShareHashFnEmptyUntilWired)

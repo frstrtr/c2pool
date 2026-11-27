@@ -127,6 +127,8 @@
 #include <impl/ltc/config.hpp>                     // ltc::config::P2PData (coin_broadcaster BroadcasterConfig needs it)
 #include <c2pool/merged/merged_mining.hpp>        // MergedMiningManager / AuxChainConfig / AuxChainRPC
 #include <c2pool/merged/coin_broadcaster.hpp>     // CoinBroadcaster / PeerManagerConfig
+#include <c2pool/merged/aux_chain_params.hpp>     // find_aux_chain_params (DOGE address versions)
+#include <impl/dgb/coin/aux_doge_payout_provider.hpp> // DOGE payout provider + fallback payout address
 #include <core/netaddress.hpp>                    // PeerEndpoint
 #include <boost/asio/thread_pool.hpp>             // header-admission pool (owned at main scope for join)
 #include <boost/asio/post.hpp>
@@ -550,10 +552,20 @@ int run_node(const core::CoinParams& params, bool testnet,
             if (parts.size() >= 6) cfg.rpc_userpass = parts[4] + ":" + parts[5];
             cfg.multiaddress = true;  // V36: canonical PPLNS coinbase for merged chains
 
-            if (cfg.symbol == "DOGE" && testnet)
-                cfg.aux_payout_address = "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt";
-            else if (cfg.symbol == "DOGE")
-                cfg.aux_payout_address = "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";
+            // createauxblock's address (non-multiaddress / RPC fallback path):
+            // the single donation P2PKH c2pool-dash pays, as a DOGE address of
+            // this network (aux_doge_payout_provider.hpp), never a placeholder.
+            // Plus DOGE's own version bytes for the merged payout views.
+            if (cfg.symbol == "DOGE") {
+                cfg.aux_payout_address = dgb::coin::doge_fallback_payout_address(testnet);
+                if (const auto* cp = c2pool::merged::find_aux_chain_params(cfg.symbol)) {
+                    const auto& v = testnet ? cp->test : cp->main;
+                    if (!v.p2pkh.empty()) cfg.address_version = v.p2pkh.front();
+                    if (!v.p2sh.empty())  cfg.p2sh_version    = v.p2sh.front();
+                }
+                std::cout << "[DGB-MM] DOGE fallback payout address "
+                          << cfg.aux_payout_address << std::endl;
+            }
 
             // P2P port: 7th field override, else the DOGE default (22556 main /
             // 44556 testnet). The 7th field arms the embedded coin-P2P port.
@@ -1555,6 +1567,17 @@ int run_node(const core::CoinParams& params, bool testnet,
     // standalone DGB node — the structural no-op path proven in #1413's KAT).
     if (mm_manager)
         work_source->set_merged_mining_manager(mm_manager.get());
+
+    // ── DOGE payout provider + work-change hook + best-share dirty mark ──────
+    // WITHOUT a provider every rebuild records "no_provider"
+    // (merged_mining.cpp rebuild_cached_blocks), the commitment stays empty and
+    // the DGB coinbase never commits to a DOGE block. The BTC parent lane's
+    // wiring on the DGB node (aux_doge_payout_provider.hpp
+    // wire_doge_merged_payouts). Null mm_manager (no --merged) => nothing bound
+    // => standalone DGB byte-identical.
+    if (dgb::coin::wire_doge_merged_payouts(mm_manager.get(), p2p_node, work_source.get()))
+        std::cout << "[DGB-MM] DOGE payout provider + work-change hook wired ("
+                  << mm_manager->chain_count() << " aux chain(s))" << std::endl;
 #endif // AUX_DOGE
 
     // -- External-daemon GBT tip fallback bind (the fallback V36 mandates PERSIST)
