@@ -110,6 +110,7 @@ TEST(DgbV35PplnsByAddress, WeightsWalkKeysByTheSharesString)
         s->m_prev_hash = prev;
         s->m_bits = 0x1e0fffff;
         s->m_max_bits = 0x1e0fffff;
+        s->m_donation = 0;   // equal weights per share
         s->m_timestamp = 1790000000u + 15u * static_cast<uint32_t>(i);
         s->m_absheight = static_cast<uint32_t>(i);
         const std::string addr = a;
