@@ -1476,12 +1476,20 @@ void PageLaunch::loadSettings()
     nodeOwnerAddrEdit_->setText(s.value("nodeOwnerAddr").toString());
     giveAuthorSpinBox_->setValue(s.value("giveAuthor", 0.0).toDouble());
     {
-        // A mode saved without the user-set marker (before split became the
-        // default, when every save stored the combo's "pplns") is not applied:
-        // the default (split) is shown and nothing is passed on.
-        redistributeUserSet_ = s.value("redistributeUserSet", false).toBool();
-        const QString saved = redistributeUserSet_ ? s.value("redistribute", "split").toString() : QString("split");
-        const int idx = redistributeCombo_->findText(saved);
+        // c2pool_qt::restore_redistribute_choice: with the user-set marker,
+        // the saved choice; without it (a store written before split became
+        // the default), a saved fee / boost / donate is kept as the
+        // operator's choice and a saved pplns (the old default) is not.
+        std::optional<bool> marker;
+        if (s.contains("redistributeUserSet"))
+            marker = s.value("redistributeUserSet").toBool();
+        std::vector<std::string> offered;
+        for (int i = 0; i < redistributeCombo_->count(); ++i)
+            offered.push_back(redistributeCombo_->itemText(i).toStdString());
+        const auto [user_set, mode] = c2pool_qt::restore_redistribute_choice(
+            marker, s.value("redistribute", "").toString().toStdString(), offered);
+        redistributeUserSet_ = user_set;
+        const int idx = redistributeCombo_->findText(QString::fromStdString(mode));
         redistributeCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
     }
     maxConnsSpinBox_->setValue(s.value("maxConns", 0).toInt());

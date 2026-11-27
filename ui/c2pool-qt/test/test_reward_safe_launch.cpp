@@ -417,6 +417,32 @@ int main()
         g.redistributeSet = false;
         check(!contains(build_percoin_argv(g), "--redistribute"),
               "DGB: --redistribute only when the operator set it");
+
+        // Restoring a saved form: without the marker (an older store) a
+        // pplns was the old default and is not restored; a fee / boost /
+        // donate was a choice and is kept; with the marker, as saved.
+        using c2pool_qt::restore_redistribute_choice;
+        const std::vector<std::string> offered = {"split", "pplns", "fee", "boost", "donate"};
+        const auto r1 = restore_redistribute_choice(std::nullopt, "pplns", offered);
+        check(!r1.first && r1.second == "split", "an older store's pplns is not restored (split shown)");
+        for (const char* m : {"fee", "boost", "donate"}) {
+            const auto r = restore_redistribute_choice(std::nullopt, m, offered);
+            check(r.first && r.second == m, "an older store's fee/boost/donate is kept as the operator's choice");
+        }
+        const auto r2 = restore_redistribute_choice(std::nullopt, "split", offered);
+        check(!r2.first && r2.second == "split", "an older store's split: the default");
+        const auto r3 = restore_redistribute_choice(std::nullopt, "boost:70,donate:30", offered);
+        check(!r3.first && r3.second == "split", "a value the form does not offer is not restored");
+        const auto r4 = restore_redistribute_choice(true, "pplns", offered);
+        check(r4.first && r4.second == "pplns", "a marked pplns (the operator's choice) is restored");
+        const auto r5 = restore_redistribute_choice(false, "fee", offered);
+        check(!r5.first && r5.second == "split", "marked unset: the default");
+        // and what a restored choice passes on
+        PerCoinParams l = dashDefault();
+        l.redistribute = restore_redistribute_choice(std::nullopt, "fee", offered).second;
+        l.redistributeSet = restore_redistribute_choice(std::nullopt, "fee", offered).first;
+        const auto la = build_percoin_argv(l);
+        check(contains(la, "--redistribute") && contains(la, "fee"), "an older store's fee is passed on, as before");
     }
 
     std::printf(failures == 0 ? "ALL PASS\n" : "FAILURES: %d\n", failures);
