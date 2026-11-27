@@ -14,7 +14,9 @@
 //     the root the S3 block-connect path (the root-checked replay fold,
 //     replay_fold_engine.hpp) computes for the same block;
 //   * types 1-4 under v24: the template fold now runs the v24 transitions
-//     (a revocation keeps a basic state's version).
+//     (a revocation keeps a basic state's version);
+//   * the operator opt-out --embedded-include-v24-provider-txs=false: types
+//     10-12 stay out of the template, types 1-4 still ride.
 //
 // This TU rides test_dash_govvote_bls (the BLS-backend target).
 
@@ -39,9 +41,13 @@
 #include <impl/dash/coin/vendor/mnhftx.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
+#include <impl/dash/coin/work_source.hpp>
 
 #include <core/coin/utxo_view_cache.hpp>
 #include <core/hash.hpp>
+#include <core/param_catalog.hpp>
+#include <core/settings_cli.hpp>
+#include <core/settings_file.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 
@@ -54,7 +60,9 @@
 #include <secp256k1_recovery.h>
 
 #include <cctype>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -3035,6 +3043,393 @@ TEST(DashV24AllTx, P2FoldMemoServesAChainCoinFoldOnlyWhileItsAnswersHold)
     EXPECT_FALSE(st.embedded_template_emit_ok(wd, &why))
         << "a collateral one duff short still passed off the memo";
     EXPECT_EQ(st.fold_root_computes_dbg() - folds0, 4u);
+}
+
+// ── The v24 provider opt-out (--embedded-include-v24-provider-txs=false) ─────
+// The superset lever admits types 1-4 and, from v24 activation, the shared
+// types 10-12. The opt-out keeps 10-12 out and nothing else: types 1-4 still
+// ride, the fees of the txs left out leave the coinbase with them, and the
+// committed root is the block-connect root of the body served. ON (the
+// default) is the template every caller built before the flag existed.
+
+namespace {
+/// One tx of each shared type (ProDisTx 10, ProUpShareTx 11, ProUpSharedRegTx
+/// 12) and R's provider txs for `r_case` (0: a ProUpServTx and a key-changing
+/// ProUpRegTx, types 2 and 3; 1: a ProUpRevTx, type 4; one pool cannot hold
+/// both, a revocation being a second key change of R), every input funded.
+struct OptOutPool {
+    V24World w;
+    ::core::coin::UTXOViewCache utxo{nullptr};
+    dash::coin::Mempool mp;
+    v::CSimplifiedMNList sml;
+    dash::coin::QuorumManager qmgr;
+    dash::coin::ProTxCheckEnv env;
+    dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
+    MutableTransaction share, reg, dis;
+    std::vector<MutableTransaction> r_txs;
+
+    explicit OptOutPool(int r_case)
+        : share(w.share_tx(0, ec_key(0x51).id, w.s0)),
+          reg(w.sharedreg_tx(w.sop2.pub, ec_key(0x52).id, {&w.s0, &w.s1})),
+          dis(w.dissolve_tx())
+    {
+        mp.set_utxo(&utxo);
+        mp.set_v24_admission(true);
+        fund(share, 10'000, p2pkh(ec_key(0x57).id));
+        fund(reg, 10'000, p2pkh(ec_key(0x58).id));
+        fund(dis, kColl, dash::coin::v24::shared_collateral_script());
+        if (r_case == 0) {
+            r_txs = {servtx_r(w), w.upreg_r(w.rop2.pub)};
+            fund(r_txs[0], 10'000, p2pkh(ec_key(0x59).id));
+            fund(r_txs[1], 1'000'000, p2pkh(ec_key(0x5c).id));
+            // R's collateral (CheckProUpRegTx reads its coin).
+            utxo.add_coin(::core::coin::Outpoint(w.regular.collateralOutpoint.hash,
+                                                 w.regular.collateralOutpoint.index),
+                          ::core::coin::Coin(kColl, script_of(p2pkh(w.rcollat.id)), 1, false));
+        } else {
+            r_txs = {w.rev_r()};
+            fund(r_txs[0], 20'000, p2pkh(ec_key(0x5d).id));
+        }
+        EXPECT_TRUE(mp.add_tx(share));
+        EXPECT_TRUE(mp.add_tx(reg));
+        EXPECT_TRUE(mp.add_tx(dis));
+        for (const auto& t : r_txs) EXPECT_TRUE(mp.add_tx(t)) << "type " << t.type;
+        sml = w.base_sml();
+        env.net = dash::coin::DashNetwork::MAINNET;
+        env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+    }
+    void fund(const MutableTransaction& t, int64_t value, std::vector<uint8_t> script)
+    {
+        utxo.add_coin(::core::coin::Outpoint(t.vin[0].prevout.hash, t.vin[0].prevout.index),
+                      ::core::coin::Coin(value, script_of(std::move(script)), 1, false));
+    }
+    std::vector<const MutableTransaction*> shared_txs() const { return {&share, &reg, &dis}; }
+    /// The template at V24World::H with the superset armed. std::nullopt
+    /// leaves include_v24_provider_txs at its default: the call every caller
+    /// made before the parameter existed.
+    dash::coin::DashWorkData build(bool v24, std::optional<bool> include_v24) const
+    {
+        if (!include_v24)
+            return dash::coin::build_embedded_workdata(
+                V24World::H - 1, h256(0xAB), w.sm, mp, 0x1b104be3u, 1'800'000'000u, 76, 16, 1'800'000'100u,
+                0x20000000u, nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+                dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+                /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
+                /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, v24, &env, nullptr);
+        return dash::coin::build_embedded_workdata(
+            V24World::H - 1, h256(0xAB), w.sm, mp, 0x1b104be3u, 1'800'000'000u, 76, 16, 1'800'000'100u,
+            0x20000000u, nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+            dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+            /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
+            /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, v24, &env, nullptr,
+            /*want_xcheck_aid=*/false, /*include_v24_provider_txs=*/*include_v24);
+    }
+    /// The same inputs as build(true, include_v24), as the work source takes
+    /// them (select_dash_work -> build_embedded_workdata).
+    dash::coin::EmbeddedWorkInputs inputs(bool include_v24) const
+    {
+        dash::coin::EmbeddedWorkInputs e;
+        e.has_state = true;
+        e.prev_height = V24World::H - 1;
+        e.prev_hash = h256(0xAB);
+        e.mnstates = &w.sm;
+        e.mempool = &mp;
+        e.bits_for_next = 0x1b104be3u;
+        e.mtp_at_tip = 1'800'000'000u;
+        e.address_version = 76;
+        e.address_p2sh_version = 16;
+        e.curtime = 1'800'000'100u;
+        e.version = 0x20000000u;
+        e.v24_active = true;
+        e.sml = &sml;
+        e.qmgr = &qmgr;
+        e.include_mn_special_txs = true;
+        e.protx_sig_verifier = &sigfn;
+        e.protx_check_env = &env;
+        e.include_v24_provider_txs = include_v24;
+        return e;
+    }
+};
+bool opt_rides(const dash::coin::DashWorkData& wd, const MutableTransaction& t)
+{
+    for (const auto& h : wd.m_tx_hashes)
+        if (h == txid(t)) return true;
+    return false;
+}
+/// The fee the template took for `t` (0 when it does not ride).
+uint64_t opt_fee(const dash::coin::DashWorkData& wd, const MutableTransaction& t)
+{
+    for (size_t i = 0; i < wd.m_tx_hashes.size() && i < wd.m_tx_fees.size(); ++i)
+        if (wd.m_tx_hashes[i] == txid(t)) return wd.m_tx_fees[i];
+    return 0;
+}
+/// Every field the block, its coinbase and a miner's job are built from.
+::testing::AssertionResult SameTemplate(const dash::coin::DashWorkData& a, const dash::coin::DashWorkData& b)
+{
+    if (a.m_version != b.m_version || a.m_previous_block != b.m_previous_block || a.m_height != b.m_height
+        || a.m_bits != b.m_bits || a.m_curtime != b.m_curtime || a.m_mintime != b.m_mintime)
+        return ::testing::AssertionFailure() << "header fields differ";
+    if (a.m_tx_hashes != b.m_tx_hashes) return ::testing::AssertionFailure() << "tx ids differ";
+    if (a.m_tx_fees != b.m_tx_fees) return ::testing::AssertionFailure() << "tx fees differ";
+    if (a.m_tx_data_hex != b.m_tx_data_hex) return ::testing::AssertionFailure() << "tx bytes differ";
+    if (a.m_coinbase_value != b.m_coinbase_value) return ::testing::AssertionFailure() << "coinbase value differs";
+    if (a.m_payment_amount != b.m_payment_amount) return ::testing::AssertionFailure() << "payment differs";
+    if (a.m_coinbase_payload != b.m_coinbase_payload) return ::testing::AssertionFailure() << "CbTx differs";
+    if (a.m_packed_payments.size() != b.m_packed_payments.size())
+        return ::testing::AssertionFailure() << "payment count differs";
+    for (size_t i = 0; i < a.m_packed_payments.size(); ++i)
+        if (a.m_packed_payments[i].payee != b.m_packed_payments[i].payee
+            || a.m_packed_payments[i].amount != b.m_packed_payments[i].amount)
+            return ::testing::AssertionFailure() << "payment " << i << " differs";
+    return ::testing::AssertionSuccess();
+}
+}  // namespace
+
+TEST(DashV24AllTx, V24ProviderOptOutLeavesOutTypes10To12AndKeepsTypes1To4)
+{
+    for (int r_case = 0; r_case < 2; ++r_case) {
+        SCOPED_TRACE(r_case == 0 ? "R: types 2 and 3" : "R: type 4");
+        OptOutPool p(r_case);
+        const auto on = p.build(/*v24=*/true, true);
+        // Fixture: ON, every tx of the pool rides.
+        for (const auto* t : p.shared_txs()) ASSERT_TRUE(opt_rides(on, *t)) << "type " << t->type;
+        for (const auto& t : p.r_txs) ASSERT_TRUE(opt_rides(on, t)) << "type " << t.type;
+
+        const auto off = p.build(/*v24=*/true, false);
+        for (const auto* t : p.shared_txs()) EXPECT_FALSE(opt_rides(off, *t)) << "type " << t->type << " rode";
+        for (const auto& t : p.r_txs) EXPECT_TRUE(opt_rides(off, t)) << "type " << t.type << " was left out";
+        for (const auto& t : off.m_txs) EXPECT_FALSE(dash::coin::tx_type_is_v24_provider(t.type)) << t.type;
+        // Exactly the three are gone.
+        std::set<uint256> want, got(off.m_tx_hashes.begin(), off.m_tx_hashes.end());
+        for (const auto& h : on.m_tx_hashes)
+            if (h != txid(p.share) && h != txid(p.reg) && h != txid(p.dis)) want.insert(h);
+        EXPECT_EQ(got, want);
+        EXPECT_EQ(off.m_tx_hashes.size(), on.m_tx_hashes.size() - 3);
+        // Their fees leave the coinbase with them.
+        EXPECT_EQ(on.m_coinbase_value - off.m_coinbase_value,
+                  opt_fee(on, p.share) + opt_fee(on, p.reg) + opt_fee(on, p.dis));
+        // The ProDisTx never reached the collateral filter: nothing excluded.
+        EXPECT_TRUE(off.m_xcheck_collateral_excluded_txids.empty());
+        // The committed root is the block-connect root of the body served: S
+        // stays listed (no dissolution rode), R's updates apply.
+        v::CCbTx cb;
+        ASSERT_TRUE(v::parse_cbtx(off.m_coinbase_payload, cb));
+        EXPECT_EQ(cb.nVersion, v::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS);
+        std::vector<MutableTransaction> body;
+        for (const auto& t : off.m_txs) body.emplace_back(t);
+        const auto r = p.w.connect(body, cb.merkleRootMNList, [&](const DmlFoldEngine& eng) {
+            EXPECT_NE(eng.find(p.w.S), nullptr) << "S was dissolved";
+        });
+        EXPECT_TRUE(r.ok) << r.error;
+        v::CCbTx cb_on;
+        ASSERT_TRUE(v::parse_cbtx(on.m_coinbase_payload, cb_on));
+        EXPECT_NE(cb_on.merkleRootMNList, cb.merkleRootMNList) << "ON commits the dissolution";
+    }
+}
+
+TEST(DashV24AllTx, V24ProviderOptInDefaultIsTheTemplateBeforeTheFlag)
+{
+    for (int r_case = 0; r_case < 2; ++r_case) {
+        SCOPED_TRACE(r_case == 0 ? "R: types 2 and 3" : "R: type 4");
+        OptOutPool p(r_case);
+        const auto dflt = p.build(/*v24=*/true, std::nullopt);
+        const auto on = p.build(/*v24=*/true, true);
+        EXPECT_TRUE(SameTemplate(dflt, on)) << "the default is ON";
+        // The assertions of BuilderCarriesSharedTypesAtV24AndCommitsTheBlockConnectRoot.
+        for (const auto* t : p.shared_txs()) EXPECT_TRUE(opt_rides(dflt, *t)) << "type " << t->type;
+        for (const auto& t : p.r_txs) EXPECT_TRUE(opt_rides(dflt, t)) << "type " << t.type;
+        v::CCbTx cb;
+        ASSERT_TRUE(v::parse_cbtx(dflt.m_coinbase_payload, cb));
+        EXPECT_EQ(cb.nVersion, v::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS);
+        std::vector<MutableTransaction> body;
+        for (const auto& t : dflt.m_txs) body.emplace_back(t);
+        const auto r = p.w.connect(body, cb.merkleRootMNList, [&](const DmlFoldEngine& eng) {
+            EXPECT_EQ(eng.find(p.w.S), nullptr) << "the dissolution rode and removed S";
+        });
+        EXPECT_TRUE(r.ok) << r.error;
+        // The work source forwards the flag to the builder unchanged.
+        const auto sel_on = dash::coin::select_dash_work(p.inputs(true), [] { return dash::coin::DashWorkData{}; });
+        ASSERT_EQ(sel_on.source, dash::coin::WorkSource::Embedded);
+        EXPECT_TRUE(SameTemplate(sel_on.work, on));
+        const auto sel_off = dash::coin::select_dash_work(p.inputs(false), [] { return dash::coin::DashWorkData{}; });
+        ASSERT_EQ(sel_off.source, dash::coin::WorkSource::Embedded);
+        EXPECT_TRUE(SameTemplate(sel_off.work, p.build(/*v24=*/true, false)));
+        for (const auto* t : p.shared_txs()) EXPECT_FALSE(opt_rides(sel_off.work, *t)) << "type " << t->type;
+    }
+}
+
+TEST(DashV24AllTx, V24ProviderOptOutChangesNothingBeforeActivation)
+{
+    for (int r_case = 0; r_case < 2; ++r_case) {
+        SCOPED_TRACE(r_case == 0 ? "R: types 2 and 3" : "R: type 4");
+        OptOutPool p(r_case);
+        const auto off = p.build(/*v24=*/false, false);
+        EXPECT_TRUE(SameTemplate(p.build(/*v24=*/false, true), off));
+        EXPECT_TRUE(SameTemplate(p.build(/*v24=*/false, std::nullopt), off));
+        // Before v24 types 10-12 never ride, the opt-out or not; types 1-4 do.
+        for (const auto* t : p.shared_txs()) EXPECT_FALSE(opt_rides(off, *t)) << "type " << t->type;
+        for (const auto& t : p.r_txs) EXPECT_TRUE(opt_rides(off, t)) << "type " << t.type;
+        v::CCbTx cb;
+        ASSERT_TRUE(v::parse_cbtx(off.m_coinbase_payload, cb));
+        EXPECT_EQ(cb.nVersion, v::CCbTx::VERSION_CLSIG_AND_BALANCE) << "pre-activation: CbTx v3";
+    }
+}
+
+TEST(DashV24AllTx, V24ProviderOptOutKeepsAType1SharedRegistration)
+{
+    // A shared registration is a type-1 ProRegTx: the opt-out names types
+    // 10-12 only, so it still rides (BuilderCarriesARealSharedRegistrationOnlyAtV24).
+    V24World w;
+    const RealProReg* r = nullptr;
+    for (const auto& f : kTnProRegV3)
+        if (std::string(f.txid) == "8699ef5afd141f7b02f170db4f4875468ace2f6c84c6889f3e0280633ba65f40") r = &f;
+    ASSERT_NE(r, nullptr);
+    const auto tx = tx_from_hex(r->hex);
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    utxo.add_coin(::core::coin::Outpoint(u256("be2d2879d9c61c0be23d2e2a776258ecd34a0c305e08686d9be4c37386af0c0e"), 1),
+                  ::core::coin::Coin(59'949'999'775, script_of(unhex("76a9147e043aa93e5160be7d0a9051af26727304fbbbc988ac")),
+                                     1'583'288, false));
+    utxo.add_coin(::core::coin::Outpoint(u256("87b3ecbef212122cab1b6417d14a3e3dea52856e50e0de5f55ee0c6c865768a5"), 1),
+                  ::core::coin::Coin(100'000'000, script_of(unhex("76a91461c8a7a076a563357c2668c73a0f0f64882e607388ac")),
+                                     1'583'287, false));
+    utxo.add_coin(::core::coin::Outpoint(u256("be2d2879d9c61c0be23d2e2a776258ecd34a0c305e08686d9be4c37386af0c0e"), 0),
+                  ::core::coin::Coin(40'050'000'000, script_of(unhex("76a914837502f9d1483f4a19b153da729c4e2e49691d3488ac")),
+                                     1'583'288, false));
+    dash::coin::Mempool mp;
+    mp.set_utxo(&utxo);
+    ASSERT_TRUE(mp.add_tx(tx));
+    const auto sml = w.base_sml();
+    dash::coin::QuorumManager qmgr;
+    dash::coin::ProTxCheckEnv env;
+    env.net = dash::coin::DashNetwork::TESTNET;
+    env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+    const dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
+    auto build = [&](bool include_v24) {
+        return dash::coin::build_embedded_workdata(
+            r->height - 1, h256(0xAB), w.sm, mp, 0x1b104be3u, 1'790'987'000u, 140, 19, 1'790'987'100u, 0x20000000u,
+            nullptr, &sml, &qmgr, 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+            dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+            /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
+            /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, /*v24_active=*/true, &env, nullptr,
+            /*want_xcheck_aid=*/false, include_v24);
+    };
+    const auto on = build(true);
+    ASSERT_TRUE(opt_rides(on, tx)) << "fixture: the shared registration rides ON";
+    const auto off = build(false);
+    EXPECT_TRUE(opt_rides(off, tx)) << "a type-1 tx is not opted out";
+    EXPECT_TRUE(SameTemplate(on, off)) << "no type 10-12 in the pool: nothing changes";
+}
+
+TEST(DashV24AllTx, V24ProviderOptOutEmitGateRefusesTypes10To12)
+{
+    V24World w;
+    const uint256 prev = h256(0xAB);
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    dash::coin::NodeCoinState st;
+    st.set_v24_state_fn([](uint32_t) { return dash::coin::V24State::ACTIVE; });
+    st.set_require_sml(true);
+    st.sml() = w.base_sml();
+    st.set_have_sml(true);
+    st.set_sml_current_hash(prev);
+    {
+        MNState shared = w.shared, regular = w.regular;
+        shared.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+        regular.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+        st.mnstates().load({{w.S, shared}, {w.R, regular}}, V24World::H - 1);
+    }
+    st.set_include_mn_special_txs(true);
+    dash::coin::ProTxCheckEnv env;
+    env.net = dash::coin::DashNetwork::MAINNET;
+    env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
+    st.set_protx_check_env(env);
+    const dash::coin::MnFoldContext::OperatorSigFn sigfn = &v::verify_protx_operator_sig;
+    st.set_protx_operator_sig_verifier(sigfn);
+    st.mempool().set_utxo(&utxo);
+    st.set_tip(V24World::H - 1, prev, 0x1b104be3u, 1'800'000'000u, 76, 16, 1'800'000'100u, 0x20000000u);
+    utxo.add_coin(::core::coin::Outpoint(w.S, 0),
+                  ::core::coin::Coin(kColl, script_of(dash::coin::v24::shared_collateral_script()), 1, false));
+    const auto dis = w.dissolve_tx();
+    ASSERT_TRUE(st.mempool().add_tx(dis));
+    const auto wd = dash::coin::build_embedded_workdata(
+        V24World::H - 1, prev, std::as_const(st).mnstates(), st.mempool(), 0x1b104be3u,
+        1'800'000'000u, 76, 16, 1'800'000'100u, 0x20000000u, nullptr, &std::as_const(st).sml(),
+        &std::as_const(st).qmgr(), 0, dash::coin::k_zero_cl_sig, 0, nullptr, nullptr,
+        dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr, dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET,
+        /*suppress=*/false, "utxo-immature-serving", nullptr, false, nullptr,
+        /*include_mn_special_txs=*/true, nullptr, nullptr, &sigfn, /*v24_active=*/true, &env, nullptr);
+    ASSERT_TRUE(opt_rides(wd, dis)) << "fixture: the dissolution rides ON";
+    dash::coin::DeclineReport why;
+    ASSERT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
+
+    // The node hands the flag to the builder: default ON, the setter turns it off.
+    EXPECT_TRUE(st.include_v24_provider_txs());
+    EXPECT_TRUE(st.make_embedded_work_inputs().include_v24_provider_txs);
+    st.set_include_v24_provider_txs(false);
+    EXPECT_FALSE(st.make_embedded_work_inputs().include_v24_provider_txs);
+
+    // Opted out, a cached body carrying a type 10, 11 or 12 tx is refused.
+    EXPECT_FALSE(st.embedded_template_emit_ok(wd, &why));
+    EXPECT_EQ(why.cause, "emit-v24-provider-tx-opted-out");
+    EXPECT_EQ(why.value, "type=10");
+    for (const auto& t : {w.share_tx(0, ec_key(0x51).id, w.s0),
+                          w.sharedreg_tx(w.sop2.pub, ec_key(0x52).id, {&w.s0, &w.s1})}) {
+        auto one = wd;
+        one.m_txs.clear();
+        one.m_txs.emplace_back(t);
+        one.m_tx_hashes = {txid(t)};
+        one.m_tx_fees = {0};
+        EXPECT_FALSE(st.embedded_template_emit_ok(one, &why));
+        EXPECT_EQ(why.cause, "emit-v24-provider-tx-opted-out");
+        EXPECT_EQ(why.value, "type=" + std::to_string(t.type));
+    }
+    // The same node, opted back in, serves the dissolution again.
+    st.set_include_v24_provider_txs(true);
+    EXPECT_TRUE(st.embedded_template_emit_ok(wd, &why)) << why.cause << " " << why.value;
+}
+
+TEST(DashV24AllTx, V24ProviderOptOutCatalogRowAndOffToken)
+{
+    namespace cat = c2pool::catalog;
+    namespace cs = c2pool::settings;
+    const auto* row = cat::find_by_canon("embedded.include_v24_provider_txs");
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(row->type, cat::PType::TRISTATE_BOOL);
+    EXPECT_EQ(row->mutability, cat::Mut::RESTART);
+    EXPECT_FALSE(row->is_money());
+    EXPECT_TRUE(row->applies_to(cat::C_DASH));
+    EXPECT_EQ(row, cat::find_by_alias(cat::Bin::BIN_DASH, "--embedded-include-v24-provider-txs"));
+    ASSERT_EQ(row->aliases.size(), 1u);
+    EXPECT_EQ(row->aliases[0].style, cat::AliasStyle::FLAG_OPT_EQFALSE);
+    // The resolved config reads the OFF token as false, the bare flag as true,
+    // and an absent flag as unset (the code default, ON).
+    auto scan = [](const char* arg) {
+        cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(cat::C_DASH);
+        cs::CliTracker tracker;
+        std::string a0 = "c2pool-dash", a1 = arg ? arg : "";
+        std::vector<char*> argv = {a0.data()};
+        if (arg) argv.push_back(a1.data());
+        cs::scan_cli(static_cast<int>(argv.size()), argv.data(), cat::Bin::BIN_DASH, tracker, rc);
+        return rc.get_tri("embedded.include_v24_provider_txs");
+    };
+    EXPECT_EQ(scan("--embedded-include-v24-provider-txs=false"), cs::TriBool::False);
+    EXPECT_EQ(scan("--embedded-include-v24-provider-txs"), cs::TriBool::True);
+    EXPECT_EQ(scan(nullptr), cs::TriBool::Unset);
+
+    // main_dash parses exactly these spellings into the default-ON local and
+    // hands it to the node (whitespace-insensitive source scan). Any other
+    // spelling falls to the parser's final else: "unknown argument", exit 1.
+    std::ifstream in(DASH_MAIN_SRC);
+    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::string src;
+    for (std::istreambuf_iterator<char> it(in), end; it != end; ++it)
+        if (!std::isspace(static_cast<unsigned char>(*it))) src.push_back(*it);
+    auto has = [&](const char* needle) { return src.find(needle) != std::string::npos; };
+    EXPECT_TRUE(has("boolembedded_include_v24_provider_txs=true;"));
+    EXPECT_TRUE(has(R"("--embedded-include-v24-provider-txs")==0)embedded_include_v24_provider_txs=true;)"));
+    EXPECT_TRUE(has(R"("--embedded-include-v24-provider-txs=false")==0)embedded_include_v24_provider_txs=false;)"));
+    EXPECT_TRUE(has("node_coin_state.set_include_v24_provider_txs(embedded_include_v24_provider_txs);"));
+    EXPECT_TRUE(has(R"(std::cerr<<"unknownargument:"<<argv[i]<<"\n";return1;)"));
 }
 
 #endif  // C2POOL_DASH_BLS

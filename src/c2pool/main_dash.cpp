@@ -657,6 +657,8 @@ void print_banner(const char* argv0)
         << "           [--header-dgw-log-only]  (log, do not refuse, a header off its DGW bits)\n"
         << "           [--embedded-utxo[=false]] [--embedded-mainnet[=false]] [--embedded-null-arm[=false]]\n"
         << "           [--embedded-superblock[=false]] [--embedded-include-mn-special-txs[=false]]\n"
+        << "           [--embedded-include-v24-provider-txs[=false]]  (Dash v24 types 10-12 with the\n"
+        << "              special-tx superset; default ON; =false keeps them out, types 1-4 unaffected)\n"
         << "           [--embedded-superblock-unfunded-mainnet]  (TEST/SOAK ONLY — MUST NEVER be set on a\n"
         << "              production MAINNET node: serves a superblock height with a normal coinbase when\n"
         << "              the node believes no trigger is funded; a wrong belief loses the block. Default\n"
@@ -1435,7 +1437,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // superblock height without a funded trigger refuses (master's
              // behaviour). Testnet serves NotTriggered without it. Never
              // implied by any other flag.
-             bool embedded_superblock_unfunded_mainnet = false)
+             bool embedded_superblock_unfunded_mainnet = false,
+             // --embedded-include-v24-provider-txs[=false]: with the special-tx
+             // superset armed and Dash Core v24 active, the shared-masternode
+             // types 10-12 ride by default; false keeps them out of every
+             // template while types 1-4 still ride. Forwarded to
+             // NodeCoinState::set_include_v24_provider_txs.
+             bool embedded_include_v24_provider_txs = true)
 {
     namespace io = boost::asio;
 
@@ -3747,14 +3755,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         env.ecdsa = &dash::coin::protx_ecdsa_verify_hash;
         node_coin_state.set_protx_check_env(std::move(env));
     }
-    std::cout << "[run] embedded special-tx superset (provider types 1-4; from Dash Core v24 "
-                 "activation also 10-12; MNHF signals type 7): "
+    // Dash Core v24 provider types 10-12 ride the superset lever unless the
+    // operator opts out (--embedded-include-v24-provider-txs=false); types 1-4
+    // are unaffected by that opt-out.
+    node_coin_state.set_include_v24_provider_txs(embedded_include_v24_provider_txs);
+    std::cout << "[run] embedded special-tx superset (provider types 1-4; MNHF signals type 7): "
               << (embedded_include_mn_special_txs
                       ? "ON (--embedded-include-mn-special-txs: SML-folded "
                         "special txs admitted; root re-folded + drift-rejected "
                         "at emit)"
                       : "OFF (default off / dashd-armed: special txs excluded, "
                         "coinbase-only for those types)")
+              << "; v24-provider-txs="
+              << (!embedded_include_mn_special_txs
+                      ? "off (the superset is off)"
+                      : embedded_include_v24_provider_txs
+                            ? "on (types 10-12 ProDisTx/ProUpShareTx/ProUpSharedRegTx ride "
+                              "from Dash Core v24 activation; opt out: "
+                              "--embedded-include-v24-provider-txs=false)"
+                            : "off (--embedded-include-v24-provider-txs=false: types 10-12 "
+                              "never selected; types 1-4 still ride)")
               << "\n";
     node_coin_state.set_accrue_pending_asset_locks(embedded_accrue_asset_locks);
     std::cout << "[run] embedded #107 asset-lock accrual: "
@@ -13043,6 +13063,12 @@ int main(int argc, char** argv)
     // UNCHANGED. Explicit opt-out: --embedded-include-mn-special-txs=false.
     bool embedded_include_mn_special_txs = false;
     bool embedded_include_mn_special_txs_off = false; // --embedded-include-mn-special-txs=false
+    // --embedded-include-v24-provider-txs[=false]: Dash Core v24 provider types
+    // 10-12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) ride with the superset
+    // above from v24 activation. Default ON (both postures). The opt-out is
+    // exactly --embedded-include-v24-provider-txs=false; any other value is an
+    // unknown argument and the node refuses to start.
+    bool embedded_include_v24_provider_txs = true;
     // --embedded-creditpool-publish-at-serve-tip: publish the derived credit
     // pool AT THE SERVE TIP rather than at the folded body height (PR-5,
     // dashd GetCreditPool(pindexPrev) parity). MONEY PATH -> default OFF: it
@@ -13303,6 +13329,10 @@ int main(int argc, char** argv)
             embedded_include_mn_special_txs = true;   // special-tx superset (DIP types 1-4)
         else if (std::strcmp(argv[i], "--embedded-include-mn-special-txs=false") == 0)
             embedded_include_mn_special_txs_off = true; // good-citizen opt-out
+        else if (std::strcmp(argv[i], "--embedded-include-v24-provider-txs") == 0)
+            embedded_include_v24_provider_txs = true;   // v24 types 10-12 (the default)
+        else if (std::strcmp(argv[i], "--embedded-include-v24-provider-txs=false") == 0)
+            embedded_include_v24_provider_txs = false;  // opt-out: 10-12 kept out, 1-4 ride
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest") == 0)
             embedded_mempool_ingest = true;
         else if (std::strcmp(argv[i], "--embedded-mempool-ingest=false") == 0)
@@ -13800,6 +13830,12 @@ int main(int argc, char** argv)
         if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee     = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
         if (rc.file_set("money.give_author_pct"))    dev_donation       = rc.get_double("money.give_author_pct").value_or(dev_donation);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
+        // The v24 provider opt-out from a settings file (the CLI wins): only an
+        // explicit true keeps types 10-12 on, any other value turns them off,
+        // so a file entry is never silently ignored.
+        if (rc.file_set("embedded.include_v24_provider_txs"))
+            embedded_include_v24_provider_txs =
+                rc.get_tri("embedded.include_v24_provider_txs") == cs::TriBool::True;
         // #157 Slice 3: control-plane apply token file. A settings-file value is
         // honored (CLI wins) exactly like the overlays above; because the row is
         // money-class it already passed the money-ack gate to reach here.
@@ -14245,7 +14281,8 @@ int main(int argc, char** argv)
                         embedded_utxo_fold_expect,     // W5-A anchor restatement
                         explorer_enabled,             // /api/explorer surface (default ON)
                         embedded_include_mn_special_txs, // special-tx superset (DIP types 1-4)
-                        embedded_superblock_unfunded_mainnet); // explicit mainnet NotTriggered opt-in
+                        embedded_superblock_unfunded_mainnet, // explicit mainnet NotTriggered opt-in
+                        embedded_include_v24_provider_txs);   // v24 types 10-12 (default ON)
     }
     return run_selftest();
 }

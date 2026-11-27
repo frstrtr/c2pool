@@ -1033,6 +1033,10 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_govvote_bls PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)
+    # Source-scan KAT (test_dash_v24_alltx.cpp): main_dash.cpp parses the v24
+    # provider opt-out token into the default-ON local.
+    target_compile_definitions(test_dash_govvote_bls PRIVATE
+        DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp")
     gtest_discover_tests(test_dash_govvote_bls DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 60)
 
     endif()  # C2POOL_DASH_BLS: the BLS-crypto KATs need the dashbls backend (built in the linux-dash-bls job); skipped in the default OFF build

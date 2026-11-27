@@ -2732,8 +2732,9 @@ public:
     //
     // Dash Core v24 (the embedded builder sets these from its own inputs):
     //   * types 10-12 (ProDisTx/ProUpShareTx/ProUpSharedRegTx) — admitted when
-    //     allow_v24_provider (DEPLOYMENT_V24 active for the block and the v24
-    //     fold armed: the template folds them, sml_special_fold.hpp); a
+    //     allow_v24_provider (DEPLOYMENT_V24 active for the block, the v24
+    //     fold armed and no --embedded-include-v24-provider-txs=false opt-out:
+    //     the template folds them, sml_special_fold.hpp); a
     //     ProDisTx may then spend its shared masternode's template-script
     //     collateral, the only spend Core allows of that coin;
     //   * type 7 (MNHF signal) — admitted when allow_mnhf (the builder runs

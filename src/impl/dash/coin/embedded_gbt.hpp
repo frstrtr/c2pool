@@ -759,7 +759,8 @@ inline DashWorkData build_embedded_workdata(
     // positional caller is byte-unchanged (the folded copy is never built).
     // Dash Core v24: with v24_active the same lever admits the shared-
     // masternode types 10-12 (the fold then runs the v24 transitions for every
-    // provider type), and, with mnhf_check_env, type-7 MNHF signals.
+    // provider type; include_v24_provider_txs=false keeps 10-12 out), and,
+    // with mnhf_check_env, type-7 MNHF signals.
     // The type-8 (asset-lock) selection leg rides accrue_pending_asset_locks;
     // types 5/6/9 are never selected (type-6 is builder-generated, type-9 is
     // admission-path-only via admitted_asset_unlocks).
@@ -798,7 +799,14 @@ inline DashWorkData build_embedded_workdata(
     // w.m_xcheck_collateral_aid. Only a node that runs the GBT-xcheck asks for
     // it. false (default) => nothing kept; the template is byte-unchanged
     // either way.
-    bool want_xcheck_aid = false)
+    bool want_xcheck_aid = false,
+    // --embedded-include-v24-provider-txs (default true). With the special-tx
+    // superset armed and v24 active, false keeps the shared-masternode types
+    // 10-12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) out of selection while
+    // types 1-4 and type 7 still ride. A ProDisTx then never reaches the body,
+    // so its collateral-spend exemption below never applies. true (default)
+    // => byte-identical to the template before this parameter existed.
+    bool include_v24_provider_txs = true)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -907,12 +915,14 @@ inline DashWorkData build_embedded_workdata(
     // types 1-4 (the fold then runs the v24 transitions for all of them), and
     // the selection applies Core v24's type list. MNHF signals (type 7) ride
     // the lever when their checks are wired (mnhf_check.hpp); they change no
-    // CbTx root.
+    // CbTx root. include_v24_provider_txs=false (operator opt-out) masks types
+    // 10-12 alone: types 1-4 and 7 are unaffected.
     Mempool::SpecialTxSelectMask special_mask;
     special_mask.allow_all_special = false;                 // never the general path here
     special_mask.allow_mn_types    = include_mn_special_txs && (sml != nullptr);
     special_mask.allow_locks       = accrue_pending_asset_locks;
-    special_mask.allow_v24_provider = special_mask.allow_mn_types && v24_active;
+    special_mask.allow_v24_provider = special_mask.allow_mn_types && v24_active
+                                      && include_v24_provider_txs;
     special_mask.allow_mnhf        = include_mn_special_txs && mnhf_check_env != nullptr;
     special_mask.v24_rules         = v24_active;
     // suppress_mempool_txs: coinbase-only body, total_fees == 0 exactly. The
@@ -978,6 +988,10 @@ inline DashWorkData build_embedded_workdata(
             // spending its collateral. With the v24 fold armed it stays: the
             // fold checks it (CheckProDisTx) and removes the masternode in the
             // collateral-spend pass, so the committed root carries the removal.
+            // Under the v24 provider opt-out allow_v24_provider is false, so
+            // selection never hands a ProDisTx to this loop (the mask refuses
+            // type 10 and the shared-collateral input), and no exemption is
+            // taken.
             const bool v24_dissolve = special_mask.allow_v24_provider
                 && tx_is_special_version(selected[i].tx.version)
                 && selected[i].tx.type == tx_type::PROVIDER_DISSOLVE;

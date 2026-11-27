@@ -469,6 +469,14 @@ public:
     void set_include_mn_special_txs(bool v) { m_include_mn_special_txs = v; bump_root_memo_epoch(); }
     bool include_mn_special_txs() const { return m_include_mn_special_txs; }
 
+    /// --embedded-include-v24-provider-txs (default ON): with the superset
+    /// above armed and Dash Core v24 active, OFF keeps the shared-masternode
+    /// types 10-12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) out of the
+    /// served body while types 1-4 still ride; the emit gate then refuses any
+    /// body that carries one. ON is today's behaviour.
+    void set_include_v24_provider_txs(bool v) { m_include_v24_provider_txs = v; bump_root_memo_epoch(); }
+    bool include_v24_provider_txs() const { return m_include_v24_provider_txs; }
+
     /// GBT-xcheck label aid (gbt_xcheck_dashd_only_collateral.hpp): the
     /// builder keeps its committed fold in the template so the xcheck can
     /// label a collateral spend only dashd's template carries. main_dash sets
@@ -1937,10 +1945,18 @@ public:
         // Dash Core v24: a ProDisTx spends its shared masternode's collateral
         // by design. With the special-tx fold armed it is allowed through here
         // and the fold below checks it and removes the masternode (refusing the
-        // template on any doubt).
-        const bool v24_fold = m_include_mn_special_txs && v24_state_for(next_h) == V24State::ACTIVE;
+        // template on any doubt). Under the v24 provider opt-out no type 10-12
+        // tx may ride at all, and a ProDisTx is a collateral spend like any
+        // other.
+        const bool v24_fold = m_include_mn_special_txs && m_include_v24_provider_txs
+                              && v24_state_for(next_h) == V24State::ACTIVE;
         for (const auto& tx : w.m_txs) {
             uint256 protx;
+            if (!m_include_v24_provider_txs && tx_is_special_version(tx.version)
+                && tx_type_is_v24_provider(tx.type))
+                return reject("emit-v24-provider-tx-opted-out",
+                              "type=" + std::to_string(tx.type),
+                              "no-type-10-12-in-template");
             if (v24_fold && tx_is_special_version(tx.version) && tx.type == tx_type::PROVIDER_DISSOLVE)
                 continue;
             if (tx_spends_mn_collateral(m_mnstates, tx, &protx))
@@ -2448,6 +2464,8 @@ public:
         // SUPERSET: include provider special txs (types 1-4) + fold them into
         // the committed merkleRootMNList. Default OFF (canary flag).
         e.include_mn_special_txs = m_include_mn_special_txs;
+        // v24 provider types 10-12 (default ON; OFF keeps them out).
+        e.include_v24_provider_txs = m_include_v24_provider_txs;
         // GBT-xcheck label aid (never served; false => nothing kept).
         e.want_xcheck_aid = m_xcheck_collateral_aid;
         // E-SUPERBLOCK: hand the resolved treasury schedule to the builder.
@@ -3127,6 +3145,10 @@ private:
     // Consumed by make_embedded_work_inputs (builder) and
     // embedded_template_emit_ok (matching folded-root emit-gate re-derivation).
     bool m_include_mn_special_txs{false};
+    // --embedded-include-v24-provider-txs (set_include_v24_provider_txs).
+    // Default ON. Consumed by make_embedded_work_inputs (builder) and
+    // embedded_template_emit_ok (refuses a type 10-12 tx while OFF).
+    bool m_include_v24_provider_txs{true};
     // GBT-xcheck label aid requested (set_xcheck_collateral_aid). Default OFF.
     bool m_xcheck_collateral_aid{false};
     MnFoldContext::OperatorSigFn m_protx_sig_verifier;   // B.9 (unset => refuse types 2/4)
