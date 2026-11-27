@@ -27,6 +27,11 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 #include <functional>
 #include <future>
 #include <memory>
@@ -224,4 +229,46 @@ TEST(DgbStratumBestShare, UnbuildableCoinbaseIsHeldNotEmpty)
     r = ws->build_connection_coinbase(uint256(), "00", Bytes{0x76, 0xa9, 0x14, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x88, 0xac}, {});
     EXPECT_TRUE(r.held);
     EXPECT_TRUE(r.coinb1.empty());
+}
+
+// Review dd1248abd #6: a throw while the job coinbase is built (a V35 key the
+// PPLNS split cannot turn into a script) is no job, never an exception out of
+// the core session's io handler.
+TEST(DgbStratumBestShare, AThrowingCoinbaseBuildIsHeld)
+{
+    Ws w;
+    auto ws = w.make();
+    int calls = 0;
+    ws->set_pplns_inputs_fn([&calls](const uint256&, const std::string&, const Bytes&,
+                                     const std::vector<std::pair<uint32_t, Bytes>>&, const Bytes&,
+                                     const dgb::stratum::DGBWorkSource::JobBlock&)
+                                -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
+        ++calls;
+        throw std::runtime_error("V35 PPLNS key has no script");
+    });
+    const Bytes p2pkh{0x76, 0xa9, 0x14, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+                      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x88, 0xac};
+    core::stratum::CoinbaseResult r;
+    EXPECT_NO_THROW(r = ws->build_connection_coinbase(kBestA, "00", p2pkh, {}));
+    EXPECT_EQ(calls, 1) << "the producer was not reached";
+    EXPECT_TRUE(r.held);
+    EXPECT_TRUE(r.coinb1.empty());
+
+    // The PPLNS->coinbase build is inside the same guard.
+#ifdef DGB_MAIN_SRC
+    const auto src = std::filesystem::path(DGB_MAIN_SRC).parent_path().parent_path() / "impl" / "dgb" / "stratum"
+                     / "work_source.cpp";
+    std::ifstream f(src);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string body = ss.str();
+    const auto t = body.find("        inputs = fn(prev_share_hash, extranonce1_hex, eff_payout_script,");
+    ASSERT_NE(t, std::string::npos);
+    const auto b = body.find("parts = dgb::coin::build_connection_coinbase_from_pplns(*inputs);", t);
+    const auto c = body.find("} catch (const std::exception& e) {", t);
+    ASSERT_NE(b, std::string::npos);
+    ASSERT_NE(c, std::string::npos);
+    EXPECT_LT(b, c);
+    EXPECT_LT(body.rfind("    try {", t), t);
+#endif
 }

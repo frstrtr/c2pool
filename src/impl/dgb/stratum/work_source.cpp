@@ -865,13 +865,25 @@ core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
     block.value = coinbase_value(block.height, /*total_fees=*/0, /*gbt_coinbasevalue=*/std::nullopt);
     block.local_hash_rate = local_hash_rate;
 
-    std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs =
-        fn(prev_share_hash, extranonce1_hex, eff_payout_script, eff_merged_addrs, aux_mm_scriptsig, block);
-    if (!inputs)
-        return held();  // producer declined (no or unknown prev share, tracker busy): no job.
-
-    dgb::coin::ConnCoinbaseParts parts =
-        dgb::coin::build_connection_coinbase_from_pplns(*inputs);
+    // The producer and the PPLNS->coinbase build may throw (review dd1248abd
+    // #6: a V35 key the split cannot turn into a script). The core session
+    // has no try around its job build, so an escaping throw would leave the
+    // io handler: no job instead, logged at most once a minute.
+    std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs;
+    dgb::coin::ConnCoinbaseParts parts;
+    try {
+        inputs = fn(prev_share_hash, extranonce1_hex, eff_payout_script, eff_merged_addrs, aux_mm_scriptsig, block);
+        if (!inputs)
+            return held();  // producer declined (no or unknown prev share, tracker busy): no job.
+        parts = dgb::coin::build_connection_coinbase_from_pplns(*inputs);
+    } catch (const std::exception& e) {
+        static std::atomic<int64_t> s_last_log{0};
+        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+        int64_t last = s_last_log.load();
+        if (now - last >= 60 && s_last_log.compare_exchange_strong(last, now))
+            LOG_ERROR << "[DGB-STRATUM] job coinbase build failed (" << e.what() << "): no job";
+        return held();
+    }
 
     core::stratum::CoinbaseResult out;
     out.coinb1 = std::move(parts.coinb1);
