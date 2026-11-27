@@ -327,8 +327,8 @@ TEST(StratumDuplicateSubmit, OnlyTheCanonicalSpellingIsTaken)
 {
     std::vector<Submit> v;
     v.push_back(Submit{"00000000", "6ae2a090", "00000001", ""});
-    for (const std::string n : {"1", "0x00000001", "00000001zz", " 0000001", "+0000001",
-                                std::string(300, '0') + "1", std::string(16000, '0')})
+    for (const std::string& n : std::vector<std::string>{"1", "0x00000001", "00000001zz", " 0000001", "+0000001",
+                                                          std::string(300, '0') + "1", std::string(16000, '0')})
         v.push_back(Submit{"00000000", "6ae2a090", n, ""});
     v.push_back(Submit{"0000000", "6ae2a090", "00000002", ""});      // extranonce2 one digit short
     v.push_back(Submit{"0000000000", "6ae2a090", "00000002", ""});   // and one byte long
