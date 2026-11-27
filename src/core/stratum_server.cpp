@@ -1818,7 +1818,8 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         //     accepted (below). "+0", negatives, "+inf" and "+nan" set no
         //     difficulty (std::stod accepts inf/nan, so a bare "> 0" check let
         //     "+inf" through).
-        //   "/N": this login's share difficulty (p2pool desired_share_target).
+        //   "/N": this login's share difficulty (p2pool desired_share_target),
+        //     handed to the work source with every job (send_notify_work).
         //     Set or cleared by every authorize.
         // Worker: '.' or '_' (python compat; '_' wins), cut from the address.
         const auto login = stratum_username::parse_login(username_);
@@ -3150,6 +3151,10 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     std::vector<unsigned char> job_payout_script;
     std::map<uint32_t, std::vector<unsigned char>> job_merged_scripts;
     std::optional<uint16_t> job_share_donation;
+    // The login's "/N", read once for this job: the job's share bits
+    // (frozen_ref) are sized by it, so a re-authorize changes the jobs built
+    // after it only.
+    const std::optional<double> job_share_difficulty = share_difficulty_override_;
     if (frozen_best_share)
         frozen_prev_share = *frozen_best_share;  // use cycle-frozen value (from notify_all)
     else if (auto fn = mining_interface_->get_best_share_hash_fn())
@@ -3241,9 +3246,11 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         job_merged_scripts = std::map<uint32_t, std::vector<unsigned char>>(merged_addrs.begin(), merged_addrs.end());
         // The share target is sized by this connection's login key (its
         // pseudoshares' key, zero for a keyless login), not by the job's
-        // payout: a node-fee job is its miner's job but for the payout.
+        // payout: a node-fee job is its miner's job but for the payout; and
+        // by the login's "/N" when it gave one.
         cbr = mining_interface_->build_connection_coinbase_for(
-            pubkey_hash_, frozen_prev_share, extranonce1_, payout_script, merged_addrs, job_share_donation);
+            pubkey_hash_, frozen_prev_share, extranonce1_, payout_script, merged_addrs, job_share_donation,
+            job_share_difficulty);
         if (cbr.held) {
             // No coinbase its shares could verify (the sharechain is busy): no
             // job now — the miner keeps its last one — never the global

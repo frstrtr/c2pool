@@ -310,7 +310,9 @@ private:
 
     // Per-miner SHARE difficulty from a colon-less "ADDR/<diff>" login token
     // (p2pool desired_share_target), set by every authorize. Unset when absent
-    // or not a finite value > 0. Parsed here only; consumers wire it per coin.
+    // or not a finite value > 0. Each job hands it to the work source
+    // (IWorkSource::build_connection_coinbase_for desired_share_difficulty);
+    // a lane that sizes a job's share target per miner uses it.
     std::optional<double> share_difficulty_override_;
 
     // Difficulty last sent with mining.set_difficulty (internal units; 0 =
