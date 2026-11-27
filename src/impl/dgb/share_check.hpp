@@ -1003,6 +1003,17 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
         return pubkey_hash_to_script(obj->m_pubkey_hash, 0);
 }
 
+// The PPLNS weight key of a share: V34/V35 shares by their ADDRESS STRING
+// (tagged, v35_weight_key), as the python V35 network keys them
+// (WeightsSkipList: share.address); V36 shares by script.
+inline std::vector<unsigned char> get_share_weight_key(const auto* obj)
+{
+    if constexpr (requires { obj->m_address; })
+        return v35_weight_key(std::string(obj->m_address.m_data.begin(), obj->m_address.m_data.end()));
+    else
+        return get_share_script(obj);
+}
+
 // ============================================================================
 // generate_share_transaction()
 //
@@ -1106,7 +1117,9 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
     // pre-V36 formulae, 0.5% finder fee, >=1-sat V36 donation floor with the
     // (amount, script) tiebreak, and the ascending sort truncated to [-4000:]).
     // Reference: frstrtr/p2pool-merged-v36 data.py generate_transaction().
-    auto finder_script = get_share_script(&share);
+    // Pre-V36: the finder is keyed like the weights, by the share's address
+    // string as it carries it (get_share_weight_key).
+    auto finder_script = use_v36_pplns ? get_share_script(&share) : get_share_weight_key(&share);
     auto pplns_split = dgb::coin::compute_pplns_payout_split(
         weights, total_weight, subsidy, use_v36_pplns, finder_script);
     auto& payout_outputs = pplns_split.payout_outputs;

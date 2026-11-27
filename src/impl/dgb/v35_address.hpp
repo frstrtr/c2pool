@@ -33,6 +33,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -257,6 +258,53 @@ inline std::string v35_script_to_address(const std::vector<unsigned char>& s, co
         return out;
     }
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// V34/V35 PPLNS keys (review 906a0e5e3 REQUIRED 2). The python V35 network
+// keys a share's weight by its ADDRESS STRING (data.py WeightsSkipList:
+// share.address), sums amounts per string, merges the donation's own P2PKH
+// address (donation_script_to_address) into the donation, sorts the dests by
+// string and derives each output's script from its string. A V35 weight key
+// here is kV35AddressKeyTag followed by the address bytes; distinct strings
+// with one script (uppercase bech32, another witness version, a shortened
+// 32-byte program) stay distinct outputs, as in python.
+// ---------------------------------------------------------------------------
+inline constexpr unsigned char kV35AddressKeyTag = 0xfe;   // no payout script starts with it
+
+inline std::vector<unsigned char> v35_weight_key(const std::string& addr)
+{
+    std::vector<unsigned char> k;
+    k.reserve(1 + addr.size());
+    k.push_back(kV35AddressKeyTag);
+    k.insert(k.end(), addr.begin(), addr.end());
+    return k;
+}
+
+inline bool is_v35_weight_key(const std::vector<unsigned char>& k)
+{
+    return !k.empty() && k[0] == kV35AddressKeyTag;
+}
+
+inline std::string v35_key_address(const std::vector<unsigned char>& k)
+{
+    return is_v35_weight_key(k) ? std::string(k.begin() + 1, k.end()) : std::string();
+}
+
+/// python donation_script_to_address(net): the P2PK donation script read as
+/// script2_to_pubkey_address, i.e. the base58 P2PKH address of hash160(pubkey).
+inline std::string v35_donation_address(const std::vector<unsigned char>& p2pk_script, const V35AddressNet& net)
+{
+    if (p2pk_script.size() < 3 || p2pk_script.back() != 0xac || p2pk_script[0] != p2pk_script.size() - 2)
+        return {};
+    unsigned char h[20];
+    CHash160().Write(std::span<const unsigned char>(p2pk_script.data() + 1, p2pk_script.size() - 2))
+        .Finalize(std::span<unsigned char>(h, 20));
+    std::vector<unsigned char> s{0x76, 0xa9, 0x14};
+    s.insert(s.end(), h, h + 20);
+    s.push_back(0x88);
+    s.push_back(0xac);
+    return v35_script_to_address(s, net);
 }
 
 } // namespace dgb

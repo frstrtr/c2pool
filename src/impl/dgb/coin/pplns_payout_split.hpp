@@ -35,6 +35,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -67,10 +69,40 @@ inline PplnsPayoutSplit compute_pplns_payout_split(
 {
     std::map<std::vector<unsigned char>, uint64_t> amounts;
 
+    // Pre-V36 (the python V35 network): every key is an ADDRESS STRING
+    // (python WeightsSkipList keys by share.address; data.py
+    // generate_transaction sums amounts per string, merges the donation's own
+    // P2PKH address into the donation, sorts by string, and derives each
+    // output's script from its string). V34/V35 weights arrive keyed by
+    // address (v35_weight_key); a script key (the finder from the job
+    // producer, a script-keyed caller) is read as its canonical address, the
+    // string a share minted here carries.
+    std::map<std::vector<unsigned char>, uint288> keyed;
+    const std::map<std::vector<unsigned char>, uint288>* w = &weights;
+    std::vector<unsigned char> finder = finder_script;
+    std::vector<unsigned char> donation_key;
+    const auto net = dgb::v35_address_net(dgb::PoolConfig::is_testnet);
+    if (!use_v36_pplns)
+    {
+        auto canon = [&net](const std::vector<unsigned char>& k) {
+            if (k.empty() || dgb::is_v35_weight_key(k))
+                return k;
+            const std::string a = dgb::v35_script_to_address(k, net);
+            return a.empty() ? k : dgb::v35_weight_key(a);
+        };
+        for (const auto& [k, x] : weights)
+            keyed[canon(k)] += x;
+        w = &keyed;
+        finder = canon(finder_script);
+        const std::string da = dgb::v35_donation_address(dgb::PoolConfig::get_donation_script(35), net);
+        if (!da.empty())
+            donation_key = dgb::v35_weight_key(da);
+    }
+
     // --- exact integer payout amounts (generate_share_transaction step 2) ---
     if (!total_weight.IsNull())
     {
-        for (auto& [script, weight] : weights)
+        for (auto& [script, weight] : *w)
         {
             uint64_t amount;
             if (use_v36_pplns)
@@ -91,9 +123,13 @@ inline PplnsPayoutSplit compute_pplns_payout_split(
         }
     }
 
-    // Pre-V36: add 0.5% finder fee to share creator.
-    if (!use_v36_pplns)
-        amounts[finder_script] += subsidy / 200;
+    // Pre-V36: add 0.5% finder fee to share creator; the donation's own
+    // address is merged into the donation (python amounts[donation_address]).
+    if (!use_v36_pplns) {
+        amounts[finder] += subsidy / 200;
+        if (!donation_key.empty())
+            amounts.erase(donation_key);
+    }
 
     // Donation = subsidy minus the sum of all payout amounts.
     uint64_t sum_amounts = 0;
@@ -145,24 +181,28 @@ inline PplnsPayoutSplit compute_pplns_payout_split(
                 return a.first < b.first;                             // asc by script tiebreak
             });
     } else {
-        const auto net = dgb::v35_address_net(dgb::PoolConfig::is_testnet);
-        std::map<std::vector<unsigned char>, std::string> key;
-        for (const auto& [script, amount] : amounts)
-            key.emplace(script, dgb::v35_script_to_address(script, net));
+        // Keys are address strings (tagged): byte order is python's string order.
         std::sort(out.payout_outputs.begin(), out.payout_outputs.end(),
-            [&key](const auto& a, const auto& b) {
+            [](const auto& a, const auto& b) {
                 if (a.second != b.second) return a.second < b.second; // asc by amount
-                const std::string& ka = key.at(a.first);
-                const std::string& kb = key.at(b.first);
-                if (ka.empty() != kb.empty()) return kb.empty();      // addressed ones first
-                if (ka != kb) return ka < kb;                         // asc by address string
-                return a.first < b.first;
+                return a.first < b.first;                             // asc by address string
             });
     }
     const std::size_t max_payouts = use_v36_pplns ? PPLNS_MAX_OUTPUTS : PPLNS_MAX_OUTPUTS - 1;
     if (out.payout_outputs.size() > max_payouts)
         out.payout_outputs.erase(out.payout_outputs.begin(),
                                  out.payout_outputs.end() - static_cast<std::ptrdiff_t>(max_payouts));
+    // Pre-V36: each output's script from its own string (python
+    // address_to_script2): distinct strings may share a script.
+    if (!use_v36_pplns)
+        for (auto& [key, amount] : out.payout_outputs) {
+            if (!dgb::is_v35_weight_key(key))
+                continue;
+            auto script = dgb::v35_address_to_script(dgb::v35_key_address(key), net);
+            if (!script)
+                throw std::invalid_argument("V35 PPLNS address is not payable: " + dgb::v35_key_address(key));
+            key = std::move(*script);
+        }
     return out;
 }
 

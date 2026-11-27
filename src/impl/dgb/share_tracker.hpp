@@ -2270,7 +2270,12 @@ public:
                 uint64_t amount = (uint288(subsidy) * uint288(199) * weight / (uint288(200) * total_weight)).GetLow64();
                 if (amount > 0)
                 {
-                    result[script] = static_cast<double>(amount);
+                    // V35 weights are keyed by address string: shown by script.
+                    std::vector<unsigned char> out = script;
+                    if (is_v35_weight_key(script))
+                        out = v35_address_to_script(v35_key_address(script),
+                                                    v35_address_net(PoolConfig::is_testnet)).value_or(script);
+                    result[out] += static_cast<double>(amount);
                     sum += amount;
                 }
             }
@@ -3087,7 +3092,8 @@ private:
                     auto att = chain::target_to_average_attempts(target);
                     delta.total_weight = att * 65535;
                     delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
-                    auto addr_bytes = get_share_script(obj);
+                    // V34/V35 by address string (python share.address), V36 by script.
+                    auto addr_bytes = get_share_weight_key(obj);
                     delta.weights[addr_bytes] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                 });
                 return delta;
