@@ -72,6 +72,7 @@
 #include <impl/nmc/coin/headers_wire.hpp>         // parse_nmc_headers_message (AuxPoW intact)
 #include <impl/ltc/config_coin.hpp>               // ltc::config::P2PData/RPCData — BroadcasterConfig adapter dep (coin_broadcaster.hpp; main_ltc pulls it via config.hpp)
 #include <c2pool/merged/coin_broadcaster.hpp>     // CoinBroadcaster (NMC coin-P2P header-feed)
+#include <c2pool/merged/merged_donation.hpp>      // merged_donation_script (aux coinbase donation)
 
 #include <core/author_fee.hpp>                   // SSOT author-fee default + donation_percent_to_u16
 #include <core/coin/utxo.hpp>
@@ -87,6 +88,7 @@
 #include <core/hash.hpp>
 #include <core/stratum_server.hpp>
 #include <core/address_utils.hpp>       // core::address_to_script (node-owner fee destination)
+#include <core/analytics_tag.hpp>        // --analytics-id / web.analytics_id
 #include <core/web_server.hpp>          // H-STATS.944: operator dashboard + graph_db persist
 #include <btclibs/util/strencodings.h>
 
@@ -179,6 +181,11 @@ static void print_usage()
         "  --stratum-tls-handshakes N / --stratum-tls-handshakes-per-ip N  TLS\n"
         "                  handshakes in progress at once, in total and from one\n"
         "                  address (default 32 and 8; 0 = no limit).\n"
+        "  --analytics-id ID  Google Analytics (GA4) measurement ID, G-XXXXXXXXXX;\n"
+        "                  off by default. Every HTML page --http serves then shows a\n"
+        "                  consent bar; only after a visitor accepts are GA4 page views\n"
+        "                  sent, with addresses and query strings stripped. You are\n"
+        "                  responsible for your own privacy notice.\n"
         "  --sharechain-port P  bind the sharechain (pool P2P) listener on\n"
         "                  port P instead of the default 9333, so a SECOND\n"
         "                  isolated c2pool-btc instance can run on one host\n"
@@ -489,6 +496,14 @@ int main(int argc, char* argv[])
             dev_donation    = std::strtod(argv[++i], nullptr);
             give_author_set = true;
         }
+        else if (arg == "--analytics-id" && i + 1 < argc)
+        {
+            if (!core::parse_analytics_id(argv[++i], core::analytics_id_setting())) {
+                std::cerr << "bad value: --analytics-id " << argv[i]
+                          << " (expected a Google Analytics measurement ID, G-XXXXXXXXXX)\n";
+                return 1;
+            }
+        }
         else if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0)
         {
             // --stratum-http[=true|false|auto]: the web API on the stratum port
@@ -576,6 +591,9 @@ int main(int argc, char* argv[])
             else { h = v.substr(0, c); p = static_cast<uint16_t>(std::stoi(v.substr(c + 1))); }
         };
         if (rc.file_set("web.port"))          http_port = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
+        if (rc.file_set("web.analytics_id"))   // --analytics-id: a bad value is warned about and ignored
+            core::apply_analytics_id_setting("web.analytics_id", rc.get_string("web.analytics_id").value_or(""),
+                                             core::analytics_id_setting());
         if (rc.file_set("stratum.http"))   // --stratum-http: true / false / auto
             core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""),
                                              core::stratum_http_mode_setting());
@@ -2341,9 +2359,11 @@ int main(int argc, char* argv[])
             tracker.chain.get(best).share.invoke([&](auto* s) {
                 block_target = chain::bits_to_target(s->m_min_header.m_bits);
             });
-            // Merged chains commit the V36 (P2SH) donation script regardless
-            // of parent share version (p2pool data.py:303).
-            auto donation_script = btc::PoolConfig::get_donation_script(36);
+            // The aux coinbase's donation and PPLNS remainder: the single
+            // P2PKH key whatever the parent share version
+            // (merged_donation.hpp); the BTC coinbase keeps its own
+            // version-dependent donation.
+            const auto& donation_script = c2pool::merged::merged_donation_script();
             std::map<std::vector<unsigned char>, uint64_t> payouts_map;
             try {
                 payouts_map = tracker.get_merged_expected_payouts(
@@ -2837,6 +2857,7 @@ int main(int argc, char* argv[])
         // web-static so "/" resolves. Display-only — no share/reward/consensus.
         mi->set_dashboard_always_ready(true);
         web_server->set_dashboard_dir("web-static");
+        web_server->set_analytics_id(core::analytics_id_setting());   // --analytics-id (default off)
 
         // D-BTC dashboard feeds (integrator 2026-08-03): mirror of D-BCH
         // (PR #1055) into the live MiningInterface the H-STATS.944 seam already

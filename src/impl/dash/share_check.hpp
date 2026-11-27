@@ -138,14 +138,23 @@ inline uint256 check_merkle_link(const uint256& tip_hash, const MerkleLinkT& lin
 }
 
 // ── Donation script (P2PKH for XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u) ─────────
-// Reference: ref/p2pool-dash/p2pool/data.py DONATION_SCRIPT
-static const std::vector<unsigned char> DONATION_SCRIPT = {
-    0x76, 0xa9, 0x14,
-    0x20, 0xcb, 0x5c, 0x22, 0xb1, 0xe4, 0xd5, 0x94,
-    0x7e, 0x5c, 0x11, 0x2c, 0x76, 0x96, 0xb5, 0x1a,
-    0xd9, 0xaf, 0x3c, 0x61,
-    0x88, 0xac
-};
+// Reference: ref/p2pool-dash/p2pool/data.py DONATION_SCRIPT. The bytes live in
+// core::donation::SINGLE_P2PKH_DONATION_SCRIPT, the same key every aux-chain
+// coinbase pays its donation to (value-invariant: DashConformancePayoutScript
+// checks them against the P2PKH builder over the donation hash160).
+// DASH share consensus — must never follow an aux-key change. The 25 bytes are
+// written out here, independent of the shared constant: if that constant
+// moves, the build fails here instead of DASH's donation changing with it.
+static_assert(core::donation::SINGLE_P2PKH_DONATION_SCRIPT == std::array<uint8_t, 25>{
+                  0x76, 0xa9, 0x14,
+                  0x20, 0xcb, 0x5c, 0x22, 0xb1, 0xe4, 0xd5, 0x94,
+                  0x7e, 0x5c, 0x11, 0x2c, 0x76, 0x96, 0xb5, 0x1a,
+                  0xd9, 0xaf, 0x3c, 0x61,
+                  0x88, 0xac},
+              "DASH share consensus — must never follow an aux-key change");
+static const std::vector<unsigned char> DONATION_SCRIPT(
+    core::donation::SINGLE_P2PKH_DONATION_SCRIPT.begin(),
+    core::donation::SINGLE_P2PKH_DONATION_SCRIPT.end());
 
 // ── v36 unified cross-coin donation P2SH (Bucket-2 standardization, operator
 //    FLAG6 2026-06-17) ─────────────────────────────────────────────────────

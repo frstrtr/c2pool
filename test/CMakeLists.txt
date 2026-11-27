@@ -640,11 +640,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # round-trip through the version-36 ShareVariants dispatch, merged-fields-
     # inert convention, and v16 backward-compat. Same allowlisted target (proven
     # pattern), no build.yml change (avoids the #769 new-target/allowlist trap).
+    # test_dash_frozen_registry_cap.cpp (P2'): the frozen-job registry's byte
+    # cap, age eviction, count backstop and tier order on an injected clock,
+    # the cap rule read from the cgroup, and the producer job cache's age
+    # sweep. Same allowlisted target (proven pattern), no build.yml change.
     add_executable(test_dash_share_hash_link
         test_dash_share_hash_link.cpp
         test_dash_share_producer.cpp
         test_dash_share_producer_bind.cpp
         test_dash_mint_runloop.cpp
+        test_dash_frozen_registry_cap.cpp
         test_dash_share_download.cpp
         test_dash_v36_share.cpp
         test_dash_known_txs_retention.cpp)
@@ -1406,6 +1411,10 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_share_gate_frozen_bits.cpp
         test_dash_serve_staleness_unit.cpp
         test_dash_gbt_quorum_staleness.cpp
+        # test_dash_p5_shared_tx_hex.cpp: P5, one shared tx-hex vector per
+        # cached template -- golden serve byte-identity (work-source API and a
+        # real StratumServer on loopback) plus the sharing contract.
+        test_dash_p5_shared_tx_hex.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/dash/coin/zmq_tip_notify.cpp)
     target_link_libraries(test_dash_stratum_work_source PRIVATE
         GTest::gtest_main GTest::gtest

@@ -43,8 +43,10 @@
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
 
+#include <chrono>
 #include <cstring>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace {
@@ -478,19 +480,28 @@ TEST(DashMintRunloop, DeclinesSolveBelowCommittedTarget)
                      .has_value());
 }
 
-// (7) Frozen-job registry: fail-closed on unknown refs, FIFO-bounded.
+// (7) Frozen-job registry: fail-closed on unknown refs, bounded by its count
+//     backstop. Each job here is served on a new best share 50 s after the
+//     previous one (past the 45 s grace), so the older ones are old-share
+//     entries the backstop may take, oldest first; the newest is current.
 TEST(DashMintRunloop, FrozenJobRegistryFailClosedAndBounded)
 {
-    FrozenJobRegistry registry(/*capacity=*/4);
+    auto t = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    dash::mint::FrozenRegistryConfig cfg;
+    cfg.backstop = 4;
+    FrozenJobRegistry registry(cfg, [&t] { return t; });
     EXPECT_FALSE(registry.get(h256_tag(0x01)).has_value());
+    EXPECT_FALSE(registry.lookup_for_mint(h256_tag(0x01)).job.has_value());
+    EXPECT_EQ(registry.stats().mint_miss_unknown, 1u);
 
     for (uint8_t i = 1; i <= 6; ++i) {
+        t += std::chrono::seconds(50);
         dash::stratum::FrozenMintJob job;
         job.share_nonce = i;
-        registry.put(h256_tag(i), job);
+        registry.put(h256_tag(i), job, h256_tag(0xf0), h256_tag(static_cast<uint8_t>(0xa0 + i)));
     }
     EXPECT_EQ(registry.size(), 4u);
-    // Oldest two evicted; newest four present.
+    // Oldest two evicted by the backstop; newest four present.
     EXPECT_FALSE(registry.get(h256_tag(1)).has_value());
     EXPECT_FALSE(registry.get(h256_tag(2)).has_value());
     for (uint8_t i = 3; i <= 6; ++i) {
@@ -498,6 +509,64 @@ TEST(DashMintRunloop, FrozenJobRegistryFailClosedAndBounded)
         ASSERT_TRUE(j.has_value());
         EXPECT_EQ(j->share_nonce, i);
     }
+    EXPECT_EQ(registry.stats().evict_backstop, 2u);
+    const auto miss = registry.lookup_for_mint(h256_tag(1));
+    EXPECT_TRUE(miss.evicted);
+    EXPECT_EQ(miss.cause, dash::mint::FrozenEvictCause::backstop);
+}
+
+// P2': a submit against a retained job mints; against a job the registry
+// evicted it is declined LOUDLY, with the cause and that cause's counter; a
+// foreign ref reads unknown. The mint seam's read is frozen_job_for_mint.
+TEST(DashMintRunloop, SubmitRetainedVsEvictedJob)
+{
+    const auto params = easy_params();
+    dash::ShareTracker tracker;
+    tracker.m_coin_params = params;
+    auto wd = make_workdata();
+    auto kept    = solve_job(tracker, params, uint256(), h160_uniform(0x22), wd, 11);
+    auto evicted = solve_job(tracker, params, uint256(), h160_uniform(0x23), wd, 12);
+    ASSERT_TRUE(kept.solved);
+    ASSERT_TRUE(evicted.solved);
+    ASSERT_NE(kept.in.ref_hash, evicted.in.ref_hash);
+
+    auto t = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    FrozenJobRegistry registry(dash::mint::FrozenRegistryConfig{}, [&t] { return t; });
+    const uint256 coin_tip = wd.m_previous_block;
+    registry.put(evicted.in.ref_hash, evicted.frozen, coin_tip, uint256());
+    t += std::chrono::seconds(300);
+    registry.put(kept.in.ref_hash, kept.frozen, coin_tip, uint256());
+    t += std::chrono::seconds(121);   // 421 s after the first put, 121 s after the second
+    dash::stratum::FrozenMintJob other;
+    registry.put(h256_tag(0x99), other, coin_tip, uint256());
+
+    // Retained: it mints.
+    std::string line;
+    auto job = dash::mint::frozen_job_for_mint(registry, kept.in.ref_hash, &line);
+    ASSERT_TRUE(job.has_value());
+    EXPECT_TRUE(line.empty());
+    auto built = mint_from_inputs(tracker.chain, params, kept.in, *job);
+    ASSERT_TRUE(built.has_value());
+    EXPECT_EQ(built->share.m_hash, kept.in.pow_hash);
+
+    // Evicted by age: declined, named, counted.
+    EXPECT_FALSE(dash::mint::frozen_job_for_mint(registry, evicted.in.ref_hash, &line).has_value());
+    EXPECT_EQ(line.rfind("[MINT] no frozen job for ref=" + evicted.in.ref_hash.GetHex().substr(0, 16), 0), 0u)
+        << line;
+    EXPECT_NE(line.find(" cause=age (evicted 0 s ago, 421 s after its last put)"), std::string::npos) << line;
+    EXPECT_NE(line.find("mint_miss_age=1"), std::string::npos) << line;
+    auto s = registry.stats();
+    EXPECT_EQ(s.mint_miss_age, 1u);
+    EXPECT_EQ(s.mint_miss_unknown, 0u);
+    EXPECT_EQ(s.mint_hits, 1u);
+
+    // Foreign: unknown.
+    EXPECT_FALSE(dash::mint::frozen_job_for_mint(registry, h256_tag(0x42), &line).has_value());
+    EXPECT_NE(line.find(" cause=unknown "), std::string::npos) << line;
+    EXPECT_NE(line.find("mint_miss_unknown=1"), std::string::npos) << line;
+    s = registry.stats();
+    EXPECT_EQ(s.mint_miss_unknown, 1u);
+    EXPECT_EQ(s.mint_miss_age, 1u);
 }
 
 // (8) --give-author mapping: donation percentage -> the oracle u16 field

@@ -196,6 +196,9 @@ C2P_PARAM("sharechain.deferred_mint", Sharechain, TRISTATE_BOOL, RESTART, C_DASH
   C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--deferred-mint", FLAG)
   C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--no-deferred-mint", FLAG_NO_PREFIX)
 
+C2P_PARAM("sharechain.frozen_job_cap_mb", Sharechain, INT64, RESTART, C_DASH, NONE, "", NONE, "frozen-job registry byte cap in MiB (default auto: min(256 MiB, memory.max/8), floor 64 MiB; range 1 MiB - 1 TiB, i.e. 1..1048576)")
+  C2P_ALIAS("sharechain.frozen_job_cap_mb", BIN_DASH, "--frozen-job-cap-mb", VALUE)
+
 C2P_PARAM("sharechain.max_conns", Sharechain, INT64, RESTART, C_LTC, LIT, "0", NONE, "max connections")
   C2P_ALIAS("sharechain.max_conns", BIN_LTC, "--max-conns", VALUE)
 
@@ -458,8 +461,13 @@ C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE,
 C2P_PARAM("web.cors_origin", WebOps, STRING, LIVE, C_LTC, LIT, "", NONE, "CORS origin")
   C2P_ALIAS("web.cors_origin", BIN_LTC, "--cors-origin", VALUE)
 
-C2P_PARAM("web.analytics_id", WebOps, STRING, LIVE, C_LTC, LIT, "", NONE, "analytics id")
+C2P_PARAM("web.analytics_id", WebOps, STRING, LIVE, C_ALL, LIT, "", NONE, "Google Analytics (GA4) measurement ID, G-XXXXXXXXXX; empty = off (default). Every HTML page the node serves then shows a consent bar; only after a visitor accepts are GA4 page views sent, with addresses and query strings stripped. The operator is responsible for the privacy notice. A value that is not a measurement ID is refused on the command line and ignored with a warning in a settings file")
+  C2P_ALIAS("web.analytics_id", BIN_DASH, "--analytics-id", VALUE)
   C2P_ALIAS("web.analytics_id", BIN_LTC, "--analytics-id", VALUE)
+  C2P_ALIAS("web.analytics_id", BIN_BTC, "--analytics-id", VALUE)
+  C2P_ALIAS("web.analytics_id", BIN_DGB, "--analytics-id", VALUE)
+  C2P_ALIAS("web.analytics_id", BIN_BCH, "--analytics-id", VALUE)
+  C2P_ALIAS("web.analytics_id", BIN_BIP110, "--analytics-id", VALUE)
 
 C2P_PARAM("global.rss_limit_mb", Global, INT64, LIVE, C_LTC, LIT, "4000", NONE, "RSS limit MB (abort over)")
   C2P_ALIAS("global.rss_limit_mb", BIN_LTC, "--rss-limit-mb", VALUE)

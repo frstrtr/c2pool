@@ -7,7 +7,8 @@
 //                 its LTC address, not as a row of its own;
 //   auto-convert  derived from the LTC key (same hash160); a P2SH LTC parent
 //                 is flagged parent_p2sh (unsafe if segwit-wrapped);
-//   donation      under the LTC donation row;
+//   donation      under the LTC donation row (the aux coinbase's single
+//                 P2PKH donation and the old combined P2SH alike);
 // one DOGE address given by two LTC addresses: under each, with its part by
 // weight (output_amount, fraction). A provider without origins keeps the old
 // view (hash160 match, "auto-convert").
@@ -16,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,6 +29,7 @@
 #include <core/address_validator.hpp>
 #include <core/web_server.hpp>
 #include <c2pool/merged/merged_mining.hpp>
+#include <c2pool/merged/merged_donation.hpp>
 #include <impl/ltc/config_pool.hpp>
 
 namespace {
@@ -236,4 +239,58 @@ TEST(MergedPayoutSource, WithoutOriginsKeepsTheHash160View)
     }
     if (auto* m = only_merged(res, ltc_addr(kDon)))
         EXPECT_EQ(m->at("source"), "donation");
+}
+
+// The donation the providers pay now (merged_donation_script, the single
+// P2PKH key): under the LTC donation row too, with its DOGE address, and no
+// row of its own.
+TEST(MergedPayoutSource, TheAuxCoinbaseDonationIsShownUnderTheLtcDonationRow)
+{
+    Rig r;
+    r.mm.set_payout_detail_provider([](uint32_t, uint64_t) {
+        auto p = Rig::payouts();
+        for (auto& [script, amount] : p)
+            if (script == kDon)
+                script = c2pool::merged::merged_donation_script();
+        std::sort(p.begin(), p.end());
+        return MergedPayoutDetail{p, Rig::origins()};
+    });
+    const auto res = r.mi.compute_current_merged_payouts();
+    if (auto* m = only_merged(res, ltc_addr(kDon))) {
+        EXPECT_EQ(m->at("source"), "donation");
+        EXPECT_EQ(m->at("address"), "D88Vn6Dyct7DKfVCfR3syHkjyNx9gEyyiv");
+        EXPECT_DOUBLE_EQ(m->at("amount").get<double>(), 1.0);
+    }
+    EXPECT_FALSE(res.contains("D88Vn6Dyct7DKfVCfR3syHkjyNx9gEyyiv"));
+}
+
+// A "donate"-mode share (its DOGE payout the old combined P2SH) and the
+// donation itself: the aux coinbase pays both as one output to the single
+// key, and so does the view: one donation entry under the LTC donation row,
+// at D88Vn.. with the summed amount, and the combined P2SH's address nowhere.
+TEST(MergedPayoutSource, ADonateModeShareAndTheDonationAreOneDonationRow)
+{
+    Rig r;
+    r.mm.set_payout_detail_provider([](uint32_t, uint64_t) {
+        auto p = Rig::payouts();   // kDon (the combined P2SH): 1 DOGE
+        p.emplace_back(c2pool::merged::merged_donation_script(), 2'00000000ULL);
+        std::sort(p.begin(), p.end());
+        return MergedPayoutDetail{p, Rig::origins()};
+    });
+    const auto res = r.mi.compute_current_merged_payouts();
+    if (auto* m = only_merged(res, ltc_addr(kDon))) {
+        EXPECT_EQ(m->at("source"), "donation");
+        EXPECT_EQ(m->at("address"), "D88Vn6Dyct7DKfVCfR3syHkjyNx9gEyyiv");
+        EXPECT_DOUBLE_EQ(m->at("amount").get<double>(), 3.0);
+    }
+    int donation_entries = 0;
+    for (const auto& [row, e] : res.items()) {
+        EXPECT_NE(row, doge_addr(kDon));
+        for (const auto& m : e.at("merged")) {
+            EXPECT_NE(m.at("address"), doge_addr(kDon)) << row;
+            if (m.at("source") == "donation")
+                ++donation_entries;
+        }
+    }
+    EXPECT_EQ(donation_entries, 1);
 }

@@ -271,6 +271,13 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # the hand-off to HttpSession on the web server's HTTP thread, read-only
     # GET/HEAD, local-only routes, the caps and the session accounting, the
     # handshake deadline, the 503 without a web server. Same folding.
+    # analytics_tag_test.cpp: the Google Analytics tag in served HTML
+    # (core/analytics_tag.hpp): once before </head> with consent default
+    # denied, the consent bar once before </body>, nothing for an empty or bad
+    # ID; a real WebServer tags its static .html pages only; every coin
+    # binary's --analytics-id reaches its web server (source wiring); the
+    # explorer.py generated pages carry the same bytes (python3, if present).
+    # Same fold-into-core_test reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     # stratum_tls_test.cpp: the TLS stratum listener (core/stratum_tls.hpp):
     # the --stratum-tls flags and their refusal without TLS, a real loopback
@@ -282,6 +289,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     add_executable(core_test
         addr_store_save_test.cpp
         address_coin_validation_test.cpp
+        analytics_tag_test.cpp
         author_fee_test.cpp
         block_body_summary_test.cpp
         block_broadcast_test.cpp

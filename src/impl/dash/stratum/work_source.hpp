@@ -578,6 +578,45 @@ public:
     /// and share-target submissions cannot mint (loud fail-closed decline).
     void set_producer_job_fn(ProducerJobFn fn);
 
+    /// The idle keepalive-notify cadence (StratumConfig::keepalive_notify_sec)
+    /// this work source configures. Named so the frozen-job registry's age and
+    /// grace (dash::mint::kFrozenJobAge, kFrozenJobGrace) are derived from it.
+    static constexpr uint32_t kKeepaliveNotifySec = 25;
+
+    /// The frozen-job registry's SAFETY BRAKE (dash::mint::FrozenJobRegistry::
+    /// brake_on): true while the registry is over its byte cap with no
+    /// evictable entry left. While it holds, the template store keeps the
+    /// cached template instead of storing a same-tip refresh that changes only
+    /// the tx set (store_brake_may_skip), and re-stamps it fresh; a tip change,
+    /// any other change and any store after an invalidate still store. Called
+    /// from whichever thread stores (io inline or the rpc_pool executor), so it
+    /// must be thread-safe. Unbound: never engaged.
+    using StoreBrakeFn = std::function<bool()>;
+    void set_store_brake_fn(StoreBrakeFn fn);
+    /// Template refreshes the brake kept out of the store, since construction.
+    uint64_t store_brake_skips() const {
+        return store_brake_skips_.load(std::memory_order_relaxed);
+    }
+    /// The brake's skip rule: `next` is a refresh of `cached` on the same coin
+    /// tip (previous block, height and bits) with another tx set, NOT at a
+    /// superblock height (governance payments are not tip state), with the
+    /// same payees in the same order and a byte-equal CbTx payload. Only the
+    /// amounts may differ (the masternode amount follows the fee total of the
+    /// tx set). `superblock_cycle` is dashcore's nSuperblockCycle.
+    static bool store_brake_may_skip(const coin::DashWorkData& cached,
+                                     const coin::DashWorkData& next,
+                                     int superblock_cycle);
+    /// nSuperblockCycle of this work source's network.
+    int superblock_cycle() const;
+
+    /// --regtest: a third network. DASH rides the testnet flag for it (regtest
+    /// reuses the testnet address bytes, so the payout-address set is the
+    /// testnet one either way), but its nSuperblockCycle is 10, not 24: the
+    /// store brake's skip rule must know it. Set once at wiring time, before
+    /// the first template is sourced.
+    void set_regtest(bool regtest) { is_regtest_ = regtest; }
+    bool is_regtest() const { return is_regtest_; }
+
     /// Drop the cached template snapshot + bump work_generation. Wired to the
     /// NodeRPC reconnect hook in main_dash.cpp (stale-payee fix, defect 3):
     /// a "CoindRPC reconnecting" churn means any cached template — and the
@@ -613,6 +652,36 @@ public:
     uint64_t serve_recheck_fail_count() const {
         return serve_recheck_fail_count_.load(std::memory_order_relaxed);
     }
+
+    /// Serve timing, one summary per stored template. A "serve" is one
+    /// build_connection_coinbase over the template (one job). Its SPAN is the
+    /// DASH share of one session's serve on the serving thread: from that
+    /// session's get_current_work_template() to the end of its
+    /// build_connection_coinbase() (core::StratumSession::send_notify_work
+    /// calls template, branches, coinbase, in that order, with no yield), so
+    /// it covers the three cached_work() reads with their serve-time
+    /// re-checks, both merkle-branch computations, the producer job or the
+    /// payout split, and the frozen snapshot. Core's JSON and socket write are
+    /// not in it. The summary of a template is written (one INFO line,
+    /// format_serve_timing_line) when the first serve of the NEXT template is
+    /// recorded; it carries counts, sizes and durations only.
+    struct ServeTimingSummary {
+        uint64_t seq{0};          ///< store sequence of the template
+        uint32_t height{0};
+        uint64_t txs{0};
+        uint64_t body_bytes{0};
+        uint64_t serves{0};
+        uint64_t spans{0};        ///< serves with a measured span
+        uint32_t serve_us_p50{0}, serve_us_p99{0}, serve_us_max{0};
+        uint32_t coinbase_us_p50{0}, coinbase_us_p99{0}, coinbase_us_max{0};
+        int64_t  live_hex_chars{0};   ///< coin::live_template_hex_chars() at the write
+        bool     store_brake{false};     ///< the frozen-job registry's safety brake at the write
+        uint64_t store_brake_skips{0};   ///< store_brake_skips() at the write
+    };
+    static std::string format_serve_timing_line(const ServeTimingSummary& s);
+    /// The last summary written, and how many were written (tests).
+    std::optional<ServeTimingSummary> last_serve_timing() const;
+    uint64_t serve_timing_lines() const;
 
     /// Seconds since the cached template was sourced, -1 when none / unknown.
     /// Display only (the dashboard's block_value_age_sec): a template that is
@@ -1021,6 +1090,12 @@ private:
     mutable std::mutex          producer_job_mutex_;
     ProducerJobFn               producer_job_fn_;
 
+    // Frozen-job registry safety brake (set_store_brake_fn). Empty until wired.
+    mutable std::mutex          store_brake_mutex_;
+    StoreBrakeFn                store_brake_fn_;
+    mutable std::atomic<uint64_t> store_brake_skips_{0};
+    bool store_brake_engaged() const;
+
     // Template cache (stage 4c): the last DashWorkData sourced through the
     // embedded/fallback selector, keyed on work_generation_ + a staleness TTL
     // (kStaleAfter). A failed fetch is negative-cached for kRetryAfter so a
@@ -1047,6 +1122,25 @@ private:
     // event that changes the answer and must re-source immediately instead of
     // waiting out kRetryAfter (soak0804e resume-quantization fix).
     mutable uint64_t            template_last_fail_gen_{0};
+    // Store sequence: names each stored template instance (its TemplateTxHex
+    // seq). Any thread that stores (io inline, or the rpc_pool executor).
+    mutable std::atomic<uint64_t> template_store_seq_{0};
+
+    // Serve timing (ServeTimingSummary): the open template's samples. Serves
+    // record on the serving thread; the lock is held for a sample push, and
+    // once per template for its summary (the log line is written after it).
+    void note_serve_timing(const coin::DashWorkData& wd, int64_t serve_us,
+                           int64_t coinbase_us) const;
+    struct ServeTimingAcc {
+        ServeTimingSummary    head;          // seq/height/txs/bytes + counts
+        std::vector<uint32_t> serve_us;      // capped at kServeTimingSamples
+        std::vector<uint32_t> coinbase_us;
+    };
+    static constexpr size_t kServeTimingSamples = 4096;
+    mutable std::mutex                        serve_timing_mutex_;
+    mutable ServeTimingAcc                    serve_timing_;
+    mutable std::optional<ServeTimingSummary> last_serve_timing_;
+    mutable uint64_t                          serve_timing_lines_{0};
 
     // io-thread-decouple: background single-flight template refresh.
     // refresh_executor_ posts the blocking re-source onto the rpc_pool thread

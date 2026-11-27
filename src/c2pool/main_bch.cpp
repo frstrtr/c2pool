@@ -52,6 +52,7 @@
 #include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
 #include <core/stratum_http.hpp>           // --stratum-http (the web API on the stratum port)
 #include <core/stratum_tls.hpp>            // --stratum-tls (the TLS stratum listener)
+#include <core/analytics_tag.hpp>          // --analytics-id / web.analytics_id
 #include <impl/bch/catalog_defaults.hpp>  // M0b L0 compiled defaults
 
 #include <cstdlib>
@@ -109,6 +110,12 @@ void print_banner(const char* argv0)
         << "Pool / sharechain:\n"
         << "  --stratum [HOST:]PORT     bind the stratum miner endpoint (else disabled)\n"
         << "  --http [HOST:]PORT        bind the dashboard/HTTP endpoint (else disabled)\n"
+        << "  --analytics-id ID         Google Analytics (GA4) measurement ID, G-XXXXXXXXXX;\n"
+        << "                            off by default. Every HTML page --http serves then\n"
+        << "                            shows a consent bar; only after a visitor accepts\n"
+        << "                            are GA4 page views sent, with addresses and query\n"
+        << "                            strings stripped. You are responsible for your own\n"
+        << "                            privacy notice.\n"
         << "  --stratum-http[=true|false|auto]  also answer the web API (GET/HEAD,\n"
         << "                            read-only) on the stratum port, as python p2pool\n"
         << "                            did on its worker port; default false; auto =\n"
@@ -920,6 +927,13 @@ int main(int argc, char** argv)
                 http_port = static_cast<uint16_t>(std::stoul(hp));
             }
         }
+        else if (std::strcmp(argv[i], "--analytics-id") == 0 && i + 1 < argc) {
+            if (!core::parse_analytics_id(argv[++i], core::analytics_id_setting())) {
+                std::cerr << "bad value: --analytics-id " << argv[i]
+                          << " (expected a Google Analytics measurement ID, G-XXXXXXXXXX)\n";
+                return 1;
+            }
+        }
         // --stratum-http[=true|false|auto]: the web API on the stratum port too
         // (core/stratum_http.hpp).
         else if (std::strcmp(argv[i], "--stratum-http") == 0
@@ -1045,6 +1059,9 @@ int main(int argc, char** argv)
             c2pool::catalog::C_BCH, path);
         // Apply file-sourced (L1) values into the locals the node consumes.
         if (rc.file_set("web.port"))        http_port  = static_cast<uint16_t>(rc.get_u16("web.port").value_or(http_port));
+        if (rc.file_set("web.analytics_id"))   // --analytics-id: a bad value is warned about and ignored
+            core::apply_analytics_id_setting("web.analytics_id", rc.get_string("web.analytics_id").value_or(""),
+                                             core::analytics_id_setting());
         if (rc.file_set("stratum.http"))   // --stratum-http: true / false / auto
             core::apply_stratum_http_setting(rc.get_string("stratum.http").value_or(""),
                                              core::stratum_http_mode_setting());

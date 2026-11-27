@@ -60,6 +60,7 @@
 #include <core/netaddress.hpp>
 #include <core/stratum_server.hpp>
 #include <core/web_server.hpp>              // shared coin-generic dashboard + /node_info
+#include <core/analytics_tag.hpp>           // --analytics-id
 #include <core/filesystem.hpp>             // config_path() for graph_db stats persistence
 #include <core/log.hpp>
 #include <core/param_catalog.hpp>           // M0b catalog: C_BIP110 / BIN_BIP110
@@ -119,6 +120,11 @@ void print_banner(const char* argv0)
         "  --fork-checkpoint    seed the Knots 961640 checkpoint for a fast proof\n"
         "  --http [HOST:]PORT   serve the shared coin-generic dashboard (HTML at\n"
         "                       \"/\", JSON /node_info for health probes)\n"
+        "  --analytics-id ID    Google Analytics (GA4) measurement ID, G-XXXXXXXXXX;\n"
+        "                       off by default. Every HTML page --http serves then shows\n"
+        "                       a consent bar; only after a visitor accepts are GA4\n"
+        "                       page views sent, with addresses and query strings\n"
+        "                       stripped. You are responsible for your own privacy notice.\n"
         "  --stratum-http[=true|false|auto]  also answer the web API (GET/HEAD,\n"
         "                       read-only) on the stratum port, as python p2pool did\n"
         "                       on its worker port; default false; auto = on when\n"
@@ -2041,6 +2047,7 @@ int run_embedded(bool coin_p2p_discover,
         // btc/dgb): "/" -> web-static/dashboard.html. The deploy pairs a
         // web-static copied from THIS commit next to the binary/CWD.
         web_server->set_dashboard_dir("web-static");
+        web_server->set_analytics_id(core::analytics_id_setting());   // --analytics-id (default off)
         // Node fee card — configured node-owner fee percent.
         mi->set_pool_fee_percent(node_owner_fee_pct);
 
@@ -3091,6 +3098,13 @@ int main(int argc, char** argv)
             }
         }
         else if (arg == "--no-stratum") { stratum_port = 0; }
+        else if (arg == "--analytics-id" && i + 1 < argc) {
+            if (!core::parse_analytics_id(argv[++i], core::analytics_id_setting())) {
+                std::fprintf(stderr, "bad value: --analytics-id %s (expected a Google Analytics "
+                                     "measurement ID, G-XXXXXXXXXX)\n", argv[i]);
+                return 1;
+            }
+        }
         else if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0) {
             // the web API on the stratum port too (core/stratum_http.hpp)
             if (!core::parse_stratum_http_flag(arg, core::stratum_http_mode_setting())) {

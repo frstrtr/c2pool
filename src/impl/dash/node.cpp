@@ -1882,9 +1882,10 @@ NodeImpl::LocalAddResult NodeImpl::add_local_share_ex(ShareType share, bool bloc
         // F1-sub (by-construction backability): DECLINE a solve whose template
         // txs are no longer retained in m_known_txs, rather than mint a share
         // send_shares would then have to withhold. FrozenJobRegistry
-        // (mint_runloop.hpp) is a FIFO cap-512 with NO TTL and re-put refreshes,
-        // so a solve can arrive from an arbitrarily-old job — no finite retention
-        // window is a provable bound, so the only by-construction guarantee is to
+        // (mint_runloop.hpp) keeps a job up to 420 s after its LAST put, and every
+        // re-put refreshes it, so a solve can arrive from a job far older than any
+        // retention window here — no finite retention window is a provable bound,
+        // so the only by-construction guarantee is to
         // fail closed here: every share we add is fully forwardable. The miner
         // keeps the pseudoshare credit; the next solve on a fresh job mints. The
         // deduped rolling template window (register_template_txs) keeps declines
