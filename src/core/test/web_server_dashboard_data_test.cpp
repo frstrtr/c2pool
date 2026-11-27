@@ -1892,6 +1892,34 @@ TEST(DashboardData, BestShareIsFedByLocalPseudoshares)
     EXPECT_EQ(bs["round"]["miner"].get<std::string>(), "w1");
 }
 
+// The cheap gate the BTC/BCH Best Share sinks (and the LTC path) run before
+// rebuilding a share's hash: true exactly when update_best_difficulty would
+// raise a leg.
+TEST(DashboardData, BestDifficultyGateMatchesTheLegs)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::BITCOIN);
+    EXPECT_FALSE(mi.beats_best_difficulty(0.0, false));
+    EXPECT_FALSE(mi.beats_best_difficulty(-1.0, false));
+    EXPECT_TRUE(mi.beats_best_difficulty(10.0, false));
+
+    mi.update_best_difficulty(100.0, "w1", "", /*update_merged=*/false);
+    EXPECT_FALSE(mi.beats_best_difficulty(100.0, false));   // equal raises nothing
+    EXPECT_FALSE(mi.beats_best_difficulty(99.0, false));
+    EXPECT_TRUE(mi.beats_best_difficulty(100.5, false));
+    // The merged legs were not raised, so with them any positive share counts.
+    EXPECT_TRUE(mi.beats_best_difficulty(50.0, true));
+
+    // A new round: the round leg is 0 again, so a lower share can set it.
+    mi.reset_best_difficulty_round();
+    EXPECT_TRUE(mi.beats_best_difficulty(50.0, false));
+    mi.update_best_difficulty(50.0, "w2", "", false);
+    EXPECT_FALSE(mi.beats_best_difficulty(50.0, false));
+    auto bs = mi.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["round"]["difficulty"].get<double>(), 50.0);
+    EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 100.0);
+}
+
 TEST(DashboardData, SharechainShareTargetsDoNotReachBestShare)
 {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,

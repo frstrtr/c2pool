@@ -3305,7 +3305,8 @@ int main(int argc, char* argv[])
         // Best Share card: every accepted pseudoshare's achieved difficulty
         // (the stratum session reports it to the work source, which had no
         // sink, so the card stayed empty with rigs hashing). The card's hash
-        // is the share's SHA256d header hash, rebuilt from the submit fields.
+        // is the share's SHA256d header hash, rebuilt from the submit fields
+        // when the share can set a record.
         work_source->set_best_pseudoshare_fn(
             [mi](double diff, const std::string& miner,
                  const std::string& coinb1, const std::string& coinb2,
@@ -3313,6 +3314,10 @@ int main(int argc, char* argv[])
                  const std::string& ntime, const std::string& nonce,
                  uint32_t version, const std::string& prevhash_hex,
                  const std::string& nbits_hex, const std::vector<std::string>& branches) {
+                // Almost every pseudoshare is below every leg: rebuild the
+                // hash only for one that can set a record.
+                if (!mi->beats_best_difficulty(diff, /*update_merged=*/false))
+                    return;
                 std::string pow_hex;
                 const uint256 merkle_root = core::MiningInterface::reconstruct_merkle_root(
                     coinb1 + en1 + en2 + coinb2, branches);

@@ -12517,6 +12517,16 @@ void MiningInterface::update_best_difficulty(double difficulty, const std::strin
     }
 }
 
+bool MiningInterface::beats_best_difficulty(double difficulty, bool update_merged) const
+{
+    if (!(difficulty > 0.0)) return false;
+    std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+    const auto& b = m_best_difficulty;
+    if (difficulty > b.all_time || difficulty > b.session || difficulty > b.round)
+        return true;
+    return update_merged && (difficulty > b.merged_all_time || difficulty > b.merged_round);
+}
+
 void MiningInterface::record_merged_share_difficulty(double difficulty, const std::string& miner)
 {
     std::lock_guard<std::mutex> lock(m_best_diff_mutex);
@@ -12542,17 +12552,10 @@ void MiningInterface::record_best_pseudoshare(
     const std::string& nbits_hex,
     const std::vector<std::string>& merkle_branches)
 {
-    if (!(share_difficulty > 0.0)) return;
     // Cheap gate: almost every pseudoshare is below every leg, so skip the
     // second scrypt pass unless this share can set some record.
-    {
-        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
-        const auto& b = m_best_difficulty;
-        if (!(share_difficulty > b.round || share_difficulty > b.session
-              || share_difficulty > b.all_time || share_difficulty > b.merged_round
-              || share_difficulty > b.merged_all_time))
-            return;
-    }
+    if (!beats_best_difficulty(share_difficulty, /*update_merged=*/true))
+        return;
     // The exact pow-hash for the card's hash field: the same header bytes the
     // vardiff gate hashed (calculate_share_difficulty). Empty on bad input.
     std::string pow_hex;

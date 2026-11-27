@@ -2834,6 +2834,10 @@ public:
     void update_best_difficulty(double difficulty, const std::string& miner,
                                 const std::string& pow_hash_hex = "",
                                 bool update_merged = true);
+    // True when update_best_difficulty(difficulty, ..., update_merged) would
+    // raise a leg: the cheap gate a caller runs before it rebuilds the share's
+    // hash for the card.
+    bool beats_best_difficulty(double difficulty, bool update_merged = true) const;
     // Median of the per-share target difficulties in a sharechain window
     // (p2pool web.py best_share median_pct). 0 for an empty window.
     static double median_share_difficulty(std::vector<double> diffs);
