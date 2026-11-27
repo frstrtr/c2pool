@@ -63,6 +63,41 @@ static std::string to_hex(const std::vector<unsigned char>& data)
     return HexStr(std::span<const unsigned char>(data.data(), data.size()));
 }
 
+// Every scrypt this file computes over a block header goes through here and
+// is counted (MiningInterface::header_scrypt_count, the submit-path KAT seam).
+static std::atomic<uint64_t> s_header_scrypt_count{0};
+
+static void scrypt_header(const unsigned char* header80, char out[32])
+{
+    s_header_scrypt_count.fetch_add(1, std::memory_order_relaxed);
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header80), out);
+}
+
+/*static*/
+uint64_t MiningInterface::header_scrypt_count()
+{
+    return s_header_scrypt_count.load(std::memory_order_relaxed);
+}
+
+// The scrypt digest of an 80-byte header, with the header: `known`'s digest
+// when `known` is for these exact 80 bytes (the vardiff gate already hashed
+// them), else computed now. Not valid for a header that is not 80 bytes.
+static core::stratum::SharePow submission_pow(const std::vector<unsigned char>& header,
+                                              const core::stratum::SharePow* known)
+{
+    core::stratum::SharePow p;
+    if (header.size() != p.header.size())
+        return p;
+    std::copy(header.begin(), header.end(), p.header.begin());
+    const unsigned char* d = known ? known->digest_for(header.data(), header.size()) : nullptr;
+    if (d)
+        std::copy(d, d + p.digest.size(), p.digest.begin());
+    else
+        scrypt_header(header.data(), reinterpret_cast<char*>(p.digest.data()));
+    p.valid = true;
+    return p;
+}
+
 /// MiningInterface Implementation
 MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node, Blockchain blockchain)
     : m_work_id_counter(1)
@@ -643,7 +678,8 @@ bool MiningInterface::check_merged_mining(const std::string& header_hex,
                                           const JobSnapshot* job,
                                           const std::string& miner,
                                           const uint256& share_hash,
-                                          const std::vector<unsigned char>& miner_script)
+                                          const std::vector<unsigned char>& miner_script,
+                                          const core::stratum::SharePow* parent_pow)
 {
     // Counted before the manager check so the call path itself is observable.
     m_aux_checks.fetch_add(1, std::memory_order_relaxed);
@@ -653,11 +689,14 @@ bool MiningInterface::check_merged_mining(const std::string& header_hex,
     if (header_hex.size() < 160) return false;
     std::string parent_header_hex = header_hex.substr(0, 160);
 
-    // Compute parent block hash (scrypt for LTC)
+    // Compute parent block hash (scrypt for LTC); the caller's digest when it
+    // is of these header bytes (mining_submit hashed them once already).
     auto hdr_bytes = ParseHex(parent_header_hex);
     uint256 parent_hash;
-    scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr_bytes.data()),
-                        reinterpret_cast<char*>(parent_hash.data()));
+    if (const unsigned char* d = parent_pow ? parent_pow->digest_for(hdr_bytes.data(), hdr_bytes.size()) : nullptr)
+        std::memcpy(parent_hash.data(), d, 32);
+    else
+        scrypt_header(hdr_bytes.data(), reinterpret_cast<char*>(parent_hash.data()));
 
     // Build stripped coinbase tx (no witness) — use per-job parts when available
     std::string coinbase_hex;
@@ -906,7 +945,7 @@ MiningInterface::assemble_block_for_header(const std::string& header_hex,
     // and the body were split.
     auto hdr = ParseHex(block_hex.substr(0, 160));
     char pow_hash_bytes[32];
-    scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr.data()), pow_hash_bytes);
+    scrypt_header(hdr.data(), pow_hash_bytes);
     uint256 pow_hash;
     memcpy(pow_hash.begin(), pow_hash_bytes, 32);
     const uint32_t bits = hdr[72] | (hdr[73] << 8) | (hdr[74] << 16) | (hdr[75] << 24);
@@ -2691,7 +2730,7 @@ nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::
         auto header_bytes = ParseHex(header.substr(0, 160));
         if (header_bytes.size() == 80) {
             char pow_hash_bytes[32];
-            scrypt_1024_1_1_256(reinterpret_cast<const char*>(header_bytes.data()), pow_hash_bytes);
+            scrypt_header(header_bytes.data(), pow_hash_bytes);
             uint256 pow_hash;
             memcpy(pow_hash.begin(), pow_hash_bytes, 32);
 
@@ -12642,7 +12681,7 @@ void MiningInterface::record_best_pseudoshare(
         build_header_bytes(version, prevhash_hex, merkle_root, ntime, nbits_hex, nonce);
     if (header.size() == 80) {
         char out[32];
-        scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), out);
+        scrypt_header(header.data(), out);
         uint256 pow_hash;
         memcpy(pow_hash.begin(), out, 32);
         pow_hex = pow_hash.GetHex();
@@ -13815,17 +13854,20 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             // when the block body is refused (MWEB shape check).
             std::string header_hex = derive_block_header_hex(extranonce1, extranonce2, ntime, nonce, job);
             if (!header_hex.empty()) {
+                // One scrypt of the header serves the merged check and the
+                // block check; none when the vardiff gate hashed these bytes.
+                auto block_bytes = ParseHex(header_hex);
+                const core::stratum::SharePow header_pow =
+                    submission_pow(block_bytes, job ? &job->gate_pow : nullptr);
+
                 // Check merged mining targets for every share (aux targets are lower)
                 bool solo_merged_found = check_merged_mining(header_hex, extranonce1, extranonce2, job,
-                                                             payout_address);
+                                                             payout_address, uint256(), {}, &header_pow);
 
                 // Check PoW hash against the blockchain target before submitting
-                auto block_bytes = ParseHex(header_hex);
                 if (block_bytes.size() == 80) {
-                    char pow_hash_bytes[32];
-                    scrypt_1024_1_1_256(reinterpret_cast<const char*>(block_bytes.data()), pow_hash_bytes);
                     uint256 pow_hash;
-                    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+                    memcpy(pow_hash.begin(), header_pow.digest.data(), 32);
 
                     // Read nBits directly from the block header (offset 72, LE uint32).
                     // Using the header's own bits guarantees the same target litecoind
@@ -14203,17 +14245,20 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             // when the block body is refused (MWEB shape check).
             std::string header_hex = derive_block_header_hex(extranonce1, extranonce2, ntime, nonce, job);
             if (!header_hex.empty()) {
+                // One scrypt of the header serves the merged check and the
+                // block check; none when the vardiff gate hashed these bytes.
+                auto block_bytes = ParseHex(header_hex);
+                const core::stratum::SharePow header_pow =
+                    submission_pow(block_bytes, job ? &job->gate_pow : nullptr);
+
                 // Check merged mining targets for every share (aux targets are lower)
                 bool merged_found = check_merged_mining(header_hex, extranonce1, extranonce2, job,
                                                         primary_addr, created_share,
-                                                        found_payout_script);
+                                                        found_payout_script, &header_pow);
 
-                auto block_bytes = ParseHex(header_hex);
                 if (block_bytes.size() == 80) {
-                    char pow_hash_bytes[32];
-                    scrypt_1024_1_1_256(reinterpret_cast<const char*>(block_bytes.data()), pow_hash_bytes);
                     uint256 pow_hash;
-                    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+                    memcpy(pow_hash.begin(), header_pow.digest.data(), 32);
 
                     // Read nBits from the block header itself (offset 72, LE uint32)
                     // to match exactly what litecoind will verify.
@@ -15340,7 +15385,7 @@ double MiningInterface::calculate_share_difficulty(const std::string& job_id, co
 
     // Compute scrypt hash
     char pow_hash_bytes[32];
-    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), pow_hash_bytes);
+    scrypt_header(header.data(), pow_hash_bytes);
 
     uint256 pow_hash;
     memcpy(pow_hash.begin(), pow_hash_bytes, 32);
@@ -15409,7 +15454,7 @@ double MiningInterface::calculate_share_difficulty(const std::string& coinb1, co
         return 0.0;
 
     char pow_hash_bytes[32];
-    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), pow_hash_bytes);
+    scrypt_header(header.data(), pow_hash_bytes);
 
     uint256 pow_hash;
     memcpy(pow_hash.begin(), pow_hash_bytes, 32);
@@ -15435,7 +15480,8 @@ double MiningInterface::calculate_share_difficulty(
     const std::string& ntime, const std::string& nonce,
     uint32_t version, const std::string& prevhash_hex,
     const std::string& nbits_hex,
-    const std::vector<std::string>& merkle_branches)
+    const std::vector<std::string>& merkle_branches,
+    core::stratum::SharePow* pow_out)
 {
     // Reconstruct coinbase from per-connection parts
     std::string coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2;
@@ -15463,7 +15509,12 @@ double MiningInterface::calculate_share_difficulty(
     }
 
     char pow_hash_bytes[32];
-    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), pow_hash_bytes);
+    scrypt_header(header.data(), pow_hash_bytes);
+    if (pow_out) {
+        std::copy(header.begin(), header.end(), pow_out->header.begin());
+        std::memcpy(pow_out->digest.data(), pow_hash_bytes, 32);
+        pow_out->valid = true;
+    }
 
     uint256 pow_hash;
     memcpy(pow_hash.begin(), pow_hash_bytes, 32);

@@ -292,6 +292,12 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # byte-equal to the scalar one (SHA-256, sha256d, SHA256D64), the
     # C2POOL_SHA256=standard kill-switch, and the self-test fallback to the
     # scalar implementation. Same fold-into-core_test reasoning as every TU here.
+    # submit_scrypt_once_test.cpp: one scrypt of a stratum submission's header
+    # on the LTC submit path: the vardiff gate's digest reaches mining_submit
+    # (JobSnapshot::gate_pow) and is used for the same header bytes only, the
+    # merged and block checks share one hash, and the blocks submitted are
+    # the same with and without it (MiningInterface::header_scrypt_count).
+    # Same fold-into-core_test reasoning as every TU here.
     add_executable(core_test
         addr_store_save_test.cpp
         address_coin_validation_test.cpp
@@ -343,6 +349,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         stratum_port_http_wire_test.cpp
         stratum_refusal_log_test.cpp
         stratum_tls_test.cpp
+        submit_scrypt_once_test.cpp
         template_refresh_on_tx_test.cpp
         template_txs_check_test.cpp
         tx_advertiser_test.cpp

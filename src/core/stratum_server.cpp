@@ -2611,10 +2611,14 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // BTCWorkSource implements this with SHA256d. Without this dispatch
     // every BTC stratum submission gets a garbage scrypt-based diff and
     // rejects at the vardiff gate.
-    double share_difficulty = mining_interface_->compute_share_difficulty(
+    // gate_pow: the header this hashed and its digest, handed to mining_submit
+    // in the snapshot so a work source does not hash the same header twice.
+    core::stratum::SharePow gate_pow;
+    double share_difficulty = mining_interface_->compute_share_difficulty_pow(
         job.payload->coinb1, job.payload->coinb2,
         extranonce1_, extranonce2, ntime, nonce,
-        effective_version, job.gbt_prevhash, job.nbits, job.payload->merkle_branches);
+        effective_version, job.gbt_prevhash, job.nbits, job.payload->merkle_branches,
+        gate_pow);
     // VARDIFF: acceptance threshold is the per-connection adaptive difficulty.
     // p2pool accepts ALL pseudoshares meeting effective_target (VARDIFF level),
     // not just those meeting pool share_bits. This gives smooth hashrate data.
@@ -2702,6 +2706,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.frozen_ref.frozen_merged_coinbase_info = job.payload->frozen_merged_coinbase_info;
     snapshot.frozen_ref.share_version = job.share_version;
     snapshot.frozen_ref.desired_version = job.desired_version;
+    snapshot.gate_pow = gate_pow;
     // NOTE: stale_info is NOT propagated here. It must match what ref_hash_fn
     // used at job creation time (always 0 for now). Changing it at submit
     // time would break ref_hash consistency. Future: compute stale_info
