@@ -4,7 +4,8 @@
 // the named shares is cleared in one batch; each share, its metadata and its
 // cached pow_hash are kept (a coin whose share rules changed verifies its
 // stored shares again instead of deleting them). Shares not named, unknown
-// hashes and already-unverified shares are left alone.
+// hashes and already-unverified shares are left alone; an index record whose
+// share data is gone is cleared too.
 
 #include <gtest/gtest.h>
 
@@ -81,4 +82,36 @@ TEST(SharechainStoreUnverify, ClearsTheFlagAndKeepsTheShare)
     EXPECT_TRUE(st.mark_shares_unverified({}));
     st.close();
     EXPECT_FALSE(st.mark_shares_unverified({h(2)})) << "a closed store";
+}
+
+// An index record whose share data is gone (load_share fails on it) is
+// cleared too, so the DGB epoch step does not fail on it forever.
+TEST(SharechainStoreUnverify, ADanglingIndexRecordIsClearedToo)
+{
+    TempDir t;
+    {
+        core::SharechainLevelDBStore st(t.dir.string(), "kat");
+        ASSERT_TRUE(st.open());
+        core::ShareMetadata m;
+        m.height = 7;
+        m.is_verified = true;
+        ASSERT_TRUE(st.store_share(h(7), std::vector<uint8_t>(8, 7), m));
+        st.close();
+    }
+    {
+        core::LevelDBStore raw((t.dir / "kat" / "sharechain_leveldb").string(), core::LevelDBOptions{});
+        ASSERT_TRUE(raw.open());
+        ASSERT_TRUE(raw.remove("share:" + h(7).ToString()));
+        raw.close();
+    }
+    core::SharechainLevelDBStore st(t.dir.string(), "kat");
+    ASSERT_TRUE(st.open());
+    std::vector<uint8_t> data;
+    core::ShareMetadata m;
+    ASSERT_FALSE(st.load_share(h(7), data, m)) << "the record is not dangling";
+    ASSERT_TRUE(st.mark_shares_unverified({h(7)}));
+    std::vector<core::SharechainLevelDBStore::IndexEntry> idx;
+    ASSERT_TRUE(st.scan_share_index(idx));
+    ASSERT_EQ(idx.size(), 1u);
+    EXPECT_FALSE(idx[0].is_verified);
 }

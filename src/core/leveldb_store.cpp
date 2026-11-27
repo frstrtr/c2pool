@@ -1281,19 +1281,31 @@ bool SharechainLevelDBStore::mark_shares_unverified(const std::vector<uint256>& 
         auto batch = m_store->create_batch();
         int updated = 0;
         for (const auto& hash : hashes) {
+            // The index record itself, so a record whose share data is gone
+            // (load_share fails on it) is cleared too.
+            std::vector<uint8_t> raw;
+            if (!m_store->get(make_index_key(hash), raw))
+                continue;
             ShareMetadata metadata;
-            std::vector<uint8_t> dummy;
-            if (!load_share(hash, dummy, metadata))
+            uint8_t orphan = 0, verified = 0;
+            PackStream in(std::span<const std::byte>(reinterpret_cast<const std::byte*>(raw.data()), raw.size()));
+            try {
+                in >> metadata.prev_hash >> metadata.height >> metadata.timestamp >> metadata.work
+                   >> metadata.target >> orphan;
+            } catch (...) {
+                continue;   // not a record this store wrote
+            }
+            try { in >> verified; } catch (...) {}
+            if (!verified)
                 continue;
-            if (!metadata.is_verified)
-                continue;
+            try { in >> metadata.pow_hash; } catch (...) {}
             PackStream ms;
             ms << metadata.prev_hash;
             ms << metadata.height;
             ms << metadata.timestamp;
             ms << metadata.work;
             ms << metadata.target;
-            ms << static_cast<uint8_t>(metadata.is_orphan ? 1 : 0);
+            ms << orphan;
             ms << static_cast<uint8_t>(0); // is_verified = false
             ms << metadata.pow_hash;
             auto span = ms.get_span();
@@ -1303,7 +1315,8 @@ bool SharechainLevelDBStore::mark_shares_unverified(const std::vector<uint256>& 
             batch.put(make_index_key(hash), md);
             ++updated;
         }
-        if (updated > 0 && !batch.commit()) {
+        // Synced: the caller writes its marker after this returns.
+        if (updated > 0 && !batch.commit_sync()) {
             LOG_ERROR << "mark_shares_unverified: batch commit failed";
             return false;
         }
