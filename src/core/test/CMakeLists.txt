@@ -286,6 +286,12 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # shared per-IP cap, and certificate reload (file change, reload_tls(),
     # SIGHUP). The OpenSSL cases compile only with C2POOL_STRATUM_TLS. Same
     # fold-into-core_test reasoning as every TU here.
+    # sha256_dispatch_test.cpp: the SHA-256 implementation every node binary
+    # selects at startup (core/sha256_init.hpp over btclibs SHA256AutoDetect):
+    # each implementation the CPU offers against the standard vectors and
+    # byte-equal to the scalar one (SHA-256, sha256d, SHA256D64), the
+    # C2POOL_SHA256=standard kill-switch, and the self-test fallback to the
+    # scalar implementation. Same fold-into-core_test reasoning as every TU here.
     add_executable(core_test
         addr_store_save_test.cpp
         address_coin_validation_test.cpp
@@ -329,6 +335,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         random_choice_guard_test.cpp
         random_uniform_test.cpp
         reloaded_block_flag_test.cpp
+        sha256_dispatch_test.cpp
         sharechain_height_index_test.cpp
         socket_write_queue_test.cpp
         socket_read_empty_prefix_test.cpp

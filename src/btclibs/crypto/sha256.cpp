@@ -573,9 +573,17 @@ bool AVXEnabled()
 } // namespace
 
 
-std::string SHA256AutoDetect()
+std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implementation)
 {
+    // Start from the scalar implementation on every call, so a call with
+    // STANDARD (or with a mask the CPU cannot meet) puts it back.
     std::string ret = "standard";
+    Transform = sha256::Transform;
+    TransformD64 = sha256::TransformD64;
+    TransformD64_2way = nullptr;
+    TransformD64_4way = nullptr;
+    TransformD64_8way = nullptr;
+    (void)use_implementation;
 #if defined(USE_ASM) && defined(HAVE_GETCPUID)
     bool have_sse4 = false;
     bool have_xsave = false;
@@ -594,7 +602,9 @@ std::string SHA256AutoDetect()
 
     uint32_t eax, ebx, ecx, edx;
     GetCPUID(1, 0, eax, ebx, ecx, edx);
-    have_sse4 = (ecx >> 19) & 1;
+    if (use_implementation & sha256_implementation::USE_SSE4) {
+        have_sse4 = (ecx >> 19) & 1;
+    }
     have_xsave = (ecx >> 27) & 1;
     have_avx = (ecx >> 28) & 1;
     if (have_xsave && have_avx) {
@@ -602,8 +612,12 @@ std::string SHA256AutoDetect()
     }
     if (have_sse4) {
         GetCPUID(7, 0, eax, ebx, ecx, edx);
-        have_avx2 = (ebx >> 5) & 1;
-        have_shani = (ebx >> 29) & 1;
+        if (use_implementation & sha256_implementation::USE_AVX2) {
+            have_avx2 = (ebx >> 5) & 1;
+        }
+        if (use_implementation & sha256_implementation::USE_SHANI) {
+            have_shani = (ebx >> 29) & 1;
+        }
     }
 
 #if defined(ENABLE_SHANI) && !defined(BUILD_BITCOIN_INTERNAL)
@@ -637,8 +651,16 @@ std::string SHA256AutoDetect()
 #endif
 #endif
 
-    assert(SelfTest());
+    // No assert(SelfTest()) here: it compiled out under NDEBUG, so release
+    // binaries never ran it. SHA256SelfTest() below is the check, and
+    // core::init_sha256() (core/sha256_init.hpp) runs it after this call in
+    // every build and puts the scalar implementation back if it fails.
     return ret;
+}
+
+bool SHA256SelfTest()
+{
+    return SelfTest();
 }
 
 ////// SHA-256
