@@ -56,6 +56,11 @@ const Vec kVecs[] = {
     {"mixed_case", "dgb1qyY3ZXFP9YCNJS2F29VKZ6T30XQCNYVE5N5RJXD", ""},
     {"wrong_hrp", "ltc1qyy3zxfp9ycnjs2f29vkz6t30xqcnyve5qnawxn", ""},
     {"garbage", "not-an-address", ""},
+    // Whitespace around a base58 address: python's base58_decode fails and
+    // bech32_decode rejects characters < 33 (review 906a0e5e3 3a).
+    {"leading_space", " DB69qk9X8T9A3vZ8odhDxAFedZB9qoKaLG", ""},
+    {"trailing_newline", "DB69qk9X8T9A3vZ8odhDxAFedZB9qoKaLG\n", ""},
+    {"trailing_space", "DB69qk9X8T9A3vZ8odhDxAFedZB9qoKaLG ", ""},
     {"empty", "", ""},
 };
 
@@ -118,5 +123,24 @@ TEST(DgbV35Address, ShareWithAnUnpayableAddressIsRejected)
         } catch (const std::invalid_argument& e) {
             EXPECT_NE(std::string(e.what()).find("address"), std::string::npos) << e.what();
         }
+    }
+}
+
+// Review 906a0e5e3 3b: the V35 segwit_data none-value {[], root 2**256-1} is
+// python's None (Share.__init__ then fails); this node reads it back as
+// present, so share_init_verify rejects that exact value.
+TEST(DgbV35Address, SegwitDataNoneValueIsRejected)
+{
+    const auto params = dgb::make_coin_params(/*testnet=*/false);
+    dgb::PaddingBugfixShare share;
+    share.m_coinbase.m_data = {0x03, 0x01, 0x02, 0x03};
+    const std::string a = "DB69qk9X8T9A3vZ8odhDxAFedZB9qoKaLG";
+    share.m_address.m_data.assign(a.begin(), a.end());
+    share.m_segwit_data = dgb::SegwitDataDefaultV35::get();
+    try {
+        dgb::share_init_verify(share, params, /*check_pow=*/false);
+        ADD_FAILURE() << "accepted a V35 share with the segwit_data none-value";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("segwit_data"), std::string::npos) << e.what();
     }
 }

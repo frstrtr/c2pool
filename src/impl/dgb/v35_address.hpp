@@ -8,9 +8,10 @@
 // (frstrtr/p2pool-dgb-scrypt, bitcoin/data.py address_to_script2) turns it into
 // the output script as follows, and a share whose address it cannot turn into
 // a script is invalid there (Share.__init__ raises):
-//   - base58check of 25 bytes (version, hash160, checksum): the version must
-//     be ADDRESS_VERSION (30) or ADDRESS_P2SH_VERSION (63); any other version
-//     is an error (not a fall-through) -> P2PKH / P2SH;
+//   - base58check of 25 bytes (version, hash160, checksum), the string
+//     exactly its canonical encoding (no surrounding whitespace): the version
+//     must be ADDRESS_VERSION (30) or ADDRESS_P2SH_VERSION (63); any other
+//     version is an error (not a fall-through) -> P2PKH / P2SH;
 //   - else BIP173 bech32 (util/segwit_addr.py: bech32 checksum only, never
 //     bech32m; one case, upper or lower; hrp "dgb"; witness version <= 16;
 //     program 2..40 bytes; version 0 only 20 or 32):
@@ -168,8 +169,12 @@ inline std::optional<std::vector<unsigned char>> v35_address_to_script(const std
 {
     // Base58check of exactly version + 20-byte hash + checksum.
     {
+        // DecodeBase58Check skips leading/trailing whitespace; python's
+        // base58_decode does not (and bech32_decode then rejects it), so the
+        // string must be exactly the canonical encoding of its payload.
         std::vector<unsigned char> payload;
-        if (DecodeBase58Check(addr, payload, 21) && payload.size() == 21) {
+        if (DecodeBase58Check(addr, payload, 21) && payload.size() == 21
+            && EncodeBase58Check(Span<const unsigned char>(payload.data(), payload.size())) == addr) {
             std::vector<unsigned char> s;
             if (payload[0] == net.p2pkh) {
                 s = {0x76, 0xa9, 0x14};

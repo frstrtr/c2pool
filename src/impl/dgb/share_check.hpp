@@ -536,7 +536,10 @@ uint256 share_init_verify(const ShareT& share, const core::CoinParams& params, b
     if constexpr (ShareT::version >= dgb::SEGWIT_ACTIVATION_VERSION
                   && !core::version_gate::is_v36_active(ShareT::version))
         if constexpr (requires { share.m_segwit_data; })
-            if (!share.m_segwit_data.has_value())
+            if (!share.m_segwit_data.has_value()
+                || (share.m_segwit_data->m_txid_merkle_link.m_branch.empty()
+                    && share.m_segwit_data->m_wtxid_merkle_root == SegwitDataDefaultV35::get().m_wtxid_merkle_root))
+                // (the wire none-value {[], root 2**256-1} reads back as present here)
                 throw std::invalid_argument("V35 share without segwit_data");
 
     // V34/V35: the python network turns the share's address into its payout
