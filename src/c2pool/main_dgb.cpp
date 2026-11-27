@@ -67,6 +67,7 @@
 #include <impl/dgb/best_share_cell.hpp>         // stratum best share: locked cell + the one best-change hook
 #include <impl/dgb/stratum_job_push.hpp>        // clean jobs on a new tip / best share (1 s watch)
 #include <impl/dgb/stratum_work_gate.hpp>        // no work without sharechain peers / digibyted contact
+#include <impl/dgb/sharechain_stats.hpp>         // dashboard sharechain stats (guarded)
 #include <impl/dgb/coin/work_ref_hash.hpp>      // make_work_ref_hash_params (ref preimage SSOT)
 #include <impl/dgb/coin/coinbase_scriptsig.hpp>   // build_coinbase_scriptsig (BIP34 height + /c2pool-dgb/ tag, #902)
 #include <impl/dgb/run_loop_mint.hpp>              // parse_min_header_80 + mint_local_share_at_frozen_version (#884/#294)
@@ -2401,11 +2402,29 @@ int run_node(const core::CoinParams& params, bool testnet,
             return s;
         });
 
-        // (4) scrypt pool stats — sharechain length feeds getinfo poolshares.
+        // (4) scrypt pool stats (sharechain_stats.hpp, LTC's field shape),
+        //     read under the tracker guard. While think() holds the tracker:
+        //     the last full result with the snapshot's live counts (LTC's
+        //     s_last_good), or the snapshot alone before the first one.
         mi->set_sharechain_stats_fn([&p2p_node]() {
-            nlohmann::json r = nlohmann::json::object();
-            r["total_shares"] =
-                static_cast<uint64_t>(p2p_node.tracker().chain.size());
+            static std::mutex s_mutex;
+            static nlohmann::json s_last_good;
+            auto guard = p2p_node.read_tracker();
+            if (!guard) {
+                const auto snap = p2p_node.get_tracker_snapshot();
+                std::lock_guard<std::mutex> lk(s_mutex);
+                nlohmann::json out = s_last_good.is_null() ? nlohmann::json::object() : s_last_good;
+                if (s_last_good.is_null()) {
+                    out["chain_height"] = snap.chain_count;
+                    out["total_shares"] = snap.chain_count;
+                }
+                out["verified_count"] = snap.verified_count;
+                out["fork_count"] = snap.fork_count;
+                return out;
+            }
+            nlohmann::json r = dgb::sharechain_stats_json(*guard, p2p_node.best_share_hash());
+            std::lock_guard<std::mutex> lk(s_mutex);
+            s_last_good = r;
             return r;
         });
 

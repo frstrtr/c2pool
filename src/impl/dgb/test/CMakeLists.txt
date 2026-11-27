@@ -353,7 +353,7 @@ if (BUILD_TESTING AND GTest_FOUND)
                    v35_address_test.cpp pplns_v35_order_test.cpp v35_hold_test.cpp
                    v35_share_info_test.cpp oracle_vectors_test.cpp start_difficulty_test.cpp
                    v35_pplns_address_test.cpp store_rules_epoch_test.cpp
-                   stratum_work_gate_test.cpp)
+                   stratum_work_gate_test.cpp sharechain_stats_test.cpp)
     target_link_libraries(dgb_work_source_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb dgb_stratum
