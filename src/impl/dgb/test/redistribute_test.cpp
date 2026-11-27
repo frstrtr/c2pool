@@ -369,7 +369,8 @@ TEST(DgbRedistribute, Issue1312ForeignOrWitnessAddressNeverArms)
 // Every other spec binds as before; no spec binds nothing, as before.
 TEST(DgbRedistribute, ASplitSpecBindsNoPolicyAndIsNeverReadAsPplns)
 {
-    for (const char* spec : {"split", "split:100", "boost:70,split:30", "split:50,donate:50"}) {
+    for (const char* spec : {"split", "split:100", "boost:70,split:30", "split:50,donate:50", "boost:70, split:30",
+                             " split ", "boost:70,\tsplit:30"}) {
         EXPECT_TRUE(dgb::spec_names_split(spec)) << spec;
         EXPECT_FALSE(dgb::binds_redistributor(spec)) << spec;
     }

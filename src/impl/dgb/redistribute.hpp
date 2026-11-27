@@ -128,9 +128,14 @@ inline bool spec_names_split(const std::string& spec)
 {
     std::istringstream ss(spec);
     std::string token;
-    while (std::getline(ss, token, ','))
-        if (token.substr(0, token.find(':')) == "split")
+    while (std::getline(ss, token, ',')) {
+        std::string mode = token.substr(0, token.find(':'));
+        const auto first = mode.find_first_not_of(" \t");
+        const auto last = mode.find_last_not_of(" \t");
+        mode = first == std::string::npos ? std::string() : mode.substr(first, last - first + 1);
+        if (mode == "split")
             return true;
+    }
     return false;
 }
 
