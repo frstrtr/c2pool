@@ -38,6 +38,7 @@
 #include <optional>
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <string>
 #include <vector>
@@ -99,11 +100,12 @@ double attempts(uint32_t bits)
 struct Node {
     ltc::ShareTracker tracker;
     std::map<PayoutKey, double> rates;
-    uint32_t share_bits(const PayoutKey& rate_key)
+    uint32_t share_bits(const PayoutKey& rate_key, const std::optional<double>& share_difficulty = std::nullopt)
     {
         ltc::stratum::JobTargetInputs in;
         in.local_hash_rate = ltc::stratum::job_local_hash_rate(rates, rate_key);
         in.share_period = ltc::PoolConfig::share_period();
+        in.share_difficulty = share_difficulty;
         const auto desired = ltc::stratum::job_desired_share_target(in);
         return tracker.compute_share_target(uint256(), 1600000000u, desired).bits;
     }
@@ -176,23 +178,26 @@ struct Rig {
                                   const std::vector<unsigned char>&, const PayoutKey& rate_key,
                                   uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
                                   const Merged&, const std::vector<uint256>&,
-                                  const std::optional<uint16_t>&) {
+                                  const std::optional<uint16_t>&,
+                                  const std::optional<double>& share_difficulty) {
             MiningInterface::RefHashResult r;
             r.ref_hash.SetHex(std::string(64, '5'));
-            r.bits = node.share_bits(rate_key);
+            r.bits = node.share_bits(rate_key, share_difficulty);
             return r;
         });
         mi.refresh_work();
     }
     // (the job's payout, its frozen share bits)
-    std::pair<std::vector<unsigned char>, uint32_t> job(const PayoutKey& login, const std::vector<unsigned char>& script)
+    std::pair<std::vector<unsigned char>, uint32_t> job(const PayoutKey& login, const std::vector<unsigned char>& script,
+                                                        const std::optional<double>& share_difficulty = std::nullopt)
     {
         auto payout = script;
         Merged merged;
         mi.decide_job_payout(payout, merged);
         uint256 prev;
         prev.SetHex("01");
-        const auto cbr = mi.build_connection_coinbase_for(login, prev, "aabbccdd", payout, merged);
+        const auto cbr = mi.build_connection_coinbase_for(login, prev, "aabbccdd", payout, merged, std::nullopt,
+                                                          share_difficulty);
         EXPECT_FALSE(cbr.coinb1.empty());
         return {payout, cbr.snapshot.frozen_ref.bits};
     }
@@ -326,4 +331,103 @@ TEST(NodeFeeJobTarget, SmallMinerKeepsItsWeightBesideABigOne)
     const double due = small_conn / (small_conn + 9 * big_conn);
     EXPECT_NEAR(weight.front() / total / due, 1.0, 1e-9)
         << "the small miner's weight is its hash rate (was 1/30 of it)";
+}
+
+// ---------------------------------------------------------------------------
+// The login's "/N" (p2pool desired_share_target from get_user_details): the
+// job's desired target is difficulty_to_target(N) in place of both caps,
+// then the same band clip [pre_target3/30, pre_target3]. Without one the job
+// is sized exactly as before.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The band of a job with no prev share in the tracker: [MAX_TARGET/30, MAX_TARGET].
+uint256 band_hi() { return ltc::PoolConfig::max_target(); }
+uint256 band_lo() { return ltc::PoolConfig::max_target() / 30; }
+
+// The difficulty (p2pool units: difficulty 1 = 0x00000000ffff0000...) of a target.
+double difficulty_of(const uint256& t) { return chain::target_to_difficulty(t); }
+
+} // namespace
+
+TEST(ShareDifficultySuffix, SlashNInTheBandIsTheJobsShareTarget)
+{
+    Rig r;
+    // A difficulty in the middle of the band (geometric mean of its edges).
+    const double n = std::sqrt(difficulty_of(band_hi()) * difficulty_of(band_lo()));
+    const auto want = chain::difficulty_to_target(n);
+    ASSERT_TRUE(want.has_value());
+    ASSERT_TRUE(*want > band_lo() && *want < band_hi());
+
+    const auto [payout, bits] = r.job(key_of(0x0a), p2pkh(0x0a), n);
+    EXPECT_EQ(payout, p2pkh(0x0a));
+    EXPECT_EQ(bits, chain::target_to_bits_upper_bound(*want)) << "the job's share target is difficulty_to_target(N)";
+    EXPECT_NE(bits, r.job(key_of(0x0a), p2pkh(0x0a)).second) << "without \"/N\" the job had the band's easiest";
+}
+
+TEST(ShareDifficultySuffix, SlashNIsClippedIntoTheBand)
+{
+    Rig r;
+    const uint32_t easiest = r.node.easiest();
+    const uint32_t hardest = chain::target_to_bits_upper_bound(band_lo());
+    EXPECT_EQ(r.job(key_of(0x0a), p2pkh(0x0a), 1e-6).second, easiest) << "an easier N: the band's easy edge";
+    EXPECT_EQ(r.job(key_of(0x0a), p2pkh(0x0a), 1e12).second, hardest) << "a harder N: the band's hard edge";
+}
+
+// "/N" replaces the per-miner caps (p2pool get_work runs them only when the
+// login gave none): a miner at the hard edge asking for an easy share gets it.
+TEST(ShareDifficultySuffix, SlashNReplacesTheRateCap)
+{
+    Rig r;
+    const double a_easy = attempts(r.node.easiest());
+    r.node.rates[key_of(0x0a)] = a_easy * 100.0;   // Cap 1 wants ~1e5 x the easiest share
+    const uint32_t capped = r.job(key_of(0x0a), p2pkh(0x0a)).second;
+    ASSERT_NEAR(attempts(capped) / a_easy, 30.0, 0.1) << "the rate cap: the hard edge";
+    const double easy_n = difficulty_of(band_hi()) / 2.0;   // easier than the band: clipped to its easy edge
+    EXPECT_EQ(r.job(key_of(0x0a), p2pkh(0x0a), easy_n).second, r.node.easiest())
+        << "\"/N\" in place of the cap, then the band clip";
+}
+
+// Without "/N" the desired target is the caps' exactly, whatever the inputs
+// (the master formula, byte for byte).
+TEST(ShareDifficultySuffix, NoSlashNIsTheCapsUnchanged)
+{
+    for (double rate : {0.0, 1.0, 1e6, 1e12, 1e18}) {
+        for (double pool_aps : {0.0, 1e9, 1e15}) {
+            ltc::stratum::JobTargetInputs in;
+            in.local_hash_rate = rate;
+            in.share_period = ltc::PoolConfig::share_period();
+            in.pool_aps = pool_aps;
+            in.subsidy = 625000000;
+            in.dust_threshold = ltc::PoolConfig::dust_threshold();
+            in.spread = ltc::PoolConfig::SPREAD;
+            in.block_bits = 0x1a01cd2d;
+            const auto without = ltc::stratum::job_desired_share_target(in);
+            // The caps as they were computed before "/N" (Cap 1, then Cap 2).
+            uint256 want;
+            want.SetHex(std::string(64, 'f'));
+            if (rate > 0.0 && rate * in.share_period / 0.0167 > 1.0) {
+                const auto cap = ltc::stratum::average_attempts_to_target(rate * in.share_period / 0.0167);
+                if (cap < want) want = cap;
+            }
+            if (pool_aps > 0.0) {
+                const double payout = (rate / pool_aps) * static_cast<double>(in.subsidy);
+                if (payout < static_cast<double>(in.dust_threshold)) {
+                    const uint288 block_aps = chain::target_to_average_attempts(chain::bits_to_target(in.block_bits));
+                    const double dust_avg = static_cast<double>(block_aps.GetLow64()) * in.spread
+                        * static_cast<double>(in.dust_threshold) / static_cast<double>(in.subsidy);
+                    if (dust_avg > 1.0) {
+                        const auto d = ltc::stratum::average_attempts_to_target(dust_avg);
+                        if (d < want) want = d;
+                    }
+                }
+            }
+            EXPECT_EQ(without.GetHex(), want.GetHex()) << "rate " << rate << " pool_aps " << pool_aps;
+            in.share_difficulty = 512.0;
+            EXPECT_EQ(ltc::stratum::job_desired_share_target(in).GetHex(),
+                      "00000000007fff80000000000000000000000000000000000000000000000000")
+                << "\"/512\": difficulty_to_target(512), no cap (p2pool)";
+        }
+    }
 }

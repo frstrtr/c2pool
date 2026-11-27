@@ -7540,7 +7540,8 @@ int main(int argc, char* argv[]) {
                     const uint256& witness_root,
                     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
                     const std::vector<uint256>& merkle_branches,
-                    const std::optional<uint16_t>& share_donation)
+                    const std::optional<uint16_t>& share_donation,
+                    const std::optional<double>& desired_share_difficulty)
                     -> core::MiningInterface::RefHashResult
                 {
                     auto guard = p2p_node->read_tracker();
@@ -7601,7 +7602,9 @@ int main(int argc, char* argv[]) {
                     // target (pre_target3, 30x easier than its miner's at the
                     // hard edge), its shares weighed 1/30 of their work and it
                     // ended at its first, quick share, so the operator got a
-                    // fraction of the fee.
+                    // fraction of the fee. A login "/N" replaces both caps
+                    // (get_work: desired_share_target from get_user_details),
+                    // the band clip unchanged.
                     LOG_TRACE << "[ref_hash_fn] getting local_addr_rates...";
                     auto local_addr_rates = web_server.get_local_addr_rates();
                     LOG_TRACE << "[ref_hash_fn] got " << local_addr_rates.size() << " addr rates";
@@ -7615,6 +7618,7 @@ int main(int argc, char* argv[]) {
                     target_in.dust_threshold = ltc::PoolConfig::dust_threshold();
                     target_in.spread = ltc::PoolConfig::SPREAD;
                     target_in.block_bits = bits;
+                    target_in.share_difficulty = desired_share_difficulty;
                     // Cap 2's pool rate: over the last hour of shares at the
                     // prev share, once the chain is that deep; whatever the
                     // job's local rate (p2pool applies the dust rule at no
@@ -7659,6 +7663,9 @@ int main(int argc, char* argv[]) {
                                  << " max_bits=" << share_max_bits << std::dec
                                  << " share_diff=" << sd << " max_diff=" << md
                                  << " local_hr=" << local_hash_rate
+                                 << (desired_share_difficulty
+                                         ? " login_share_diff=" + std::to_string(*desired_share_difficulty)
+                                         : std::string())
                                  << " desired=" << desired_target.GetHex().substr(0, 16);
                     }
 
