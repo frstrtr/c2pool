@@ -2673,6 +2673,69 @@ int run_node(const core::CoinParams& params, bool testnet,
         // Window data is the dashboard grid — tip-sensitive; refresh on tip change.
         mi->mark_last_cache_tip_driven();
 
+        // (4d) the explorer's live updates, the share page, the current
+        //      payouts and the stratum workers (DASHBOARD-GAPS-DGB.md item 1):
+        //      core::sharechain_views (#2348) with DGB's address encoder
+        //      (dashboard_sharechain.hpp). Each feeder copies what it needs
+        //      under ONE read_tracker() guard (busy: an empty / busy document,
+        //      or the last payouts) and builds the JSON after it; the found-
+        //      block ledger and the cell take their own locks, before the guard.
+        auto found_share_hashes = [mi]() {
+            std::vector<std::string> out;
+            if (!mi) return out;
+            for (const auto& fb : mi->get_found_blocks()) {
+                const std::string sh = mi->found_block_share_hash(fb);
+                if (!sh.empty()) out.push_back(sh);
+            }
+            return out;
+        };
+        mi->set_sharechain_delta_fn([&p2p_node, mi, found_share_hashes](const std::string& since) -> nlohmann::json {
+            const auto found = found_share_hashes();
+            core::sharechain_views::ChainSnapshot snap;
+            {
+                auto guard = p2p_node.read_tracker();
+                if (!guard) return nlohmann::json::object();
+                snap = dgb::dashboard::delta_snapshot(*guard, since);
+            }
+            const std::string fee_hash160 = mi ? mi->get_node_fee_hash160() : std::string{};
+            return dgb::dashboard::delta_json(snap, fee_hash160, found);
+        });
+        mi->set_share_lookup_fn([&p2p_node, mi](const std::string& hash_hex) -> nlohmann::json {
+            const auto found = mi ? mi->get_found_blocks() : std::vector<core::MiningInterface::FoundBlock>{};
+            nlohmann::json detail;
+            {
+                auto guard = p2p_node.read_tracker();
+                if (!guard) return nlohmann::json{{"error", "tracker busy"}};
+                detail = dgb::dashboard::share_detail(*guard, hash_hex);
+            }
+            if (detail.contains("error")) return detail;
+            core::sharechain_views::add_found_block_fields(detail, found,
+                [mi](const core::MiningInterface::FoundBlock& fb) { return mi->is_primary_found_block(fb); });
+            return detail;
+        });
+        {
+            struct LastPayouts { std::mutex m; nlohmann::json j = nlohmann::json::object(); };
+            auto last = std::make_shared<LastPayouts>();
+            mi->set_current_payouts_fn([&p2p_node, cell = stratum_best_share, ws = work_source.get(), last]()
+                                           -> nlohmann::json {
+                const uint256 best = cell->get();
+                const auto t = ws->last_template_summary();
+                if (best.IsNull() || !t) return nlohmann::json::object();
+                auto guard = p2p_node.read_tracker();
+                if (!guard) {
+                    std::lock_guard<std::mutex> l(last->m);
+                    return last->j;
+                }
+                auto out = dgb::dashboard::current_payouts(*guard, best, t->bits, t->coinbase_value);
+                if (!out.empty()) {
+                    std::lock_guard<std::mutex> l(last->m);
+                    last->j = out;
+                }
+                return out;
+            });
+        }
+        mi->set_stratum_workers_fn([ws = work_source.get()]() { return ws->snapshot_stratum_workers(); });
+
         // (4c) lightweight tip endpoint for RealTime polling. Returns nullopt
         //      while the sharechain is still bootstrapping. Mirrors ltc.
         mi->set_sharechain_tip_fn(

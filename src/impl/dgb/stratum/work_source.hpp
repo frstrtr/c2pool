@@ -184,6 +184,13 @@ public:
     void register_stratum_worker(const std::string& session_id,
                                  const core::stratum::WorkerInfo& info) override;
     void unregister_stratum_worker(const std::string& session_id) override;
+    /// A copy of the registered stratum workers (the dashboard's
+    /// set_stratum_workers_fn).
+    std::map<std::string, core::stratum::WorkerInfo> snapshot_stratum_workers() const
+    {
+        std::lock_guard<std::mutex> lk(workers_mutex_);
+        return workers_;
+    }
     void update_stratum_worker(const std::string& session_id,
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
