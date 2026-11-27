@@ -65,6 +65,16 @@ inline uint256 compute_p2pool_witness_commitment(const uint256& wtxid_merkle_roo
     return Hash(wtxid_merkle_root, nonce);
 }
 
+// The P2Pool witness commitment output script: 0x6a24aa21a9ed ||
+// SHA256d(wtxid_merkle_root || '[P2Pool]'*4) (p2pool data.py generate_transaction).
+inline std::vector<unsigned char> p2pool_witness_commitment_script(const uint256& wtxid_merkle_root)
+{
+    std::vector<unsigned char> s = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+    const uint256 c = compute_p2pool_witness_commitment(wtxid_merkle_root);
+    s.insert(s.end(), c.data(), c.data() + 32);
+    return s;
+}
+
 // ============================================================================
 // check_hash_link()
 //
@@ -519,6 +529,15 @@ uint256 share_init_verify(const ShareT& share, const core::CoinParams& params, b
     // --- Basic validation ---
     if (share.m_coinbase.size() < 2 || share.m_coinbase.size() > 100)
         throw std::invalid_argument("bad coinbase size");
+
+    // V35 is segwit-activated on the python network: a V35 share without
+    // segwit_data (python's None) fails there (Share.__init__ reads
+    // share_info['segwit_data']['txid_merkle_link']).
+    if constexpr (ShareT::version >= dgb::SEGWIT_ACTIVATION_VERSION
+                  && !core::version_gate::is_v36_active(ShareT::version))
+        if constexpr (requires { share.m_segwit_data; })
+            if (!share.m_segwit_data.has_value())
+                throw std::invalid_argument("V35 share without segwit_data");
 
     // V34/V35: the python network turns the share's address into its payout
     // script or rejects the share (p2pool-dgb-scrypt Share.__init__:

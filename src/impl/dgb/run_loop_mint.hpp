@@ -33,6 +33,8 @@
 #include <optional>
 #include <vector>
 
+#include <btclibs/span.h>
+#include <btclibs/util/strencodings.h>      // HexStr (the V35 commitment gate)
 #include <core/pack.hpp>                  // PackStream, operator>>
 #include <core/pack_types.hpp>            // BaseScript
 #include <core/uint256.hpp>
@@ -164,6 +166,10 @@ inline uint256 mint_local_share_at_frozen_version(
         }
     }
 
+    const bool v35_segwit = !core::version_gate::is_v36_active(static_cast<int64_t>(in.share_version))
+                            && static_cast<int64_t>(in.share_version) >= dgb::SEGWIT_ACTIVATION_VERSION;
+    const std::vector<unsigned char> v35_commitment =
+        v35_segwit ? p2pool_witness_commitment_script(uint256()) : std::vector<unsigned char>{};
     return create_local_share(
         tracker, params, min_header, coinbase,
         in.subsidy, in.prev_share, in.merkle_branches,
@@ -171,8 +177,11 @@ inline uint256 mint_local_share_at_frozen_version(
         donation,
         merged_addrs,                        // the job's merged addresses (V36 shares carry them)
         StaleInfo::none,
-        /*segwit_active=*/false,             // producer emits non-segwit coinbase
-        std::string{},                       // witness_commitment_hex
+        // V35 shares carry segwit_data (the producer's coinbase-only {[], 0,
+        // root 0}, with the P2Pool witness commitment in the coinbase).
+        v35_segwit,                          // segwit_active
+        v35_segwit ? HexStr(Span<const unsigned char>(v35_commitment.data(), v35_commitment.size()))
+                   : std::string{},          // witness_commitment_hex (the gate)
         std::vector<unsigned char>{},        // message_data
         actual_coinbase,                     // actual_coinbase_bytes (the mined coinbase)
         uint256(),                           // witness_root

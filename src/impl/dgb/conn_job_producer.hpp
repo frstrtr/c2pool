@@ -168,7 +168,16 @@ std::optional<coin::ConnCoinbasePplnsInputs> build_conn_job_inputs(
     rin.subsidy            = subsidy;
     rin.donation           = req.donation;
     rin.stale_info         = 0;
-    rin.has_segwit         = false;           // non-segwit coinbase
+    // V35 is segwit-activated (python SEGWIT_ACTIVATION_VERSION 35): every
+    // V35 share carries segwit_data and its generation transaction starts
+    // with the P2Pool witness commitment (p2pool-dgb-scrypt data.py
+    // generate_transaction). A DGB job carries no transactions, so the
+    // segwit_data is {txid_merkle_link {[], 0}, wtxid_merkle_root =
+    // merkle_hash([0]) = 0}. V36: unchanged (no segwit coinbase).
+    const bool v35_segwit = !use_v36_pplns && mint_version >= dgb::SEGWIT_ACTIVATION_VERSION;
+    rin.has_segwit         = v35_segwit;
+    if (v35_segwit)
+        rin.segwit_data = SegwitData{};
     rin.merged_addresses   = merged_addresses;
     rin.merged_payout_hash = merged_payout_hash;
     rin.far_share_hash     = far_share_hash;
@@ -185,6 +194,8 @@ std::optional<coin::ConnCoinbasePplnsInputs> build_conn_job_inputs(
     ain.subsidy         = subsidy;
     ain.coinbase_script = coinbase_scriptsig;
     apply_conn_mint_version(ain, mint_version, req.payout_script);
+    if (v35_segwit)
+        ain.segwit_commitment_script = p2pool_witness_commitment_script(uint256());
     ain.ref_params      = coin::make_work_ref_hash_params(rin, params);
     auto out = make_conn_pplns_inputs(ain, params);
 

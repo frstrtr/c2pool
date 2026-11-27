@@ -717,6 +717,9 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     // re-derives the won-block reconstruct from; the remaining snapshot fields
     // (merkle_branches / segwit) are populated by the template-cache follow-on.
     out.snapshot.subsidy                   = inputs->subsidy;
+    // A coinbase carrying the P2Pool witness commitment (V35) is a segwit
+    // coinbase: its won block is serialized in witness form.
+    out.snapshot.segwit_active             = inputs->segwit_commitment_script.has_value();
     out.snapshot.frozen_ref.ref_hash       = inputs->ref_hash;
     out.snapshot.frozen_ref.last_txout_nonce = inputs->last_txout_nonce;
     // #884: freeze the ratchet-selected version pair the coinbase was built at,

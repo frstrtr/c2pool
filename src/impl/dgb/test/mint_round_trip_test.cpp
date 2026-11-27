@@ -47,6 +47,7 @@
 #include <boost/asio/io_context.hpp>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -134,13 +135,17 @@ struct RtRig {
     std::optional<dgb::coin::ConnCoinbasePplnsInputs> last_inputs;
     dgb::stratum::DGBWorkSource::JobBlock last_block;   // what the producer was handed
     std::string tip_bits = "1b0404cb";                   // the template's block bits
+    Bytes last_block;                                    // the last won block sent
     Bytes last_payout;                                   // what the producer was handed
     std::vector<std::pair<uint32_t, Bytes>> last_merged;
     uint256 minted;
 
     explicit RtRig(uint32_t t0 = 1795600000u) : chain(12, t0)
     {
-        auto submit = [](const std::vector<unsigned char>&, uint32_t) -> bool { return false; };
+        auto submit = [this](const std::vector<unsigned char>& block, uint32_t) -> bool {
+            last_block = block;   // a won block's wire bytes
+            return false;
+        };
         // The DGB block the jobs are for: height 20,000,000 (the coinbase's
         // BIP34 height and its subsidy), header bits 0x1b0404cb.
         hc.set_base_height(kRtBlockHeight);
@@ -201,6 +206,7 @@ struct RtRig {
         j.block_nbits = "03000001";     // no digest is a block: ShareAccept, never WonBlock
         j.prev_share_hash = chain.tip;
         j.subsidy = cbr.snapshot.subsidy;
+        j.segwit_active = cbr.snapshot.segwit_active;   // as core copies it to the job
         j.frozen_ref = cbr.snapshot.frozen_ref;
         return j;
     }
@@ -714,4 +720,113 @@ TEST(DgbMintRoundTrip, FirstShareOnANinetyDayOldTip)
         ASSERT_TRUE(m.ok) << "the first share on the old tip was not credited";
         EXPECT_TRUE(m.gentx_ok) << "a peer would reject it";
     }
+}
+
+// Review 713dc77a0 #5: V35 is segwit-activated on the python network
+// (SEGWIT_ACTIVATION_VERSION 35). Every V35 share carries segwit_data and its
+// generation transaction starts with the P2Pool witness commitment; a DGB job
+// carries no transactions, so segwit_data is {[], 0, root 0} and the
+// commitment is SHA256d(0^32 || '[P2Pool]'*4). The literal below was computed
+// independently (hashlib). Before, c2pool's V35 job had no commitment and its
+// share serialized {[], 0, 0}, which python reads as PRESENT (its none-value
+// root is 2**256-1) and then expects the commitment: every share failed.
+TEST(DgbMintRoundTrip, V35JobCarriesTheP2PoolWitnessCommitment)
+{
+    const std::string kCommit = "6a24aa21a9ed92ac07c7b9e008effde0e4753064f2328b1c8cd3d0b488f4bf1bba8cb9338c36";
+    RtRig rig;
+    rig.mint_version = 35;
+    auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", stratum_payout(miner_login()), {});
+    ASSERT_FALSE(cbr.held);
+    const std::string cb = cbr.coinb1 + cbr.coinb2;
+    const auto at = cb.find(std::string("0000000000000000") + "26" + kCommit);
+    ASSERT_NE(at, std::string::npos) << "the V35 coinbase has no P2Pool witness commitment";
+    const auto miner = cb.find(HexStr(Span<const unsigned char>(miner_script().data(), miner_script().size())));
+    ASSERT_NE(miner, std::string::npos);
+    EXPECT_LT(at, miner) << "the commitment is not the first output";
+
+    auto j = rig.job(cbr, 0x2100ffffu);
+    const std::string en1 = "cafef00d", en2 = "0000002c", ntime = "6a1b2c3d", nonce = "00c0ffee";
+    Bytes coinbase;
+    (void)miner_header(j, en1, en2, ntime, nonce, &coinbase);
+    auto r = rig.ws->mining_submit(miner_login(), "job", en1, en2, ntime, nonce, "rid", {}, &j);
+    ASSERT_TRUE(r.is_boolean() && r.get<bool>()) << r.dump();
+    ASSERT_FALSE(rig.minted.IsNull());
+    const uint256 cb_txid = Hash(std::span<const unsigned char>(coinbase.data(), coinbase.size()));
+    rig.chain.tracker.chain.get(rig.minted).share.invoke([&](auto* s) {
+        using S = std::remove_pointer_t<decltype(s)>;
+        if constexpr (S::version == 35) {
+            ASSERT_TRUE(s->m_segwit_data.has_value()) << "a V35 share without segwit_data fails in python";
+            EXPECT_TRUE(s->m_segwit_data->m_txid_merkle_link.m_branch.empty());
+            EXPECT_TRUE(s->m_segwit_data->m_wtxid_merkle_root.IsNull());
+            // It survives the wire: present, not python's none-value.
+            dgb::ShareType st;
+            st = new S(*s);
+            auto ps = pack(st);
+            auto back = dgb::ShareType::load(35, ps);
+            back.invoke([&](auto* b) {
+                if constexpr (requires { b->m_segwit_data; })
+                    EXPECT_TRUE(b->m_segwit_data.has_value()) << "segwit_data read back as absent";
+            });
+            EXPECT_EQ(dgb::generate_share_transaction(*s, rig.chain.tracker, rig.params, false, false), cb_txid)
+                << "the share's generation transaction is not the coinbase the miner hashed";
+        } else {
+            ADD_FAILURE() << "not a V35 share";
+        }
+    });
+}
+
+TEST(DgbMintRoundTrip, V35ShareWithoutSegwitDataIsRejected)
+{
+    const auto params = rt_params();
+    dgb::PaddingBugfixShare s;
+    s.m_coinbase.m_data = {0x03, 0x01, 0x02, 0x03};
+    const std::string a = miner_login();
+    s.m_address.m_data.assign(a.begin(), a.end());
+    s.m_segwit_data.reset();
+    EXPECT_THROW(dgb::share_init_verify(s, params, /*check_pow=*/false), std::invalid_argument);
+}
+
+// #5, the won block: a V35 coinbase carries the P2Pool witness commitment, so
+// its won block is sent in witness form, and Core's CheckWitnessMalleation
+// must accept it: the coinbase witness is one 32-byte item, and SHA256d(the
+// block's witness merkle root || that item) equals the commitment output's 32
+// bytes. Recomputed here from the serialized block the work source sent (a
+// coinbase-only block: its witness root is the coinbase's wtxid, 0).
+TEST(DgbMintRoundTrip, WonV35BlockPassesTheWitnessCommitmentCheck)
+{
+    RtRig rig;
+    rig.mint_version = 35;
+    auto cbr = rig.ws->build_connection_coinbase(rig.chain.tip, "cafef00d", stratum_payout(miner_login()), {});
+    ASSERT_FALSE(cbr.held);
+    EXPECT_TRUE(cbr.snapshot.segwit_active) << "a committed coinbase must be served as a segwit coinbase";
+    auto j = rig.job(cbr, 0x2100ffffu);
+    j.block_nbits = "2100ffff";   // every hash is a block
+    const std::string en1 = "cafef00d", en2 = "0000002d", ntime = "6a1b2c3d", nonce = "00c0ffee";
+    (void)rig.ws->mining_submit(miner_login(), "job", en1, en2, ntime, nonce, "rid", {}, &j);
+    const Bytes& b = rig.last_block;
+    ASSERT_GT(b.size(), 80u + 1u + 4u + 2u + 34u + 4u) << "no won block was sent";
+    ASSERT_EQ(b[80], 0x01) << "a coinbase-only block";
+    const size_t cb = 81;
+    ASSERT_EQ(b[cb + 4], 0x00) << "not in witness form (marker)";
+    ASSERT_EQ(b[cb + 5], 0x01) << "not in witness form (flag)";
+    // The coinbase witness: one 32-byte item right before the locktime.
+    const size_t wit = b.size() - 4 - 34;
+    ASSERT_EQ(b[wit], 0x01);
+    ASSERT_EQ(b[wit + 1], 0x20);
+    const Bytes reserved(b.begin() + static_cast<std::ptrdiff_t>(wit + 2),
+                         b.begin() + static_cast<std::ptrdiff_t>(wit + 34));
+    // The commitment output.
+    const Bytes prefix{0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+    auto it = std::search(b.begin() + static_cast<std::ptrdiff_t>(cb), b.end(), prefix.begin(), prefix.end());
+    ASSERT_NE(it, b.end()) << "no witness commitment output";
+    const Bytes commitment(it + 6, it + 38);
+    // CheckWitnessMalleation: SHA256d(witness root || reserved value).
+    auto recompute = [](const Bytes& reserved_value) {
+        Bytes pre(32, 0x00);   // the witness merkle root of a coinbase-only block
+        pre.insert(pre.end(), reserved_value.begin(), reserved_value.end());
+        const uint256 h = Hash(std::span<const unsigned char>(pre.data(), pre.size()));
+        return Bytes(h.data(), h.data() + 32);
+    };
+    EXPECT_EQ(recompute(reserved), commitment) << "the witness commitment does not verify";
+    EXPECT_NE(recompute(Bytes(32, 0x00)), commitment) << "the check cannot tell the reserved values apart";
 }

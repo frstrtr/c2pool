@@ -193,7 +193,11 @@ struct Formatter
 
         if constexpr (is_segwit_activated(version))
         {
-            READWRITE(Optional(obj->m_segwit_data, SegwitDataDefault));
+            // V35: python's none-value (root 2**256-1); V36: the zero sentinel.
+            if constexpr (core::version_gate::is_v36_active(version))
+                READWRITE(Optional(obj->m_segwit_data, SegwitDataDefault));
+            else
+                READWRITE(Optional(obj->m_segwit_data, SegwitDataDefaultV35));
         }
 
         // V36: merged_addresses (after segwit_data, before far_share_hash)

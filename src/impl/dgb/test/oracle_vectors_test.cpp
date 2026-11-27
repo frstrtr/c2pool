@@ -153,10 +153,14 @@ struct OracleRig {
         h.m_nonce = 7;
         BaseScript cb;
         cb.m_data = dgb::coin::build_coinbase_scriptsig(kHeight);
+        // V35 is segwit-activated: the genesis share carries the coinbase-only
+        // segwit_data and the P2Pool witness commitment, as every V35 share.
+        const auto commit = dgb::p2pool_witness_commitment_script(uint256());
         const uint256 g = dgb::create_local_share_v35(tracker, params, h, cb, dgb::CoinParams::subsidy(kHeight),
                                                       uint256(), {}, payout_of(0), 66, dgb::StaleInfo::none,
-                                                      false, {}, {}, uint256(), 0, 0, 0, uint128(), uint256(), 0,
-                                                      false, {}, uint256(), /*desired_version=*/35);
+                                                      /*segwit_active=*/true, hex(commit), {}, uint256(), 0, 0, 0,
+                                                      uint128(), uint256(), 0, false, {}, uint256(),
+                                                      /*desired_version=*/35);
         ASSERT_FALSE(g.IsNull());
         order.push_back(g);
     }
