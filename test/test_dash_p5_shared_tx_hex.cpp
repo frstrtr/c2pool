@@ -30,6 +30,7 @@
 
 #include <impl/dash/stratum/work_source.hpp>
 #include <impl/dash/coin/subsidy.hpp>      // DASH_SUPERBLOCK_CYCLE_MAINNET (P2' store brake)
+#include <impl/dash/coin/embedded_oracle_shadow.hpp>  // NetPeriodicity (one superblock cycle)
 #include <impl/dash/coinbase_builder.hpp>   // sha256d
 #include <impl/dash/coin/dash_txid.hpp>     // dash_txid, dash_instance_hash (v24 stable txid)
 #include <impl/dash/coin/vendor/bls_mode_guard.hpp>
@@ -46,6 +47,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <filesystem>
 #include <iterator>
 #include <fstream>
 #include <cctype>
@@ -1437,4 +1439,65 @@ TEST(DashWorkSourceStoreBrake, RegtestSuperblockHeightNeverSkips)
         << "--regtest does not set g_regtest";
     EXPECT_NE(src.find("work_source->set_regtest(g_regtest);"), std::string::npos)
         << "the DASH work source is not told about --regtest";
+}
+
+// ── ONE definition of the superblock cycle ──────────────────────────────────
+//
+// dash::coin::dash_superblock_cycle(testnet, regtest) is the only place the
+// cycle is chosen: mainnet 16616, testnet 24, regtest 10. The work source's
+// store brake, main_dash's embedded superblock guard and dashboard block info,
+// and the oracle shadow's height classes all take it from there, so regtest
+// can never again read testnet's 24 at one site and 10 at another.
+TEST(DashSuperblockCycle, OneDefinitionForEveryCaller)
+{
+    using dash::coin::dash_superblock_cycle;
+    EXPECT_EQ(dash_superblock_cycle(false, false), 16616);
+    EXPECT_EQ(dash_superblock_cycle(true, false), 24);
+    EXPECT_EQ(dash_superblock_cycle(true, true), 10);
+    EXPECT_EQ(dash_superblock_cycle(false, true), 10);
+
+    // The work source agrees for every network.
+    Source src;
+    src.set(tmpl_A());
+    for (const auto& [testnet, regtest] : {std::pair{false, false}, std::pair{true, false},
+                                           std::pair{true, true}}) {
+        DASHWorkSource ws(src.coin_state, src.fallback(), Source::submit(),
+                          core::stratum::StratumConfig{}, testnet);
+        ws.set_regtest(regtest);
+        EXPECT_EQ(ws.superblock_cycle(), dash_superblock_cycle(testnet, regtest))
+            << "testnet=" << testnet << " regtest=" << regtest;
+    }
+    // The oracle shadow's height classes agree (it has no regtest input).
+    EXPECT_EQ(dash::coin::NetPeriodicity::for_net(true).superblock_cycle,
+              static_cast<uint32_t>(dash_superblock_cycle(true, false)));
+    EXPECT_EQ(dash::coin::NetPeriodicity::for_net(false).superblock_cycle,
+              static_cast<uint32_t>(dash_superblock_cycle(false, false)));
+
+    // And no call site picks the cycle on its own.
+    auto squeezed = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        EXPECT_TRUE(in.good()) << "cannot open " << p;
+        std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        s.erase(std::remove_if(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c); }),
+                s.end());
+        return s;
+    };
+    auto count = [](const std::string& hay, const std::string& needle) {
+        size_t n = 0;
+        for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1)) ++n;
+        return n;
+    };
+    const std::filesystem::path main_src(DASH_MAIN_SRC);
+    const std::string m = squeezed(main_src);
+    EXPECT_EQ(count(m, "dash::coin::dash_superblock_cycle(testnet,g_regtest)"), 2u)
+        << "main_dash: the embedded superblock guard and the block info must both use it";
+    EXPECT_EQ(m.find("DASH_SUPERBLOCK_CYCLE_TESTNET"), std::string::npos)
+        << "main_dash picks a superblock cycle on its own";
+    const std::string w = squeezed(DASH_WORK_SOURCE_SRC);
+    EXPECT_NE(w.find("returncoin::dash_superblock_cycle(is_testnet_,is_regtest_);"), std::string::npos);
+    EXPECT_EQ(w.find("DASH_SUPERBLOCK_CYCLE_TESTNET"), std::string::npos)
+        << "the work source picks a superblock cycle on its own";
+    const std::string o = squeezed(main_src.parent_path().parent_path() / "impl" / "dash" / "coin" /
+                                   "embedded_oracle_shadow.hpp");
+    EXPECT_EQ(count(o, "dash_superblock_cycle("), 2u) << "the oracle shadow picks a cycle on its own";
 }

@@ -55,6 +55,30 @@ inline constexpr std::array<uint8_t, 23> COMBINED_DONATION_SCRIPT = {
     0x87  // OP_EQUAL
 };
 
+// Single-key donation script — P2PKH: OP_DUP OP_HASH160 <hash160> OP_EQUALVERIFY
+// OP_CHECKSIG over hash160 20cb5c22b1e4d5947e5c112c7696b51ad9af3c61. Two users:
+//   - DASH: the share donation output (p2pool-dash data.py DONATION_SCRIPT,
+//     XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u); impl/dash/share_check.hpp.
+//   - every aux-chain coinbase c2pool builds (DOGE under LTC, and under DGB
+//     once its payout provider lands; NMC under BTC; the other LTC aux
+//     chains): its always-last donation output
+//     and the PPLNS remainder, through c2pool::merged::merged_donation_script()
+//     (c2pool/merged/merged_donation.hpp). The same bytes on every chain: on
+//     DOGE D88Vn6Dyct7DKfVCfR3syHkjyNx9gEyyiv (mainnet) and
+//     nXBZW6xtYrZwCe4PhEhLDhM3DFLSd1pa1R (testnet).
+// Never a parent-chain (LTC/BTC/DGB/BCH) share donation: get_donation_script()
+// below is.
+inline constexpr std::array<uint8_t, 25> SINGLE_P2PKH_DONATION_SCRIPT = {
+    0x76, // OP_DUP
+    0xa9, // OP_HASH160
+    0x14, // PUSH 20 bytes
+    0x20, 0xcb, 0x5c, 0x22, 0xb1, 0xe4, 0xd5, 0x94,
+    0x7e, 0x5c, 0x11, 0x2c, 0x76, 0x96, 0xb5, 0x1a,
+    0xd9, 0xaf, 0x3c, 0x61,
+    0x88, // OP_EQUALVERIFY
+    0xac  // OP_CHECKSIG
+};
+
 // Returns the donation script for a given share version.
 // Pre-V36 shares use the P2PK script; V36+ shares use the combined P2SH script.
 inline std::vector<unsigned char> get_donation_script(int64_t share_version)

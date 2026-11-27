@@ -65,6 +65,7 @@
 port = 8082                 # dashboard + JSON API TCP port; default 8080 (0 = off). 8082 here so it does not collide with c2pool-ltc
 dashboard_dir = "web-static"   # dashboard static files; default "web-static", relative to the working directory. Use an absolute path (the release ships it beside the binary) when you start the node from elsewhere
 # external_ip = "pool.example.com"   # miner-facing host shown in the dashboard Stratum URL (behind NAT); default: auto-detect
+# analytics_id = "G-XXXXXXXXXX"   # Google Analytics: GA4 page views only after the visitor accepts the consent bar, addresses and query strings stripped; you need your own privacy notice. Default "" (off). CLI --analytics-id wins
 
 [dash.stratum]
 bind = "0.0.0.0:7903"       # Stratum (miner) listener [HOST:]PORT; default off (port 0). A bare port binds 0.0.0.0

@@ -39,10 +39,12 @@ shift
 if not defined CONFIG set "CONFIG=%DIR%config\c2pool_mainnet.yaml"
 
 rem Remaining arguments go to the node; a web/stratum port among them wins.
+rem --analytics-id ID is also given to the explorer, so its pages carry the tag.
 set "EXTRA="
 set "PREV="
 set "WEB_PORT_OVR="
 set "STRATUM_PORT_OVR="
+set "ANALYTICS_ID="
 :args_extra
 if "%~1"=="" goto args_done
 set "A=%~1"
@@ -53,6 +55,7 @@ if /i "%PREV%"=="--stratum" set "STRATUM_PORT_OVR=%A%"
 if /i "%PREV%"=="--stratum-port" set "STRATUM_PORT_OVR=%A%"
 if /i "%PREV%"=="--worker-port" set "STRATUM_PORT_OVR=%A%"
 if /i "%PREV%"=="-w" set "STRATUM_PORT_OVR=%A%"
+if /i "%PREV%"=="--analytics-id" set "ANALYTICS_ID=%A%"
 set "EXTRA=%EXTRA% %1"
 set "PREV=%A%"
 shift
@@ -185,6 +188,7 @@ goto explorer_chosen
 :explorer_generic
 set "EXPLORER_ARGS=--coin %COIN% --c2pool %EXPLORER_API% --web-port %EXPLORER_PORT%"
 :explorer_chosen
+if defined EXPLORER_ARGS if defined ANALYTICS_ID set "EXPLORER_ARGS=%EXPLORER_ARGS% --analytics-id %ANALYTICS_ID%"
 
 if not defined EXPLORER_ARGS goto python_done
 set "PY="

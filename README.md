@@ -16,6 +16,10 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Latest releases
 
+- **[v0.2.12.16](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.16)** — BTC + BIP110: header requests carry a full block locator, and header sync recovers when the peer stops relaying blocks (BTC: without `--bitcoind`). Dashboard: the BTC coin-peer card shows the connected peer and the other public candidates; a found block with no known miner (LTC, DOGE, BTC, Dash) shows under the donation address; a multi-pool deployment can list its stratum endpoints by region.
+- **[v0.2.12.15](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.15)** — LTC/DOGE miner page: the merged-mining panel lists the miner's merged blocks, and LTC blocks recorded before v0.2.12.7 count for their miner. BTC: found blocks are kept across restarts, and `--import-found-blocks` as on LTC. DASH: previous-cycle InstantSend locks keep verifying through a reorg.
+- **[v0.2.12.14](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.14)** — All coins: the read-only web API can also answer on the stratum port (`--stratum-http`, off by default), and the web port answers `HEAD`. Dashboard: local hashrate counts only sessions that are currently submitting. DASH: the superblock payment total is checked against the budget at every step.
+- **[v0.2.12.13](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.13)** — DASH: the masternode list resumes after a header-store reset (the first start on this version is a cold start); the mainnet header chain follows the built-in anchor; share-chain block solutions below the network's minimum time are not relayed. LTC/DOGE: imported found blocks take the source node's measured effort.
 - **[v0.2.12.12.2](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12.2)** — LTC + DOGE: the embedded header chains accept the genesis header only into a header store that has no tip yet; check the LTC and DOGE header stores once after upgrading (steps in the release notes). Dashboard: Discovered Merged Blocks links the parent hash to the parent-chain explorer only when its parent height is known. Recommended for every LTC/DOGE node.
 - **[v0.2.12.12.1](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12.1)** — DASH: a header-chain robustness fix. Recommended for every Dash node.
 - **[v0.2.12.12](https://github.com/frstrtr/c2pool/releases/tag/v0.2.12.12)** — DASH: InstantSend locks are checked against recently rotated quorums, and templates follow InstantSend locks; lower CPU with provider transactions in the template; share-chain block solutions are relayed at the network's difficulty only; a won block is not held back when the local Dash Core does not answer.
@@ -301,13 +305,18 @@ and does not yet exist, so the work can be judged on what it actually is.
   hysteresis and chain self-heal, to close the whole *class* rather than the known
   modes — is **in progress on the design track and not yet landed. We do not claim
   the class is fully closed.**
-- **Donation script (legacy key, disclosed):** the v36 donation output currently
-  uses a P2SH script that **inherits a legacy p2pool donation key** from the
-  upstream codebase. This is **not an endorsement by, or involvement of, any third
-  party** — it is inherited code. It is scheduled for replacement with a
-  **c2pool-only script in v37**. v36 blocks already produced with the inherited
-  script are immutable consensus history and cannot be retroactively changed; the
-  clean script becomes the default at the v37 boundary.
+- **Donation script (legacy key, disclosed):** the v36 donation output of the
+  parent share's coinbase (LTC, BTC, DGB, BCH) currently uses a P2SH script that
+  **inherits a legacy p2pool donation key** from the upstream codebase. This is
+  **not an endorsement by, or involvement of, any third party** — it is inherited
+  code. It is scheduled for replacement with a **c2pool-only script in v37**. v36
+  blocks already produced with the inherited script are immutable consensus
+  history and cannot be retroactively changed; the clean script becomes the
+  default at the v37 boundary. The merged-chain coinbases c2pool builds itself
+  (DOGE, NMC and the other aux chains) no longer pay it: their donation output
+  pays a single c2pool key (P2PKH, see
+  [Who is paid on a merged chain](#who-is-paid-on-a-merged-chain-c2pool-ltc-sharechain-mode)),
+  the key c2pool-dash donates to.
 
 ### v36 ratchet complete — the last generation shared with Python p2pool
 - **The LTC line ratcheted to V36.** Since 2026-11-13 00:00:00 UTC
@@ -991,8 +1000,26 @@ share's version:
   naming another miner's parent script could take that miner's address-less
   shares).
 
+The merged coinbase c2pool builds (every chain in multiaddress mode: DOGE
+under LTC, and under DGB once its payout provider lands; NMC under BTC; the
+other LTC aux chains) ends with its
+donation output, which takes the donation and the PPLNS rounding remainder
+(at least 1 satoshi). It pays one P2PKH key on every chain: script
+`76a914 20cb5c22b1e4d5947e5c112c7696b51ad9af3c61 88ac`, on DOGE
+`D88Vn6Dyct7DKfVCfR3syHkjyNx9gEyyiv` (testnet
+`nXBZW6xtYrZwCe4PhEhLDhM3DFLSd1pa1R`), the key c2pool-dash donates to. It is
+not the parent share's combined P2SH donation, which the LTC/BTC/DGB coinbase
+keeps. A merged payout to that combined P2SH (a share redistributed by
+`--redistribute donate`, a P2WSH/P2TR `--node-owner-address` without a merged
+address) is added to the donation output, never paid as a miner output. A
+`createauxblock`-mode chain's coinbase is its daemon's and has no donation
+output.
+
 c2pool nodes do not re-derive each other's merged coinbases, so the rule
-decides no share's validity. A P2SH `--node-owner-address` without
+decides no share's validity, and neither does the merged donation. Python
+p2pool V36 nodes do re-derive the DOGE coinbase, with the combined P2SH as its
+donation: on LTC testnet, whose shares stay V36 (no flag day), a Python V36
+node rejects the c2pool shares that carry a DOGE block. A P2SH `--node-owner-address` without
 `--node-owner-merged-address` is paid as the same P2SH on the merged chains,
 with the same segwit-wrapped warning at startup. `--solo` / `--custodial` merged payouts do not use per-miner
 merged addresses, and `c2pool-btc` (NMC) and `c2pool-dgb` (DOGE) do not carry
@@ -1122,6 +1149,7 @@ is `src/core/param_catalog.inc`. Commented example files for c2pool-ltc, -dash,
 | `--dump-resolved-config` | ltc, dash, btc, dgb, bch | Print the fully resolved config with the source of every key (compiled / file / CLI) between `=== RESOLVED CONFIG BEGIN ===` / `END` markers, then exit 0 **without starting the node**. Works with no coin endpoint configured. |
 | `--ack-money-settings` | ltc, dash, btc, dgb, bch | Compute and print the money-ack hash for the resolved settings file, then exit. Requires a settings file (`--settings PATH` or the data-dir default); exit 78 otherwise. |
 | `--data-dir PATH` | ltc, dash, btc, dgb, bch | Root all per-instance state (sharechain LevelDB, addr store, logs, …) under `PATH` (default `~/.c2pool`). Handled before the settings probe, so the default `c2pool.toml` is looked up under the final data dir. Requires a non-empty, non-flag argument (exit 1 otherwise). |
+| `--analytics-id ID` | ltc, dash, btc, dgb, bch, bip110 | Off by default. Google Analytics (GA4) page views, only after the visitor accepts the consent bar, with addresses and query strings stripped; the operator is responsible for the privacy notice. Settings key `web.analytics_id` (`[<coin>.web] analytics_id`, not on bip110, which reads no settings file); the CLI wins. See [Google Analytics tag](#google-analytics-tag). |
 
 **Money gate.** A settings file can never silently arm a money-class key
 (`MONEY_*` rows in the catalog: fees, donation, payout addresses, network
@@ -1131,6 +1159,52 @@ before anything starts (`src/core/settings_file.hpp`). Run
 `--ack-money-settings` to obtain the hash for the file as it stands, put it in
 `[gate].money_ack_hash`, and the file is accepted; any later edit to a money key
 invalidates the hash.
+
+#### Google Analytics tag
+
+**Off by default.** Nothing is added to any page unless the operator sets
+`--analytics-id G-XXXXXXXXXX` (or `web.analytics_id` in the settings file). Then
+the node puts a Google Analytics (GA4) tag and a consent bar into the HTML pages
+it serves (`src/core/analytics_tag.hpp`, one helper for every page).
+
+- **What is collected: GA4 page views only, and only after consent.** Before a
+  visitor accepts there is no contact with Google at all: the page carries no
+  external script, and Google's script (`gtag.js`) is not loaded, so not even the
+  visitor's IP address or browser reaches Google, and no cookie is set. On Decline,
+  or with no answer, it is never loaded. On Accept (or on a later visit after an
+  Accept) the page creates the one `gtag.js` script element, with no referrer,
+  then sets every Consent Mode type (`analytics_storage`, `ad_storage`,
+  `ad_user_data`, `ad_personalization`) to `denied`, grants `analytics_storage`,
+  and makes the config call (`send_page_view: false`) and the one `page_view`.
+- **Addresses and query strings are stripped.** The page view carries an
+  explicit `page_location`, `page_path`, `page_referrer` and `page_title`, never
+  the raw URL: the query string and fragment are dropped, and any path segment
+  that holds 20 or more letters and digits in a row (an address), or follows a
+  per-miner route, becomes `:addr` (`/miner_payouts/<address>` →
+  `/miner_payouts/:addr`, `/miner.html?address=<address>` → `/miner.html`). The
+  page's referrer policy is `no-referrer`, so no request carries the raw URL.
+- **Consent bar.** A small bar at the bottom reads "This site uses Google
+  Analytics cookies to count visits." with **Accept** and **Decline**. Accept
+  grants `analytics_storage` only (no `ad_*` type is ever granted); Decline loads
+  and sends nothing. The choice is kept in the browser's `localStorage`
+  (`c2pool_ga_consent`) and the bar is not shown again. A page without `</body>`
+  gets no bar, so it never loads or sends anything.
+- **Never on** `/control/*`, `/api/*` (admin, config, tx-inject), `/web/log`,
+  `/logs/*`, a request that carries a token, or a non-HTML response. A page
+  without `</head>`, or one that already loads `gtag.js`, is left unchanged.
+- **Only a measurement ID.** The value must be `G-` followed by 4–20 upper-case
+  letters or digits (the legacy `UA-<digits>-<digits>` form is also accepted).
+  A bad command-line value refuses the start (non-zero exit); a bad settings-file
+  value (also the LTC YAML `analytics_id`) is logged as a warning and ignored.
+- **Pages.** The dashboard's static `.html` / `.htm` files (also on the Stratum
+  port with `--stratum-http`) and the generated pages of
+  [`explorer/explorer.py`](#api-endpoints), which takes the same
+  `--analytics-id ID` flag: pass it there too, since the explorer is a separate
+  process.
+- **The operator who enables it is responsible for their own privacy notice**
+  (and for the GA4 property's settings). Turn off Enhanced measurement in the
+  GA4 web stream: otherwise GA adds its own events after consent, and an
+  outbound-click event carries the link URL, which can hold an address.
 
 `c2pool-bip110` does not take `--settings` / `--data-dir` / `--dump-resolved-config`
 (no `BIN_BIP110` alias for those rows in `param_catalog.inc`); its money
@@ -1222,7 +1296,7 @@ legacy YAML key set.
 | `--payout-window` | `payout_window_seconds` | 86400 | PPLNS window (seconds) |
 | `--storage-save-interval` | `storage_save_interval` | 300 | Sharechain save interval |
 | `--dashboard-dir` | `dashboard_dir` | web-static | Static dashboard directory |
-| `--analytics-id` | `analytics_id` | -- | Google Analytics measurement ID (e.g. `G-XXXXXXXXXX`); injected into dashboard HTML `</head>` |
+| `--analytics-id` | `analytics_id` | -- (off) | Google Analytics measurement ID (`G-XXXXXXXXXX`): GA4 page views after the visitor accepts the consent bar, addresses and query strings stripped (see [Google Analytics tag](#google-analytics-tag)); TOML `web.analytics_id` |
 | -- | `address_explorer_prefix` | Blockchair | Custom address explorer URL prefix |
 | -- | `block_explorer_prefix` | Blockchair | Custom block explorer URL prefix |
 | -- | `tx_explorer_prefix` | Blockchair | Custom tx explorer URL prefix |
@@ -1404,6 +1478,7 @@ dashd-attached default OFF)
 | `--stratum-http-budget N` | 16 | HTTP requests in progress on the Stratum port at once, at most N and at most max_stratum_connections - 1; others are answered 503 (0 = every HTTP request on the Stratum port is answered 503). |
 | `--stratum-http-per-ip N` | 6 | HTTP requests in progress on the Stratum port at once from one address, one /64 for IPv6: at most N; others are answered 503 (0 = no limit below `--stratum-http-budget`). |
 | `--dashboard-dir PATH` | `web-static` | Static dashboard root. |
+| `--analytics-id ID` | off | GA4 page views after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--external-ip ADDR` (aliases `--stratum-advertise`, `--public-host`) | auto-detect | Miner-facing host shown in the dashboard Stratum URL (NAT). |
 | `--explorer` / `--no-explorer` | on | Loopback-only `/api/explorer` surface + raw-block retention. |
 | `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |
@@ -1450,6 +1525,7 @@ usage and exits 1.
 | `--network-id HEX` (≤8 bytes), `--prefix HEX` | public BTC | Private sharechain identifier / prefix — two independent constants. Setting `--network-id` alone also suppresses the public seed list. |
 | `--stratum [HOST:]PORT` | off | Stratum listener. |
 | `--http [HOST:]PORT` | off | Operator dashboard (`web-static` relative to the working directory; parser only — not in the `--help` text). |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--coin-rpc HOST:PORT` | — | `submitblock` RPC backup endpoint (no secret on argv). |
 | `--coin-rpc-auth PATH` | `~/.bitcoin/bitcoin.conf` | `rpcuser`/`rpcpassword` file for the backup. Omit both to run daemonless. |
 | `--merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]` (repeatable) | — | Embedded merged-mined aux chain (NMC under BTC). |
@@ -1481,6 +1557,7 @@ destination.
 | `--run` | | Stand up the run-loop (io_context + sharechain peer + Stratum). Without it (or with `--selftest`) the binary runs the self-test and exits. |
 | `--stratum [HOST:]PORT` | off | Stratum listener. |
 | `--http [HOST:]PORT` | off | Dashboard + stats persistence (`web-static` relative to the working directory). |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--sharechain-port P` | 5024 | Sharechain listener port. |
 | `--sharechain-addnode HOST:PORT` (repeatable) | public defaults | Pin sharechain peers; suppresses the default bootstrap list. `92.53.224.27:5024` is the live public DGB sharechain seed named in the source. |
 | `--coin-p2p-discover` | off | DGB-isolated scored, diverse coin-peer discovery — daemonless. |
@@ -1525,6 +1602,7 @@ loop. Unknown argument → `unknown argument: …`, exit 1. The pool mode is
 | `--anchor N` | 0 | Cold-start ABLA floor anchor height. |
 | `--stratum [HOST:]PORT` | off | Stratum listener. |
 | `--http [HOST:]PORT` | off | Dashboard. |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); settings key `web.analytics_id`. |
 | `--rpc-conf PATH` | — | BCHN `bitcoin.conf` for the external-RPC fallback (`rpcuser`/`rpcpassword`; endpoint is `127.0.0.1:<rpcport>`). |
 | `--coin-p2p-discover` | off | Daemonless coin-peer discovery (CoinAddrMan); no `--peer` needed. |
 | `--sharechain-addnode HOST:PORT` (repeatable) | public defaults | Pin sharechain peers (`92.53.224.27:9349` is the live public BCH sharechain seed named in the source). |
@@ -1559,6 +1637,7 @@ cd /opt/c2pool-bip110 && ./c2pool-bip110 --run --coin-p2p-discover \
 | `--coin-externalip IP` | peer-echo auto | Operator-pinned reachable IP for self-advertisement (bare IP; port 8333 substituted). |
 | `--fork-checkpoint` | off | Seed the Knots 961640 checkpoint for a fast proof. |
 | `--http [HOST:]PORT` | off | Shared coin-generic dashboard (`/`, `/node_info`, `/api/node_topology`, `/broadcaster_status`). |
+| `--analytics-id ID` | off | GA4 page views of the `--http` pages after the visitor accepts the consent bar, addresses and query strings stripped ([Google Analytics tag](#google-analytics-tag)); command line only (no settings file). |
 | `--stratum [HOST:]PORT` / `--no-stratum` | `0.0.0.0:9336` on | Stratum listener; `--no-stratum` disables. |
 | `--serve-mempool-txs` / `--no-serve-mempool-txs` | on | Include real network txs in served templates (M3 good-citizen); the `--no-` form is the coinbase-only escape hatch. |
 | `--bip110-sharechain` | off | Arm the M3 sharechain mint on `:9337` and dial the federation sharechain. First outbound is irreversible (params-freeze checkpoint). Absent → M2 header-follower only. |
@@ -1707,6 +1786,12 @@ explorer_url: "http://localhost:9090"
 # Run the explorer UI against c2pool's API
 python3 explorer/explorer.py --ltc-c2pool http://127.0.0.1:8080/api/explorer --web-port 9090
 ```
+
+`--analytics-id G-XXXXXXXXXX` (off by default; a bad value exits 2) puts the same
+Google Analytics tag and consent bar as the node's into every page the explorer
+generates: GA4 page views only, after consent, with addresses and query strings
+stripped. It is a separate process, so give it the flag as well as the node
+(see [Google Analytics tag](#google-analytics-tag)).
 
 The explorer shows block details, decoded coinbase scripts, THE commitment proofs for c2pool-found blocks, and links to Blockchair for transactions/addresses outside the stored range.
 

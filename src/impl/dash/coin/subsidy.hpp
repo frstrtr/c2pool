@@ -116,6 +116,21 @@ inline int64_t compute_dash_platform_reward_post_v20_mn_rr(
     return mn_subsidy_share * 375 / 1000;
 }
 
+/// dashcore nSuperblockCycle of a network: mainnet 16616, testnet 24, regtest
+/// 10. The ONE definition every DASH superblock-height check takes its cycle
+/// from (the work source's store brake, the embedded arm's superblock guard,
+/// the dashboard's block info, the oracle shadow's height classes). DASH rides
+/// the testnet identity for --regtest (testnet is true there too), so regtest
+/// is decided first.
+inline constexpr int dash_superblock_cycle(bool testnet, bool regtest)
+{
+    return regtest ? DASH_SUPERBLOCK_CYCLE_REGTEST
+                   : (testnet ? DASH_SUPERBLOCK_CYCLE_TESTNET : DASH_SUPERBLOCK_CYCLE_MAINNET);
+}
+static_assert(dash_superblock_cycle(false, false) == 16616);
+static_assert(dash_superblock_cycle(true, false) == 24);
+static_assert(dash_superblock_cycle(true, true) == 10);
+
 /// True if `height` is a superblock height (treasury budget payout).
 inline bool is_superblock_height(uint32_t height,
                                  int cycle = DASH_SUPERBLOCK_CYCLE_MAINNET)

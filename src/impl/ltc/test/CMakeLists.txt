@@ -255,6 +255,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # nor aborts the others; the chain merkle tree height is capped. Same
     # folding rule.
     #
+    # merged_donation_kat_test.cpp: the aux coinbase's donation output pays the
+    # single P2PKH key (c2pool/merged/merged_donation.hpp), the LTC providers
+    # give the split that script, an old combined P2SH entry is folded into the
+    # donation, the addresses follow from the bytes, and the LTC share donation
+    # is unchanged. Reads main_ltc.cpp through C2POOL_IMPL_DIR. Same folding
+    # rule.
+    #
     # merged_rebuild_payouts_test.cpp: the merged work is always buildable: a
     # rebuild without payouts never commits to the parent's hash (keeps the
     # last block on the same parent, else no commitment), a stale rebuild is
@@ -515,6 +522,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         mempool_final_tx_test.cpp
         mempool_mweb_admission_test.cpp
         merged_aux_hardening_test.cpp
+        merged_donation_kat_test.cpp
         merged_found_record_test.cpp
         merged_multi_aux_test.cpp
         merged_rebuild_payouts_test.cpp

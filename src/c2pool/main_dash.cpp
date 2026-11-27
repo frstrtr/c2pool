@@ -167,6 +167,7 @@
 #include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
 #include <c2pool/storage/found_block_store.hpp>  // FoundBlockStore/Record + LevelDBStore + MergedBlockStore (persistence, main_ltc parity)
 #include <c2pool/storage/the_checkpoint.hpp>   // TheCheckpointStore — #159 (G9) DASH parity wiring (inert until merged mining)
+#include <core/analytics_tag.hpp>              // --analytics-id / web.analytics_id
 #include <core/web_server.hpp>                 // core::WebServer — the EXISTING c2pool dashboard (same wiring main_ltc.cpp uses)
 #include <impl/dash/enhanced_node.hpp>         // dash::EnhancedDashNode — core::IMiningNode the WebServer ctor takes
 #include <impl/dash/share_messages.hpp>        // dash::unpack_share_messages — signed transitional-blob DISPLAY+VERIFY feed
@@ -646,6 +647,7 @@ void print_banner(const char* argv0)
         << "           [--network-id HEX [--prefix HEX]]  (private sharechain identity)\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
+        << "           [--analytics-id ID]\n"
         << "           [--stratum-http[=true|false|auto]]\n"
         << "           [--stratum-http-budget N] [--stratum-http-per-ip N]\n"
         << "           [--external-ip ADDR]\n"
@@ -838,6 +840,10 @@ void print_banner(const char* argv0)
         << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
         << "        c2pool web dashboard + JSON API on --web-host (default 0.0.0.0)\n"
         << "        from --dashboard-dir (default web-static); --web-port 0 disables.\n"
+        << "        --analytics-id ID (Google Analytics GA4, G-XXXXXXXXXX), off by default:\n"
+        << "        every HTML page it serves shows a consent bar; only after a visitor\n"
+        << "        accepts are GA4 page views sent, with addresses and query strings\n"
+        << "        stripped. You are responsible for your own privacy notice.\n"
         << "        --stratum-http[=true|false|auto] also answers that API (GET/HEAD,\n"
         << "        read-only) on the stratum port, as python p2pool did on its\n"
         << "        worker port (trackers poll host:<stratum>/global_stats); default\n"
@@ -2256,6 +2262,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         });
 
         web_server->set_dashboard_dir(dashboard_dir);
+        web_server->set_analytics_id(core::analytics_id_setting());   // --analytics-id (default off)
         // Explicitly DISABLE the WebServer's own stratum acceptor. Its ctor
         // defaults stratum_port_ to (web_port + 10) (web_server.cpp:8330/8344/
         // 8358) and start() binds it unconditionally when non-zero
@@ -5473,15 +5480,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                     // exact regardless: superblock payouts come
                                     // from the 20% carve-out already deducted
                                     // from every block's subsidy. Cycle is
-                                    // network-specific (mainnet 16616, tn 24).
+                                    // network-specific (mainnet 16616, tn 24,
+                                    // regtest 10: dash_superblock_cycle).
                                     info.superblock =
                                         dash::coin::is_superblock_height(
                                             height,
-                                            testnet
-                                                ? dash::coin::
-                                                      DASH_SUPERBLOCK_CYCLE_TESTNET
-                                                : dash::coin::
-                                                      DASH_SUPERBLOCK_CYCLE_MAINNET);
+                                            dash::coin::dash_superblock_cycle(testnet, g_regtest));
                                     info.coinbase_value_sat =
                                         static_cast<uint64_t>(reward);
                                     info.payment_amount_sat =
@@ -6787,11 +6791,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // governance/treasury outputs, which the embedded template does not
         // compute. Refuse the embedded arm on those heights and let the reward-
         // safe dashd fallback serve the correct superblock template. Cycle is
-        // network-specific (mainnet 16616, testnet 24).
+        // network-specific (mainnet 16616, testnet 24, regtest 10), from the
+        // same definition the work source's store brake reads.
         {
-            const int sb_cycle = testnet
-                ? dash::coin::DASH_SUPERBLOCK_CYCLE_TESTNET
-                : dash::coin::DASH_SUPERBLOCK_CYCLE_MAINNET;
+            const int sb_cycle = dash::coin::dash_superblock_cycle(testnet, g_regtest);
             node_coin_state.set_is_superblock_fn(
                 [sb_cycle](uint32_t next_height) {
                     return dash::coin::is_superblock_height(next_height, sb_cycle);
@@ -13643,6 +13646,13 @@ int main(int argc, char** argv)
             external_ip = argv[++i];
         else if (std::strcmp(argv[i], "--dashboard-dir") == 0 && i + 1 < argc)
             dashboard_dir = argv[++i];
+        else if (std::strcmp(argv[i], "--analytics-id") == 0 && i + 1 < argc) {
+            if (!core::parse_analytics_id(argv[++i], core::analytics_id_setting())) {
+                std::cout << "c2pool-dash: bad value: --analytics-id " << argv[i]
+                          << " (expected a Google Analytics measurement ID, G-XXXXXXXXXX)\n";
+                return 2;
+            }
+        }
         else if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
             // --stratum [HOST:]PORT -- bind a Stratum TCP listener for miners.
             // Bare PORT keeps the default 0.0.0.0 bind host (parse_listen SSOT).
@@ -13740,6 +13750,9 @@ int main(int argc, char** argv)
         if (rc.file_set("stratum.bind"))    parse_listen(rc.get_string("stratum.bind").value_or(""), stratum_host, stratum_port);
         if (rc.file_set("web.external_ip")) external_ip = rc.get_string("web.external_ip").value_or(external_ip);
         if (rc.file_set("web.dashboard_dir")) dashboard_dir = rc.get_string("web.dashboard_dir").value_or(dashboard_dir);
+        if (rc.file_set("web.analytics_id"))   // --analytics-id: a bad value is warned about and ignored
+            core::apply_analytics_id_setting("web.analytics_id", rc.get_string("web.analytics_id").value_or(""),
+                                             core::analytics_id_setting());
         if (rc.file_set("daemon_rpc.endpoint")) rpc_endpoint = rc.get_string("daemon_rpc.endpoint").value_or(rpc_endpoint);
         if (rc.file_set("daemon_rpc.auth_file")) rpc_conf_path = rc.get_string("daemon_rpc.auth_file").value_or(rpc_conf_path);
         if (rc.file_set("money.redistribute"))       redistribute_mode  = rc.get_string("money.redistribute").value_or(redistribute_mode);

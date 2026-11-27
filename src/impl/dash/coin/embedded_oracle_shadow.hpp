@@ -154,10 +154,10 @@ struct NetPeriodicity {
         if (testnet) {
             p.dkg_windows = {{{24, 10, 18}}, {{288, 20, 28}},
                              {{576, 20, 48}}, {{288, 42, 50}}};
-            p.superblock_cycle = 24;
+            p.superblock_cycle = static_cast<uint32_t>(dash_superblock_cycle(true, false));
         } else {
             p.dkg_windows = {{{288, 24, 32}}};   // headline; full table = follow-up
-            p.superblock_cycle = 16616;
+            p.superblock_cycle = static_cast<uint32_t>(dash_superblock_cycle(false, false));
         }
         return p;
     }

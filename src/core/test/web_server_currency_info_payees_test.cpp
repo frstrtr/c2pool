@@ -5,7 +5,8 @@
 // donation outputs (donation_address, merged_donation_addresses), so the
 // dashboard draws the fee and donation tiles from explicit fields instead of
 // guessing from address prefixes.
-//   * each is rendered from the script the node pays, in the form
+//   * each is rendered from the script the node pays (the parent share's
+//     donation; on a merged chain the aux coinbase's single P2PKH donation), in the form
 //     /current_payouts (parent) and /current_merged_payouts (merged) key
 //     their rows by, on the node's network;
 //   * "" / {} when the node pays no such output: no --fee, no merged chain,
@@ -56,8 +57,11 @@ const char* kOwnerDash     = "XcF5mKwWsiv3k394GBQNpYAuk3CVJ48Xnp";   // DASH mai
 // The donation scripts (core/donation.hpp) on each chain.
 const char* kDonationLtc       = "MLhSmVQxMusLE3pjGFvp4unFckgjeD8LUA";   // V36 P2SH, LTC main
 const char* kDonationLtcV35    = "LeD2fnnDJYZuyt8zgDsZ2oBGmuVcxGKCLd";   // pre-V36 P2PK, its key's P2PKH
-const char* kDonationDoge      = "A5EZCT4tUrtoKuvJaWbtVQADzdUKdtsqpr";   // V36 P2SH, DOGE main
-const char* kDonationTestnet   = "2N63WXLw22FXFdLBNqWZLsDX7WQJTPXus7f";  // V36 P2SH, LTC/DOGE testnet (0xc4)
+const char* kDonationTestnet   = "2N63WXLw22FXFdLBNqWZLsDX7WQJTPXus7f";  // V36 P2SH, LTC testnet (0xc4)
+// The aux coinbase's donation (merged_donation_script: the single P2PKH key
+// 20cb5c22..3c61) on DOGE.
+const char* kMergedDonationDoge  = "D88Vn6Dyct7DKfVCfR3syHkjyNx9gEyyiv";  // DOGE main P2PKH, 0x1e
+const char* kMergedDonationDogeT = "nXBZW6xtYrZwCe4PhEhLDhM3DFLSd1pa1R";  // DOGE test P2PKH, 0x71
 
 struct DogeBackend : c2pool::merged::IAuxChainBackend {
     c2pool::merged::AuxChainConfig cfg;
@@ -145,12 +149,13 @@ TEST(CurrencyInfoPayees, LtcWithFeeNamesTheOwnerAndTheDonationOnBothChains)
     // The --node-owner-merged-address the DOGE side of the fee shares carries.
     EXPECT_EQ(r.at("node_owner_merged_addresses"), (nlohmann::json{{"DOGE", kOwnerDoge}}));
     EXPECT_EQ(r.at("donation_address"), kDonationLtc);
-    EXPECT_EQ(r.at("merged_donation_addresses"), (nlohmann::json{{"DOGE", kDonationDoge}}));
+    EXPECT_EQ(r.at("merged_donation_addresses"), (nlohmann::json{{"DOGE", kMergedDonationDoge}}));
 
     // The tiles' keys: the parent form is /current_payouts', the merged one
     // /current_merged_payouts' (DOGE 0x1e / 0x16).
     EXPECT_EQ(r.at("node_owner_address"), core::script_to_address(p2pkh(0x11), /*is_litecoin=*/true, false));
-    const Script don(core::donation::COMBINED_DONATION_SCRIPT.begin(), core::donation::COMBINED_DONATION_SCRIPT.end());
+    const Script don(core::donation::SINGLE_P2PKH_DONATION_SCRIPT.begin(),
+                     core::donation::SINGLE_P2PKH_DONATION_SCRIPT.end());
     EXPECT_EQ(r.at("merged_donation_addresses").at("DOGE"), core::script_to_address(don, "", 0x1e, 0x16));
 
     // Existing fields are untouched.
@@ -178,7 +183,7 @@ TEST(CurrencyInfoPayees, LtcWithoutFeeHasNoOwnerButKeepsTheDonation)
     EXPECT_EQ(r.at("node_owner_address"), "");
     EXPECT_EQ(r.at("node_owner_merged_addresses"), nlohmann::json::object());
     EXPECT_EQ(r.at("donation_address"), kDonationLtc);
-    EXPECT_EQ(r.at("merged_donation_addresses"), (nlohmann::json{{"DOGE", kDonationDoge}}));
+    EXPECT_EQ(r.at("merged_donation_addresses"), (nlohmann::json{{"DOGE", kMergedDonationDoge}}));
 
     // --fee 0 with an owner script and operator scripts still installed: no
     // fee share is minted to them, so no owner is named.
@@ -196,7 +201,7 @@ TEST(CurrencyInfoPayees, LtcTestnetRendersOnTheTestNetworks)
     EXPECT_EQ(r.at("node_owner_address"), kOwnerLtcTest);
     EXPECT_EQ(r.at("node_owner_merged_addresses"), (nlohmann::json{{"DOGE", kOwnerDogeKeyT}}));
     EXPECT_EQ(r.at("donation_address"), kDonationTestnet);
-    EXPECT_EQ(r.at("merged_donation_addresses"), (nlohmann::json{{"DOGE", kDonationTestnet}}));
+    EXPECT_EQ(r.at("merged_donation_addresses"), (nlohmann::json{{"DOGE", kMergedDonationDogeT}}));
 }
 
 TEST(CurrencyInfoPayees, PreV36DonationIsShownByItsKeysP2pkhAddress)

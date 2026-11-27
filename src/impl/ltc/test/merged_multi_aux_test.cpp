@@ -12,7 +12,8 @@
 //
 // The submitted blocks are read back and checked with the AuxPoW check Dogecoin
 // Core runs (doge::coin::check_auxpow = CAuxPow::check). The one-chain golden
-// pins the bytes of the pre-fix path (commitment, coinbase, submitted block).
+// pins the bytes of the pre-fix path (commitment, coinbase, submitted block),
+// the coinbase's donation output aside (it pays the single P2PKH key since).
 // Folded into the allowlisted share_test target (no new executable: #769).
 // ---------------------------------------------------------------------------
 
@@ -37,7 +38,9 @@
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
+#include <c2pool/merged/merged_donation.hpp>
 #include <c2pool/merged/merged_mining.hpp>
+#include <core/donation.hpp>
 #include <impl/doge/coin/auxpow.hpp>
 #include <impl/doge/coin/auxpow_check.hpp>
 #include <impl/nmc/coin/aux_expected_index.hpp>
@@ -511,7 +514,10 @@ std::string sha256_hex(const std::string& s)
 // The exact bytes a DOGE-only setup commits to and submits today: commitment,
 // the DOGE coinbase, and the block handed to the daemon (AuxPoW included).
 // The digests were produced by the pre-fix tree on the same inputs; a fix that
-// touches this path fails here.
+// touches this path fails here. Since the aux donation pays the single P2PKH
+// key (merged_donation.hpp), the coinbase with that one output's script put
+// back to the combined P2SH is the pre-fix coinbase byte for byte; the
+// commitment and the block follow from the coinbase and are pinned again.
 TEST(MergedMultiAux, GoldenSingleDogeIsByteIdentical)
 {
     Rig r({{"DOGE", 98}}, 5'000'001);
@@ -528,9 +534,23 @@ TEST(MergedMultiAux, GoldenSingleDogeIsByteIdentical)
     ASSERT_EQ(r.chain(0).blocks.size(), 1u);
     const std::string block = r.chain(0).blocks[0];
 
-    // Golden digests (commitment, coinbase, block) captured before the fix.
-    EXPECT_EQ(sha256_hex(hex_of(commitment)), "7a629761367f3e9c7408b76a85e23af5ee2036ea63e685f02d4fdd6b9fd3e0d5");
-    EXPECT_EQ(sha256_hex(coinbase), "682679761349d6c8cd7b181c8d89744a06f012dc2f6bb722f25218fdbe4b40b9");
-    EXPECT_EQ(sha256_hex(block), "4819d46491a26d06c0e9b70699d4773fabd92ffb91b8474551c3793f1ea78024");
+    // The coinbase ends with the donation output (script, then the locktime):
+    // the single P2PKH key; put back to the combined P2SH, the coinbase is the
+    // one captured before the fix.
+    const std::string now_don = "19" + hex_of(c2pool::merged::merged_donation_script());
+    const std::string old_don = "17" + hex_of(std::vector<uint8_t>(core::donation::COMBINED_DONATION_SCRIPT.begin(),
+                                                                   core::donation::COMBINED_DONATION_SCRIPT.end()));
+    ASSERT_GE(coinbase.size(), now_don.size() + 8);
+    ASSERT_EQ(coinbase.compare(coinbase.size() - 8 - now_don.size(), now_don.size(), now_don), 0)
+        << "the last output pays the single P2PKH donation";
+    const std::string old_coinbase =
+        coinbase.substr(0, coinbase.size() - 8 - now_don.size()) + old_don + coinbase.substr(coinbase.size() - 8);
+    EXPECT_EQ(sha256_hex(old_coinbase), "682679761349d6c8cd7b181c8d89744a06f012dc2f6bb722f25218fdbe4b40b9");
+    EXPECT_NE(block.find(coinbase), std::string::npos) << "the block carries that coinbase";
+
+    // Golden digests (commitment, coinbase, block) with the single-key donation.
+    EXPECT_EQ(sha256_hex(hex_of(commitment)), "80c5882245f2e7557d6ba594d55aef5e7436011370745397734b0a0bbd6907b1");
+    EXPECT_EQ(sha256_hex(coinbase), "282a6cd22420f4d05d62927377c74658aa6a8405bc18ebdac0ef3b6a9d7db0d4");
+    EXPECT_EQ(sha256_hex(block), "ff63fc00bdd94fa82f7a7c3b7c82b96fbdb564f8ac0d663ebf37da3ae7d660d0");
     EXPECT_FALSE(core_check(parse_block(block), 98).has_value());
 }
