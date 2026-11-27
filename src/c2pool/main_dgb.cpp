@@ -104,6 +104,7 @@
 #include <memory>
 #include <atomic>
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <set>
 #include <chrono>
@@ -332,6 +333,11 @@ int run_node(const core::CoinParams& params, bool testnet,
     // for a split job, else --give-author's, so the committed ref_hash matches
     // the created share (a mismatch = 100% self-decline). Clamped to [0, 100] %
     // as donation_percent_to_u16 does. --give-author overrides the AMOUNT only.
+    if (!std::isfinite(dev_donation)) {
+        std::cerr << "[DGB] --give-author " << dev_donation << " is not a number: the default "
+                  << core::kAuthorFeeDefaultPct << " % is used" << std::endl;
+        dev_donation = core::kAuthorFeeDefaultPct;
+    }
     const double give_author_pct = std::clamp(dev_donation, 0.0, 100.0);
 
     // Per-coin config root: ~/.c2pool/<net>/ (sharechain LevelDB + addrs.json
