@@ -63,13 +63,22 @@ def main():
     rejected = 0
     for k, v in enumerate(vectors['shares']):
         for n in negatives.get(k, []):
+            # Each negative touches only share_info: python must reject it in
+            # check() with ValueError('share_info invalid'), not elsewhere.
             try:
                 load(n).check(tracker)
                 print 'FAIL negative %r before share %d was ACCEPTED' % (n['name'], k)
                 fails += 1
+            except ValueError as e:
+                if str(e) == 'share_info invalid':
+                    print 'ok   negative %r before share %d rejected: share_info invalid' % (n['name'], k)
+                    rejected += 1
+                else:
+                    print 'FAIL negative %r before share %d rejected for another reason: %r' % (n['name'], k, e)
+                    fails += 1
             except Exception as e:
-                print 'ok   negative %r before share %d rejected: %s' % (n['name'], k, e)
-                rejected += 1
+                print 'FAIL negative %r before share %d rejected for another reason: %r' % (n['name'], k, e)
+                fails += 1
         try:
             share = load(v)
         except Exception as e:

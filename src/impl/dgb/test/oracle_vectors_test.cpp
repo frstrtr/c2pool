@@ -10,9 +10,11 @@
 // miner's header, mining_submit and the frozen-field mint. The chain has more
 // than TARGET_LOOKBEHIND shares, gaps over 300 s (R4), equal-amount ties
 // between D/S/dgb1 payouts (#6) and a P2WPKH with a leading-zero program
-// (#7). Every share must pass this node's own checks (share_init_verify,
-// check_v35_share_info, the generation transaction). Mutated copies (wrong
-// max_bits, bits outside the clip range, timestamp) must fail them.
+// (#7); the spacing moves the pool rate so the +-10% clip binds, and easy
+// block bits make the PPLNS cap bind. Every share must pass this node's full
+// verification (verify_share) with its stored hash. Mutated copies (wrong
+// max_bits, bits outside the clip range, timestamp, absheight, abswork,
+// far_share_hash) must fail them on share_info.
 //
 // With DGB_ORACLE_VECTORS=<file> it writes the packed shares, their hashes
 // and generation transactions as JSON for scripts/dgb_oracle_harness/
@@ -49,6 +51,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -80,8 +83,16 @@ Bytes payout_of(int i)
     }
 }
 
-// The gap before share i: 15 s, with two long ones (R4: no V35 decay).
-uint32_t gap_before(int i) { return i == 60 ? 400u : i == 100 ? 5000u : 15u; }
+// The gap before share i: mostly 1..9 s, so the pool rate over
+// TARGET_LOOKBEHIND drives the target below MAX_TARGET and the +-10% clip of
+// the previous max target binds both ways; two long gaps (R4: no V35 decay)
+// push it back up.
+uint32_t gap_before(int i) { return i == 60 ? 400u : i == 118 ? 5000u : 1u + static_cast<uint32_t>(i % 9); }
+
+// The block bits of share i's template: mostly the real-range 0x1b0404cb,
+// some easy ones so the PPLNS cap 65535*SPREAD*attempts(block) binds inside
+// the window (python's partial-last-share branch).
+const char* block_bits_of(int i) { return (i % 11 == 0) ? "1f00ffff" : (i % 7 == 0) ? "1e3fffff" : "1b0404cb"; }
 
 core::CoinParams oracle_params()
 {
@@ -97,6 +108,7 @@ struct OracleRig {
     dgb::coin::Mempool mempool;
     std::unique_ptr<dgb::stratum::DGBWorkSource> ws;
     uint32_t now = 0;
+    std::string tip_bits = "1b0404cb";
     uint256 minted;
     std::vector<uint256> order;   // shares in chain order
 
@@ -106,8 +118,8 @@ struct OracleRig {
         auto submit = [](const std::vector<unsigned char>&, uint32_t) -> bool { return false; };
         ws = std::make_unique<dgb::stratum::DGBWorkSource>(
             hc, mempool, false, submit, [](uint32_t h) -> uint64_t { return dgb::CoinParams::subsidy(h); });
-        ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
-            return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", "1b0404cb", kHeight};
+        ws->set_gbt_tip_fn([this]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+            return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", tip_bits, kHeight};
         });
         // main_dgb's producer, held at V35 (DgbVersionPolicy without --v36-ratchet).
         ws->set_pplns_inputs_fn([this](const uint256& prev, const std::string&, const Bytes& payout,
@@ -195,6 +207,7 @@ struct OracleRig {
     bool mine(int i)
     {
         now = tip_ts() + gap_before(i);
+        tip_bits = block_bits_of(i);
         auto cbr = ws->build_connection_coinbase(order.back(), "cafef00d", payout_of(i), {});
         if (cbr.held || cbr.coinb1.empty())
             return false;
@@ -224,12 +237,15 @@ struct OracleRig {
     }
 };
 
-// This node's checks of one share, as a peer receiving it runs them.
+// This node's full verification of one share, as a peer receiving it runs it
+// (verify_share: the init phase, share_info, the generation transaction), and
+// the recomputed hash against the stored one.
 std::string own_check(OracleRig& rig, const dgb::PaddingBugfixShare& s)
 {
     try {
-        dgb::share_init_verify(s, rig.params, /*check_pow=*/false);
-        dgb::check_v35_share_info(s, rig.tracker, rig.params);
+        const uint256 h = dgb::verify_share(s, rig.tracker, rig.params);
+        if (h != s.m_hash)
+            return "hash mismatch: computed " + h.GetHex() + " stored " + s.m_hash.GetHex();
     } catch (const std::exception& e) {
         return e.what();
     }
@@ -283,19 +299,25 @@ TEST(DgbOracleVectors, MintedChainPassesOwnChecksAndIsDumped)
                 // Mutated copies of later shares: both implementations must reject them.
                 if (k == 105 || k == 120) {
                     struct Mut { const char* name; std::function<void(dgb::PaddingBugfixShare&)> f; };
+                    // Each touches only share_info (python: ValueError('share_info invalid')).
                     const std::vector<Mut> muts = {
                         {"max_bits+1", [](auto& m) { m.m_max_bits += 1; }},
-                        {"bits easier than the pool target", [](auto& m) {
-                             m.m_bits = chain::target_to_bits_upper_bound(chain::bits_to_target(m.m_max_bits) * 2);
+                        {"bits harder than pool/30", [](auto& m) {
+                             m.m_bits = chain::target_to_bits_upper_bound(chain::bits_to_target(m.m_max_bits) / 64);
                          }},
                         {"timestamp = previous", [&](auto& m) {
                              rig.tracker.chain.get(m.m_prev_hash).share.invoke([&](auto* p) { m.m_timestamp = p->m_timestamp; });
                          }},
+                        {"absheight+1", [](auto& m) { m.m_absheight += 1; }},
+                        {"abswork+1", [](auto& m) { m.m_abswork = m.m_abswork + uint128(1); }},
+                        {"far_share_hash", [](auto& m) { m.m_far_share_hash.SetHex("1234"); }},
                     };
                     for (const auto& mu : muts) {
                         auto m = *s;
                         mu.f(m);
-                        EXPECT_NE(own_check(rig, m), "") << mu.name << " at " << k << " passed this node's checks";
+                        const std::string why = own_check(rig, m);
+                        EXPECT_NE(why.find("share_info invalid"), std::string::npos)
+                            << mu.name << " at " << k << ": " << (why.empty() ? "passed this node's checks" : why);
                         nlohmann::json n;
                         n["name"] = mu.name;
                         n["before"] = k;   // checked with shares [0, k) in the tracker
@@ -308,6 +330,19 @@ TEST(DgbOracleVectors, MintedChainPassesOwnChecksAndIsDumped)
                 ADD_FAILURE() << "share " << k << " is not V35";
             }
         });
+    }
+
+    // Coverage (review 906a0e5e3 #8): the retarget and its +-10% clip move
+    // max_bits inside the chain, and more than one block-bits value is used.
+    {
+        std::set<uint32_t> max_bits, header_bits;
+        for (const auto& h : rig.order)
+            rig.tracker.chain.get(h).share.invoke([&](auto* s) {
+                max_bits.insert(s->m_max_bits);
+                header_bits.insert(s->m_min_header.m_bits);
+            });
+        EXPECT_GT(max_bits.size(), 5u) << "max_bits barely moves: the retarget clip is not exercised";
+        EXPECT_GE(header_bits.size(), 3u);
     }
 
     if (const char* path = std::getenv("DGB_ORACLE_VECTORS")) {
