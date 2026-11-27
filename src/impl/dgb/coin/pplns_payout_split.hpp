@@ -21,13 +21,16 @@
 //   donation = subsidy - sum(amounts)
 //   V36 floor: donation must carry >= 1 sat (a60f7f7f) — deduct 1 from the
 //              largest payout, deterministic tiebreak (amount, script).
-//   order:   sorted(dests, key=(amount, script))[-4000:]  (asc, keep highest)
+//   order:   V36 sorted(dests, key=(amount, script))[-4000:]  (asc, keep highest);
+//            pre-V36 by (amount, address string), donation counted in the 4000
 //
 // Pure: takes already-built weights + subsidy + finder script, so it is directly
 // KAT-able against a canonical oracle vector (test/pplns_payout_split_test.cpp).
 // ============================================================================
 
 #include <core/uint256.hpp>   // uint288
+#include <impl/dgb/config_pool.hpp>   // PoolConfig::is_testnet (the V35 address strings)
+#include <impl/dgb/v35_address.hpp>   // v35_script_to_address (the V35 sort key)
 
 #include <algorithm>
 #include <cstdint>
@@ -120,19 +123,46 @@ inline PplnsPayoutSplit compute_pplns_payout_split(
     }
 
     // --- consensus output order (generate_share_transaction step 3) ---------
-    // Python: sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
-    //   = ascending by (amount, script), keep last PPLNS_MAX_OUTPUTS (highest).
+    // V36: sorted(dests, key=lambda a: (amounts[a], a))[-4000:], keyed by
+    //   script: ascending by (amount, script), keep the highest.
+    // Pre-V36 (the python V35 network, p2pool-dgb-scrypt data.py
+    //   generate_transaction): the dests are ADDRESS STRINGS, the donation one
+    //   among them: sorted(key=(addr == donation_address, amounts[addr],
+    //   addr))[-4000:]. So equal amounts sort by the address string ("D..." <
+    //   "S..." < "dgb1..."), not by the script (where a P2WPKH 0x00... sorted
+    //   first), and the donation takes one of the 4000 places: at most 3999
+    //   payouts (review 713dc77a0 #6). The string of a script is its canonical
+    //   address (v35_script_to_address: base58, lowercase bech32), which is the
+    //   string a share minted here carries; a script without one keeps the
+    //   script order after the addressed ones.
     PplnsPayoutSplit out;
     out.donation_amount = donation_amount;
     out.payout_outputs.assign(amounts.begin(), amounts.end());
-    std::sort(out.payout_outputs.begin(), out.payout_outputs.end(),
-        [](const auto& a, const auto& b) {
-            if (a.second != b.second) return a.second < b.second; // asc by amount
-            return a.first < b.first;                             // asc by script tiebreak
-        });
-    if (out.payout_outputs.size() > PPLNS_MAX_OUTPUTS)
+    if (use_v36_pplns) {
+        std::sort(out.payout_outputs.begin(), out.payout_outputs.end(),
+            [](const auto& a, const auto& b) {
+                if (a.second != b.second) return a.second < b.second; // asc by amount
+                return a.first < b.first;                             // asc by script tiebreak
+            });
+    } else {
+        const auto net = dgb::v35_address_net(dgb::PoolConfig::is_testnet);
+        std::map<std::vector<unsigned char>, std::string> key;
+        for (const auto& [script, amount] : amounts)
+            key.emplace(script, dgb::v35_script_to_address(script, net));
+        std::sort(out.payout_outputs.begin(), out.payout_outputs.end(),
+            [&key](const auto& a, const auto& b) {
+                if (a.second != b.second) return a.second < b.second; // asc by amount
+                const std::string& ka = key.at(a.first);
+                const std::string& kb = key.at(b.first);
+                if (ka.empty() != kb.empty()) return kb.empty();      // addressed ones first
+                if (ka != kb) return ka < kb;                         // asc by address string
+                return a.first < b.first;
+            });
+    }
+    const std::size_t max_payouts = use_v36_pplns ? PPLNS_MAX_OUTPUTS : PPLNS_MAX_OUTPUTS - 1;
+    if (out.payout_outputs.size() > max_payouts)
         out.payout_outputs.erase(out.payout_outputs.begin(),
-                                 out.payout_outputs.end() - PPLNS_MAX_OUTPUTS);
+                                 out.payout_outputs.end() - static_cast<std::ptrdiff_t>(max_payouts));
     return out;
 }
 
