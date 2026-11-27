@@ -16,10 +16,12 @@
 //
 // A marker next to the store records the rules epoch. It is written only
 // after a re-scan of the index records confirms no share is still flagged
-// verified, and read back. On any failure the marker is not written (the
+// verified (the clear is a synced batch, the marker a durable write), and
+// read back. On any failure the marker is not written (the
 // clear runs again on the next start) and this run trusts no stored flag.
 // ---------------------------------------------------------------------------
 
+#include <core/durable_file.hpp>
 #include <core/leveldb_store.hpp>
 #include <core/log.hpp>
 #include <core/uint256.hpp>
@@ -85,13 +87,12 @@ bool reverify_store_if_rules_changed(StorageT& storage, const std::filesystem::p
             return false;
         }
     }
+    // The cleared flags are committed synced (mark_shares_unverified); the
+    // marker is written durably after them (tmp, fsync, rename), so a power
+    // loss cannot keep the marker without the cleared flags.
     std::error_code ec;
     std::filesystem::create_directories(marker.parent_path(), ec);
-    {
-        std::ofstream out(marker, std::ios::trunc);
-        out << kDgbShareRulesEpoch << "\n";
-        out.flush();
-    }
+    core::durable_file::replace(marker.string(), std::string(kDgbShareRulesEpoch) + "\n");
     if (read_rules_epoch(marker) != kDgbShareRulesEpoch)
         LOG_ERROR << "[Pool] the DGB share rules marker " << marker.string()
                   << " cannot be written: the store's flags are cleared, and are checked again on the next start";
