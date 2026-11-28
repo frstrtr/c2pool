@@ -12,6 +12,29 @@
 
 namespace sha256_sse4
 {
+/*
+Both Clang and GCC fail with ASan on this inline assembly:
+- Clang: compile failure with -O0 or -O2 + -fcf-protection under ASan.
+  See https://github.com/llvm/llvm-project/issues/92182
+  and https://github.com/bitcoin/bitcoin/issues/31913.
+- GCC: runtime SEGV during SHA256AutoDetect()'s self-test under ASan,
+  regardless of optimization level.
+  See https://github.com/bitcoin/bitcoin/issues/34881.
+The asm takes 14 general-purpose register operands. Under ASan the "+m"
+operands (inp_end, inp, xfer) live in the instrumented frame, whose base
+needs a register; with the frame pointer kept none is free, and GCC may give
+it the register of an "=r" operand (not early-clobber), which the asm
+overwrites before its next xfer access. Uninstrumented, they are addressed
+off the stack or frame pointer. Bitcoin Core fedeff7f201d
+(bitcoin/bitcoin#34953).
+*/
+#if defined(__SANITIZE_ADDRESS__)
+  __attribute__((no_sanitize("address")))
+#elif defined(__clang__)
+#if __has_feature(address_sanitizer) // fallback can be removed once support for Clang 21 is dropped
+  __attribute__((no_sanitize("address")))
+#endif
+#endif
 void Transform(uint32_t* s, const unsigned char* chunk, size_t blocks)
 {
     static const uint32_t K256 alignas(16) [] = {

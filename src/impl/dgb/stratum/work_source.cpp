@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -63,6 +64,16 @@ constexpr uint64_t kDustThreshold = 100000;   // DUST_THRESHOLD 0.001 DGB (param
 } // namespace
 
 namespace {
+
+// The submit path's scrypt over a block header, counted
+// (DGBWorkSource::header_scrypt_count, the KAT seam).
+std::atomic<uint64_t> s_header_scrypt_count{0};
+
+dgb::coin::u256 counted_scrypt_pow_hash(const unsigned char header80[80])
+{
+    s_header_scrypt_count.fetch_add(1, std::memory_order_relaxed);
+    return dgb::coin::scrypt_pow_hash(header80);
+}
 
 // previousblockhash big-endian display-hex rendering is the dgb::coin SSOT
 // (coin/hash_format.hpp), shared with the embedded work path
@@ -1142,7 +1153,10 @@ nlohmann::json DGBWorkSource::mining_submit(
     }
 
     // 5. DGB-Scrypt PoW digest (scrypt_1024_1_1_256, the ONLY algo V36 validates).
-    dgb::coin::u256 pow_hash = dgb::coin::scrypt_pow_hash(header.data());
+    //    The vardiff gate's digest when it hashed these exact 80 bytes.
+    const unsigned char* gate_digest = job->gate_pow.digest_for(header.data(), header.size());
+    dgb::coin::u256 pow_hash = gate_digest ? dgb::coin::u256::from_le_bytes(gate_digest)
+                                           : counted_scrypt_pow_hash(header.data());
 
     // Expand both compact targets to u256 (compact_to_target SSOT). Fall back to
     // a permissive diff-1 share target for jobs frozen before share_bits was set
@@ -1464,6 +1478,27 @@ double DGBWorkSource::compute_share_difficulty(
     const std::string& nbits_hex,
     const std::vector<std::string>& merkle_branches) const
 {
+    core::stratum::SharePow unused;
+    return DGBWorkSource::compute_share_difficulty_pow(coinb1, coinb2, extranonce1, extranonce2,
+                                                       ntime, nonce, version, prevhash_hex,
+                                                       nbits_hex, merkle_branches, unused);
+}
+
+/*static*/
+uint64_t DGBWorkSource::header_scrypt_count()
+{
+    return s_header_scrypt_count.load(std::memory_order_relaxed);
+}
+
+double DGBWorkSource::compute_share_difficulty_pow(
+    const std::string& coinb1, const std::string& coinb2,
+    const std::string& extranonce1, const std::string& extranonce2,
+    const std::string& ntime, const std::string& nonce,
+    uint32_t version, const std::string& prevhash_hex,
+    const std::string& nbits_hex,
+    const std::vector<std::string>& merkle_branches,
+    core::stratum::SharePow& pow) const
+{
     // Stage 4b/4c LIVE: reconstruct the 80-byte header EXACTLY as mining_submit
     // does (coinb1||en1||en2||coinb2 -> sha256d txid -> ascend merkle branches ->
     // header), run the DGB-Scrypt digest (scrypt_1024_1_1_256, the sole algo V36
@@ -1522,7 +1557,11 @@ double DGBWorkSource::compute_share_difficulty(
     //    coin-space u256 into core uint256 via the u256_be_display_hex SSOT so
     //    the number is unit-identical to required_difficulty / pool_difficulty
     //    (both computed through chain::target_to_difficulty on the core side).
-    dgb::coin::u256 pow_hash = dgb::coin::scrypt_pow_hash(header.data());
+    //    `pow` takes the header and the raw digest for mining_submit.
+    s_header_scrypt_count.fetch_add(1, std::memory_order_relaxed);
+    dgb::coin::u256 pow_hash = dgb::coin::scrypt_pow_hash(header.data(), pow.digest.data());
+    std::copy(header.begin(), header.end(), pow.header.begin());
+    pow.valid = true;
     uint256 pow_core;
     pow_core.SetHex(dgb::coin::u256_be_display_hex(pow_hash));
     return chain::target_to_difficulty(pow_core);

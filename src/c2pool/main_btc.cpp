@@ -115,6 +115,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <core/sha256_init.hpp>
 
 namespace io = boost::asio;
 
@@ -248,6 +249,9 @@ static std::vector<std::byte> btc_magic_bytes(bool testnet, bool testnet4, bool 
 
 int main(int argc, char* argv[])
 {
+    // SHA-256 implementation (SSE4 / AVX2 / SHA-NI when the CPU has them),
+    // self-tested, before any thread starts: core/sha256_init.hpp.
+    core::init_sha256();
     core::log::Logger::init();
 
     bool        testnet       = false;

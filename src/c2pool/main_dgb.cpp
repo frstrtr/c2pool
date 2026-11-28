@@ -92,6 +92,7 @@
 #include <core/stratum_server.hpp>
 #include <core/web_server.hpp>     // H-STATS.944: operator dashboard + graph_db persist
 #include <core/analytics_tag.hpp>  // --analytics-id / web.analytics_id
+#include <core/sha256_init.hpp>    // core::init_sha256 (SHA-256 implementation + self-test)
 #include <btclibs/util/strencodings.h>
 
 #include <boost/asio.hpp>
@@ -3151,6 +3152,9 @@ int run_node(const core::CoinParams& params, bool testnet,
 
 int main(int argc, char** argv)
 {
+    // SHA-256 implementation (SSE4 / AVX2 / SHA-NI when the CPU has them),
+    // self-tested, before any thread starts: core/sha256_init.hpp.
+    core::init_sha256();
     bool want_help = false;
     bool want_selftest = false;
     bool want_run = false;

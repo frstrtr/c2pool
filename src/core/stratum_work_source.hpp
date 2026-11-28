@@ -267,6 +267,24 @@ public:
         const std::string& nbits_hex,
         const std::vector<std::string>& merkle_branches) const = 0;
 
+    /// compute_share_difficulty, also handing back the header it hashed and
+    /// the digest (`pow`), so the stratum session can pass them to
+    /// mining_submit (JobSnapshot::gate_pow) instead of the same header being
+    /// hashed again there. Same difficulty as compute_share_difficulty.
+    /// Default: compute_share_difficulty, `pow` left not valid.
+    virtual double compute_share_difficulty_pow(
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches,
+        SharePow& /*pow*/) const
+    {
+        return compute_share_difficulty(coinb1, coinb2, extranonce1, extranonce2, ntime, nonce,
+                                        version, prevhash_hex, nbits_hex, merkle_branches);
+    }
+
     /// Record an ACCEPTED pseudoshare for the dashboard "Best Share" card
     /// (the highest-difficulty share seen — how close a miner got to a block).
     /// The stratum session invokes this for EVERY accepted pseudoshare (the

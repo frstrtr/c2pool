@@ -253,6 +253,22 @@ public:
         const std::string& nbits_hex,
         const std::vector<std::string>& merkle_branches) const override;
 
+    /// The same, handing back the 80-byte header and its scrypt digest, which
+    /// the stratum session passes to mining_submit (JobSnapshot::gate_pow).
+    double compute_share_difficulty_pow(
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches,
+        core::stratum::SharePow& pow) const override;
+
+    /// Scrypt computations over a block header by compute_share_difficulty and
+    /// mining_submit, since process start: the KAT seam that counts the submit
+    /// path's hashes.
+    static uint64_t header_scrypt_count();
+
     // ── IWorkSource: atomic state ────────────────────────────────────────
     uint32_t get_share_bits() const override     { return share_bits_.load(); }
     uint32_t get_share_max_bits() const override { return share_max_bits_.load(); }

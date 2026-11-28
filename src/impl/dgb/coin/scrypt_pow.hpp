@@ -39,6 +39,13 @@ inline u256 scrypt_pow_hash(const unsigned char header80[80]) {
     return u256::from_le_bytes(reinterpret_cast<const unsigned char*>(digest));
 }
 
+// The same digest, also handing back its raw 32 bytes (`digest`), for a caller
+// that passes the hash on (the stratum vardiff gate -> mining_submit).
+inline u256 scrypt_pow_hash(const unsigned char header80[80], unsigned char digest[32]) {
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header80), reinterpret_cast<char*>(digest));
+    return u256::from_le_bytes(digest);
+}
+
 // std::array convenience overload (the form the reconstructed-header builder and
 // the nonce grinder carry the 80 header bytes in).
 inline u256 scrypt_pow_hash(const std::array<unsigned char, 80>& header80) {

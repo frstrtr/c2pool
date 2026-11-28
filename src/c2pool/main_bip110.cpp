@@ -84,6 +84,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <core/sha256_init.hpp>
 
 #ifndef C2POOL_VERSION
 #define C2POOL_VERSION "dev"
@@ -3022,6 +3023,9 @@ int run_embedded(bool coin_p2p_discover,
 
 int main(int argc, char** argv)
 {
+    // SHA-256 implementation (SSE4 / AVX2 / SHA-NI when the CPU has them),
+    // self-tested, before any thread starts: core/sha256_init.hpp.
+    core::init_sha256();
     bool selftest = true;
     bool run = false;
     bool coin_p2p_discover = false;
