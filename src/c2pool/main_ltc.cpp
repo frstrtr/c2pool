@@ -3530,6 +3530,16 @@ int main(int argc, char* argv[]) {
                     auto* mi = web_server.get_mining_interface();
                     mi->set_block_verify_fn(
                         [rpc = node_rpc.get(), mi](const std::string& hash_hex) -> int {
+                            // Parent (LTC) rows only. A merged row with no
+                            // verifier of its own falls back here, and
+                            // litecoind cannot judge it: pending, no RPC.
+                            const auto row = ltc::coin::found_block::find_parent_row(
+                                mi->get_found_blocks(), hash_hex,
+                                [mi](const core::MiningInterface::FoundBlock& b) {
+                                    return mi->is_primary_found_block(b);
+                                });
+                            if (!row.parent)
+                                return 0;
                             uint256 h;
                             h.SetHex(hash_hex);
                             ltc::coin::found_block::RpcLookups calls;
@@ -3538,7 +3548,7 @@ int main(int argc, char* argv[]) {
                             calls.getblockheader = [rpc](const uint256& hh) { return rpc->getblockheader(hh); };
                             try {
                                 return ltc::coin::found_block::rpc_parent_verdict(
-                                    std::move(calls), h, found_block_height(*mi, hash_hex));
+                                    std::move(calls), h, row.height);
                             } catch (...) {
                                 return 0;  // cannot tell: pending
                             }
@@ -11243,7 +11253,11 @@ int main(int argc, char* argv[]) {
             // last shutdown. The verify callback + io_context are wired above,
             // so a restored pending row now gets confirm/orphan checks instead
             // of staying "pending" on the dashboard forever.
-            web_server.get_mining_interface()->reverify_pending_found_blocks();
+            // RPC mode: each check is up to three blocking litecoind calls on
+            // the io_context (NodeRPC::Send, under the lock template refresh
+            // also takes), so the restored rows are spaced, not burst.
+            web_server.get_mining_interface()->reverify_pending_found_blocks(
+                embedded_ltc ? std::chrono::milliseconds(0) : std::chrono::milliseconds(250));
 
             // --import-found-blocks: the pool's found-block history from another
             // node (core/found_block_import.hpp). Every block is validated

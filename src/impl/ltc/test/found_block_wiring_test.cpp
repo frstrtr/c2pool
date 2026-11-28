@@ -133,3 +133,22 @@ TEST(LtcFoundBlockWiring, RpcModeWiresTheParentVerdict)
     EXPECT_NE(rpc_branch.find("ltc::coin::found_block::rpc_parent_verdict("), std::string::npos)
         << "the RPC-mode verdict is the embedded rule over litecoind (rpc_parent_verdict)";
 }
+
+// RPC mode asks litecoind only for LTC rows, and spaces the restored
+// pending rows instead of running all their checks in one burst on the
+// io_context (each check is blocking NodeRPC calls).
+TEST(LtcFoundBlockWiring, RpcModeVerdictIsGatedAndRestoredRowsAreSpaced)
+{
+    const auto src = main_ltc();
+    const auto rpc_branch = section(src, "if (!embedded_ltc) {\n                coin_iface", "} else if (embedded_broadcaster");
+    ASSERT_FALSE(rpc_branch.empty());
+    const auto gate = rpc_branch.find("ltc::coin::found_block::find_parent_row(");
+    const auto ask = rpc_branch.find("ltc::coin::found_block::rpc_parent_verdict(");
+    ASSERT_NE(gate, std::string::npos) << "the RPC verifier must gate on the parent row";
+    ASSERT_NE(ask, std::string::npos);
+    EXPECT_LT(gate, ask) << "the gate must come before any litecoind call";
+    EXPECT_NE(rpc_branch.find("if (!row.parent)\n                                return 0;"), std::string::npos);
+    EXPECT_NE(src.find("reverify_pending_found_blocks(\n                embedded_ltc ? std::chrono::milliseconds(0) : std::chrono::milliseconds(250));"),
+              std::string::npos)
+        << "RPC mode must space the restored pending rows";
+}

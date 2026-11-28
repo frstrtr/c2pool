@@ -6825,7 +6825,7 @@ void MiningInterface::seed_netdiff_history_from_found_blocks()
     }
 }
 
-void MiningInterface::reverify_pending_found_blocks()
+void MiningInterface::reverify_pending_found_blocks(std::chrono::milliseconds spacing)
 {
     // Snapshot the pending hashes under the lock, then schedule outside it —
     // schedule_block_verification takes m_blocks_mutex itself.
@@ -6838,10 +6838,27 @@ void MiningInterface::reverify_pending_found_blocks()
         }
     }
     if (pending.empty()) return;
-    for (const auto& hash : pending)
-        schedule_block_verification(hash);
+    if (spacing.count() <= 0 || !m_context) {
+        for (const auto& hash : pending)
+            schedule_block_verification(hash);
+    } else {
+        // Row i is scheduled i*spacing later, and every check of its own
+        // schedule with it. Scheduled together, each restored row's first
+        // check fired in the same instant, and a verifier that is a blocking
+        // RPC (LTC --no-embedded-ltc) ran them back to back on the
+        // io_context.
+        schedule_block_verification(pending.front());
+        for (size_t i = 1; i < pending.size(); ++i) {
+            auto timer = std::make_shared<boost::asio::steady_timer>(
+                *m_context, spacing * static_cast<long long>(i));
+            timer->async_wait([this, hash = pending[i], timer](boost::system::error_code ec) {
+                if (!ec) schedule_block_verification(hash);
+            });
+        }
+    }
     LOG_INFO << "[Pool] Scheduled re-verification for " << pending.size()
-             << " restored pending found block(s)";
+             << " restored pending found block(s)"
+             << (spacing.count() > 0 ? ", spaced " + std::to_string(spacing.count()) + "ms" : std::string());
 }
 
 void MiningInterface::set_block_field_lookups(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn)

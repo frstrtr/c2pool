@@ -1592,7 +1592,11 @@ public:
     /// forever because the live verification schedulers only fire on freshly
     /// recorded blocks. Call once AFTER the block-verify callback and io_context
     /// are wired. Safe to call with no verifier/io_context (it no-ops per row).
-    void reverify_pending_found_blocks();
+    /// `spacing` > 0 starts row i's checks i*spacing later, so a lane whose
+    /// verifier is a blocking RPC does not run every restored row's check in
+    /// one burst on the io_context. The default (0) schedules every row at once.
+    void reverify_pending_found_blocks(
+        std::chrono::milliseconds spacing = std::chrono::milliseconds(0));
 
     /// Backfill network_difficulty on loaded blocks using a block hash → difficulty lookup.
     /// Called after embedded header chain is available.

@@ -21,6 +21,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -165,4 +166,56 @@ TEST(LtcFoundBlockRpcVerdict, TipReadOncePerVerdict)
     d.grow(100, 110);
     rpc_parent_verdict(d.lookups(), d.best[105], 105);
     EXPECT_EQ(d.calls_getblockcount, 1);
+}
+
+// ── The parent-row gate (find_parent_row) ──────────────────────────────────
+// A merged (DOGE) row with no verifier of its own falls back to the parent
+// verifier. litecoind cannot judge it, and asked anyway, a DOGE block under
+// an LTC height 6 deep reads as an LTC orphan. The verifier asks litecoind
+// only for a row of this node's own chain.
+
+namespace {
+struct Row {
+    std::string hash;
+    uint64_t height = 0;
+    std::string chain;
+};
+bool ltc_primary(const Row& r) { return r.chain == "LTC"; }
+} // namespace
+
+using ltc::coin::found_block::find_parent_row;
+
+TEST(LtcFoundBlockRpcVerdict, ParentRowGateTakesOnlyThisChainsRows)
+{
+    const std::vector<Row> rows = {
+        {"aa", 105, "LTC"},
+        {"bb", 5400000, "DOGE"},
+        {"cc", 0, "LTC"},
+    };
+    const auto ltc = find_parent_row(rows, "aa", ltc_primary);
+    EXPECT_TRUE(ltc.parent);
+    ASSERT_TRUE(ltc.height.has_value());
+    EXPECT_EQ(*ltc.height, 105u);
+
+    const auto doge = find_parent_row(rows, "bb", ltc_primary);
+    EXPECT_FALSE(doge.parent);
+    EXPECT_FALSE(doge.height.has_value());
+
+    const auto unknown_height = find_parent_row(rows, "cc", ltc_primary);
+    EXPECT_TRUE(unknown_height.parent);
+    EXPECT_FALSE(unknown_height.height.has_value());
+
+    EXPECT_FALSE(find_parent_row(rows, "dd", ltc_primary).parent);
+}
+
+// The failure the gate closes, end to end: a DOGE hash that litecoind has
+// never seen, at a DOGE height under a 6-deep LTC tip, is an orphan to the
+// parent rule. The gate keeps it from ever being asked.
+TEST(LtcFoundBlockRpcVerdict, UngatedMergedRowWouldReadAsOrphan)
+{
+    FakeLitecoind d;
+    d.grow(100, 120);
+    EXPECT_LT(rpc_parent_verdict(d.lookups(), h_of("d0d0"), 105), 0);
+    const std::vector<Row> rows = {{"d0d0", 105, "DOGE"}};
+    EXPECT_FALSE(find_parent_row(rows, "d0d0", ltc_primary).parent);
 }

@@ -27,6 +27,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace ltc {
 namespace coin {
@@ -82,6 +83,34 @@ inline ChainView rpc_chain_view(RpcLookups rpc)
     v.tip_height = [read_tip]() { return read_tip().value_or(0); };
     v.has_tip = [read_tip]() { return read_tip().has_value(); };
     return v;
+}
+
+/// The found-block row a verdict is asked for, as the parent verifier sees
+/// it. `parent` is false when no row has the hash or the row is not of this
+/// node's own chain: a merged (DOGE) row whose chain has no verifier of its
+/// own falls back to the parent one (MiningInterface::verify_found_block), and
+/// litecoind cannot judge it. Asked anyway, a DOGE block 6 deep under an LTC
+/// height reads as an LTC orphan.
+struct ParentRow {
+    bool parent = false;
+    std::optional<uint32_t> height;   // its recorded height, if known
+};
+
+template <class Rows, class IsPrimary>
+ParentRow find_parent_row(const Rows& rows, const std::string& hash_hex, IsPrimary is_primary)
+{
+    ParentRow r;
+    for (const auto& b : rows) {
+        if (b.hash != hash_hex)
+            continue;
+        if (!is_primary(b))
+            return ParentRow{};
+        r.parent = true;
+        if (b.height > 0)
+            r.height = static_cast<uint32_t>(b.height);
+        return r;
+    }
+    return r;
 }
 
 /// >0 confirmed (confirmations), <0 orphaned, 0 pending.
