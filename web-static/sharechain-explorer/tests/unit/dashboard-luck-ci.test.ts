@@ -159,6 +159,23 @@ test('window difficulty: fewer than 2 samples in the window returns the fallback
   assert.equal(L.c2pWindowNetDiff([[0, 100], [H, 300]], H, H, 9), 9, 'an empty window');
 });
 
+test('window difficulty: the last sample inside the window holds until maxMs', () => {
+  // 300 from 1 h to the window end at 2 h: 2 / (1/100 + 1/300) = 150, not
+  // the first hour's 100 alone.
+  assert.equal(L.c2pWindowNetDiff([[0, 100], [H, 300]], 0, 2 * H, 9), 150);
+});
+
+test('window difficulty: an unmeasured sample mid-series holds nothing', () => {
+  // 100 for [0, 1 h), nothing for [1 h, 1.5 h), 300 for [1.5 h, 2 h]:
+  // 1.5 / (1/100 + 0.5/300) = 128.571..., not 100 held across the gap (120).
+  assert.ok(near(L.c2pWindowNetDiff([[0, 100], [H, null], [1.5 * H, 300]], 0, 2 * H, 9), 1.5 / (1 / 100 + 0.5 / 300), 1e-12));
+});
+
+test('window difficulty: 2 samples but no measured time returns the fallback', () => {
+  // Both samples at maxMs: no interval inside the window holds a difficulty.
+  assert.equal(L.c2pWindowNetDiff([[2 * H, 100], [2 * H, 300]], 0, 2 * H, 9), 9);
+});
+
 test('a difficulty drop no longer reads Critical', () => {
   // A 30-day window, the pool at a steady 1 PH/s, reporting exactly that.
   // Difficulty D1 (one block a day at 1 PH/s) for 27 days, then D1 / 4 for
