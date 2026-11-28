@@ -8781,7 +8781,9 @@
         // (blocks/sec). With k blocks found over windowSec seconds, the exact
         // (Garwood) 95% confidence interval of lambda * windowSec is
         // [chi2(.025; 2k) / 2, chi2(.975; 2k + 2) / 2], i.e. Gamma quantiles
-        // (c2pEffectiveHashrateCI), converted to H/s via netDiff * 2^32.
+        // (c2pEffectiveHashrateCI), converted to H/s via netDiff * 2^32, netDiff
+        // the time-harmonic mean difficulty over the same window
+        // (c2pWindowNetDiff), not the newest one.
         // No prior: the fork's Gamma(5, .) prior centred on the REPORTED
         // hashrate pulled the band toward the very figure it was testing, and
         // its normal approximation was off at the small k this runs at.
@@ -9186,6 +9188,38 @@
             if (!(windowSec > 0) || !(netDiff > 0) || !(k >= 0)) return null;
             var ci = c2pPoissonCI(k), perBlock = netDiff * 4294967296;
             return { low: ci.low / windowSec * perBlock, high: ci.high / windowSec * perBlock };
+        }
+        // The difficulty that blocks found over [minMs, maxMs] were found
+        // against: its time-harmonic mean over that window,
+        // T / sum(dt_i / D_i). At a steady hashrate H the window expects
+        // H / 2^32 * sum(dt_i / D_i) blocks, so this is the netDiff that
+        // c2pEffectiveHashrateCI takes for k blocks over T seconds.
+        // series: [ms, D] samples in any order, D null or <= 0 unmeasured.
+        // Each sample's difficulty holds until the next sample (the last one
+        // until maxMs); the first and last intervals are clipped to the
+        // window, and an unmeasured sample holds nothing.
+        // FALLBACK: fewer than 2 measured samples inside the window (or no
+        // measured time in it) returns `fallback`, the caller's newest
+        // difficulty.
+        function c2pWindowNetDiff(series, minMs, maxMs, fallback) {
+            if (!(maxMs > minMs)) return fallback;
+            var pts = [], inWindow = 0;
+            (series || []).forEach(function(s) {
+                if (!Array.isArray(s) || typeof s[0] !== 'number' || !isFinite(s[0])) return;
+                var d = s[1] > 0 ? s[1] : null;
+                pts.push([s[0], d]);
+                if (d !== null && s[0] >= minMs && s[0] <= maxMs) inWindow++;
+            });
+            if (inWindow < 2) return fallback;
+            pts.sort(function(a, b) { return a[0] - b[0]; });
+            var covered = 0, weighted = 0;
+            for (var i = 0; i < pts.length; i++) {
+                if (pts[i][1] === null) continue;
+                var from = Math.max(pts[i][0], minMs);
+                var to = Math.min(i + 1 < pts.length ? pts[i + 1][0] : maxMs, maxMs);
+                if (to > from) { covered += to - from; weighted += (to - from) / pts[i][1]; }
+            }
+            return weighted > 0 ? covered / weighted : fallback;
         }
 
         // The open round: {effort, covered_effort (the part of it the rate
@@ -10219,12 +10253,16 @@
             
             // Pool Luck: the period luck that matches the chart's period.
             c2pGraphLuckStat('graph-luck', 'graph-luck-label', '.graph-legend.compact', chartLuck);
-            // CI95 effective-vs-reported band. lastNetDiff read defensively so
-            // this is agnostic to the netdiff sample shape; k counts blocks WE
-            // found in the window regardless of whether luck was computable --
-            // that sidesteps the #1138 undercount (a DASH block recorded with
-            // network_difficulty 0 has null luck but is still a real find) and
-            // excludes relay-learned blocks (found_locally === false).
+            // CI95 effective-vs-reported band over [minTime, maxTime]: k counts
+            // blocks WE found in that window (blockMarkers) regardless of
+            // whether luck was computable -- that sidesteps the #1138
+            // undercount (a DASH block recorded with network_difficulty 0 has
+            // null luck but is still a real find) and excludes relay-learned
+            // blocks (found_locally === false). The difficulty is the
+            // time-harmonic mean of netDiffData over the same window
+            // (c2pWindowNetDiff); lastNetDiff, the newest sample read
+            // defensively so it is agnostic to the netdiff sample shape, is
+            // its fallback when the window holds fewer than 2 samples.
             var lastNetDiff = 0;
             for (var _i = (networkDiffSamples || []).length - 1; _i >= 0; _i--) {
                 var _sm = networkDiffSamples[_i];
@@ -10235,7 +10273,8 @@
                 return m.block && m.block.found_locally !== false;
             }).length;
             updateHashrateDiagnostic('hashrate-diagnostic', avg, kBlocks,
-                (maxTime - minTime) / 1000, lastNetDiff, 'Effective vs reported: ');
+                (maxTime - minTime) / 1000, c2pWindowNetDiff(netDiffData, minTime, maxTime, lastNetDiff),
+                'Effective vs reported: ');
 
             
             // Create Highcharts chart (regular chart for better pan support)
@@ -10755,12 +10794,11 @@
             // Pool Luck, as on the compact chart, scoped to the fullscreen
             // legend/stat.
             c2pGraphLuckStat('fs-graph-luck', 'fs-graph-luck-label', '.fullscreen-controls', chartLuck);
-            // CI95 effective-vs-reported band. lastNetDiff read defensively so
-            // this is agnostic to the netdiff sample shape; k counts blocks WE
-            // found in the window regardless of whether luck was computable --
-            // that sidesteps the #1138 undercount (a DASH block recorded with
-            // network_difficulty 0 has null luck but is still a real find) and
-            // excludes relay-learned blocks (found_locally === false).
+            // CI95 effective-vs-reported band over [minTime, maxTime], as on
+            // the compact chart: k blocks WE found in that window, the
+            // time-harmonic mean difficulty over the same window
+            // (c2pWindowNetDiff), the newest sample (lastNetDiff) as its
+            // fallback when the window holds fewer than 2 samples.
             var lastNetDiff = 0;
             for (var _i = (networkDiffSamples || []).length - 1; _i >= 0; _i--) {
                 var _sm = networkDiffSamples[_i];
@@ -10771,7 +10809,8 @@
                 return m.block && m.block.found_locally !== false;
             }).length;
             updateHashrateDiagnostic('fs-hashrate-diagnostic', avg, kBlocks,
-                (maxTime - minTime) / 1000, lastNetDiff, 'Effective vs reported: ');
+                (maxTime - minTime) / 1000, c2pWindowNetDiff(netDiffData, minTime, maxTime, lastNetDiff),
+                'Effective vs reported: ');
 
             
             fullscreenChart = Highcharts.chart('fullscreen-graph', {
