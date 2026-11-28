@@ -203,6 +203,10 @@ private:
     // Height is MUTABLE — cache updated when shares are removed.
     chain::TrackerView<hash_t, uint288, hasher_t> m_view;
 
+    // Test-only: get_chain's bounds check by a full get_height walk, as before
+    // has_depth (set_legacy_get_chain_bound_for_test).
+    bool m_legacy_get_chain_bound{false};
+
     void calculate_head_tail(hash_t head, hash_t tail, index_t* /*index*/)
     {
         // C++ implementation of the p2pool sharechain add() logic.
@@ -599,9 +603,44 @@ public:
         }
     };
 
+    /// True iff the walk from `hash` along prev links passes at least n shares
+    /// that are present: the predicate `!(n > get_height(hash))`, computed by
+    /// walking at most n steps instead of the whole chain.
+    ///
+    /// Same value for every input. get_height(hash) is min(L, size()+1), where
+    /// L is the number of leading positions of the walk that are non-null and
+    /// present (L is unbounded only on a prev-link cycle, where get_height's
+    /// guard stops at size()+1). For n <= size() the predicate is n <= L, which
+    /// is exactly "the first n positions are non-null and present". For
+    /// n > size() the old expression is evaluated as it was (a full walk, its
+    /// cycle guard and stderr line included): no acyclic walk is that long.
+    bool has_depth(const hash_t& hash, uint64_t n)
+    {
+        if (n > static_cast<uint64_t>(m_shares.size()))
+            return !(n > static_cast<uint64_t>(get_height(hash)));
+        hash_t cur = hash;
+        for (uint64_t i = 0; i < n; ++i)
+        {
+            if (cur.IsNull())
+                return false;
+            auto it = m_shares.find(cur);
+            if (it == m_shares.end())
+                return false;
+            cur = it->second.index->tail;
+        }
+        return true;
+    }
+
+    /// The previous bounds check, kept for the differential tests (old against
+    /// new code in one process). Production never sets it.
+    void set_legacy_get_chain_bound_for_test(bool on) { m_legacy_get_chain_bound = on; }
+
     ChainView get_chain(const hash_t& hash, uint64_t n)
     {
-        if (n > get_height(hash))
+        const bool too_short = m_legacy_get_chain_bound
+            ? (n > static_cast<uint64_t>(get_height(hash)))
+            : !has_depth(hash, n);
+        if (too_short)
         {
             throw std::invalid_argument("n > height for this hash in get_chain!");
         }

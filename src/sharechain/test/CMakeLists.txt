@@ -1,5 +1,9 @@
 if (BUILD_TESTING AND GTest_FOUND)
-    add_executable(sharechain_test share_test.cpp share_variants_clone_ownership_test.cpp)
+    # get_chain_bound_test.cpp: X1 stage A1, get_chain's bounds check walks n
+    # steps instead of the whole chain; old and new side by side over random
+    # forests (random_forest.hpp). In this allowlisted target (the #769 trap).
+    add_executable(sharechain_test share_test.cpp share_variants_clone_ownership_test.cpp
+        get_chain_bound_test.cpp)
     target_link_libraries(sharechain_test PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc
