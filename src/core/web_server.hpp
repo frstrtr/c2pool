@@ -2893,9 +2893,13 @@ public:
     // miner, which is not an achieved hash and must not reach the Best Share
     // card (p2pool work.py records target_to_difficulty(pow_hash) of local
     // submits only).
+    // net_diff_at_share: the network difficulty the hash was checked against
+    // (the job's block bits), passed to update_best_difficulty; <= 0: the
+    // node's network difficulty at record time.
     void record_share_difficulty(double difficulty, const std::string& miner,
                                  const std::string& share_hash = "",
-                                 bool update_best = true);
+                                 bool update_best = true,
+                                 double net_diff_at_share = 0.0);
     void record_merged_share_difficulty(double difficulty, const std::string& miner);
     // Best Share card legs only (no ring / counters). Raises the primary
     // all_time / session / round legs and, when update_merged, the merged
@@ -2932,6 +2936,11 @@ public:
         uint32_t version, const std::string& prevhash_hex,
         const std::string& nbits_hex,
         const std::vector<std::string>& merkle_branches) override;
+    // This binary fed the Best Share primary legs from its share tracker hook
+    // before sidecar v3 (bip110; DASH is detected from its blockchain): a
+    // v1/v2 primary all-time leg is a share target and is dropped at load.
+    // Call before load_stat_log.
+    void set_best_share_tracker_fed_before_v3(bool fed) { m_best_share_tracker_fed_before_v3 = fed; }
     // A pool block was won -> the sharechain round boundary moved. Reset the
     // round-level best-share tracker (all_time / session are left untouched).
     // See #922: round previously only ever raised, degenerating into a
@@ -3058,6 +3067,7 @@ private:
     }
     void save_best_share_all_time();
     void load_best_share_all_time();
+    bool m_best_share_tracker_fed_before_v3{false};
 
     // Per-miner rolling hashrate ring populated by
     // record_share_difficulty; consumed by rest_pplns_current

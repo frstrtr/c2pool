@@ -468,6 +468,127 @@ TEST(BestShareAtTime, NoDifficultyAtRecordTimeFallsBackToTheLiveOne)
     EXPECT_EQ(basis(bs["round"]), "current");
 }
 
+// A v1/v2 sidecar's primary all-time leg on DASH and bip110 was fed by the
+// share tracker hook (any member's share target): dropped at load. LTC v2 and
+// BTC v2 primary legs are this node's hashes: kept, against the live
+// difficulty (pct_basis "current"). The merged leg rule is unchanged.
+TEST(BestShareAtTime, PreV3PrimaryLegOfATrackerFedCoinIsDropped)
+{
+    const std::string log_path = "/tmp/c2pool_test_bestshare_attime_prev3.json";
+    const std::string side = log_path + ".best.json";
+    struct Case {
+        const char* coin;
+        Blockchain chain;
+        bool tracker_fed_before_v3;   // bip110 serves as BITCOIN and sets it
+        bool kept;
+    };
+    const Case cases[] = {
+        {"LTC", Blockchain::LITECOIN, false, true},
+        {"BTC", Blockchain::BITCOIN, false, true},
+        {"DASH", Blockchain::DASH, false, false},
+        {"bip110", Blockchain::BITCOIN, true, false},
+    };
+    for (const auto& c : cases) {
+        for (int v : {1, 2}) {
+            if (c.chain == Blockchain::LITECOIN && v == 1) continue;   // the LTC v1 rule
+            remove_sidecar(log_path);
+            {
+                std::ofstream f(side, std::ios::trunc);
+                if (v == 2) f << R"({"v":2,)";
+                else f << "{";
+                f << R"("difficulty":5.0e7,"miner":"w1","hash":"ab","ts":1793000000,)"
+                     R"("merged":{"difficulty":5.856e7,"miner":"w1","ts":1793000000}})";
+            }
+            MiningInterface mi(/*testnet=*/false, /*node=*/nullptr, c.chain);
+            mi.set_best_share_tracker_fed_before_v3(c.tracker_fed_before_v3);
+            mi.set_stat_log_path(log_path);
+            mi.update_network_difficulty(2.0e8, "test");
+            mi.load_stat_log();
+            const auto bs = mi.rest_best_share();
+            const std::string where = std::string(c.coin) + " v" + std::to_string(v);
+            if (c.kept) {
+                EXPECT_DOUBLE_EQ(num(bs["all_time"], "difficulty"), 5.0e7) << where;
+                EXPECT_EQ(bs["all_time"]["miner"].get<std::string>(), "w1") << where;
+                EXPECT_DOUBLE_EQ(num(bs["all_time"], "network_difficulty_at_share"), 0.0) << where;
+                EXPECT_EQ(basis(bs["all_time"]), "current") << where;
+                EXPECT_DOUBLE_EQ(num(bs["all_time"], "pct_of_block"), 25.0) << where;
+                EXPECT_TRUE(bs["has_best_share"].get<bool>()) << where;
+            } else {
+                EXPECT_DOUBLE_EQ(num(bs["all_time"], "difficulty"), 0.0)
+                    << where << ": a share target came back as this node's record";
+                EXPECT_EQ(bs["all_time"]["miner"].get<std::string>(), "") << where;
+                EXPECT_FALSE(bs["has_best_share"].get<bool>()) << where;
+            }
+            ASSERT_TRUE(bs.contains("merged")) << where;
+            EXPECT_DOUBLE_EQ(num(bs["merged"]["all_time"], "difficulty"), 5.856e7)
+                << where << ": the merged leg rule is unchanged";
+        }
+    }
+
+    // v3 primary legs load on every coin.
+    for (const auto& c : cases) {
+        remove_sidecar(log_path);
+        {
+            std::ofstream f(side, std::ios::trunc);
+            f << R"({"v":3,"difficulty":5.0e7,"miner":"w1","hash":"ab","ts":1793000000,)"
+                 R"("network_difficulty_at_share":1.0e8})";
+        }
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr, c.chain);
+        mi.set_best_share_tracker_fed_before_v3(c.tracker_fed_before_v3);
+        mi.set_stat_log_path(log_path);
+        mi.update_network_difficulty(2.0e8, "test");
+        mi.load_stat_log();
+        const auto bs = mi.rest_best_share();
+        EXPECT_DOUBLE_EQ(num(bs["all_time"], "difficulty"), 5.0e7) << c.coin << " v3";
+        EXPECT_DOUBLE_EQ(num(bs["all_time"], "network_difficulty_at_share"), 1.0e8) << c.coin << " v3";
+        EXPECT_DOUBLE_EQ(num(bs["all_time"], "pct_of_block"), 50.0) << c.coin << " v3";
+        EXPECT_EQ(basis(bs["all_time"]), "at_share") << c.coin << " v3";
+    }
+    remove_sidecar(log_path);
+}
+
+// /best_share and /local_stats serve each leg's own at-share difficulty:
+// all_time (from the sidecar), session and round (a later round) differ.
+TEST(BestShareAtTime, EachLegServesItsOwnAtShareDifficulty)
+{
+    const std::string log_path = "/tmp/c2pool_test_bestshare_attime_legs.json";
+    const std::string side = log_path + ".best.json";
+    remove_sidecar(log_path);
+    {
+        std::ofstream f(side, std::ios::trunc);
+        f << R"({"v":3,"difficulty":1000.0,"miner":"wa","hash":"aa","ts":1793000000,)"
+             R"("network_difficulty_at_share":7000.0})";
+    }
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr, Blockchain::LITECOIN);
+    mi.set_stat_log_path(log_path);
+    mi.load_stat_log();
+    mi.update_network_difficulty(2000.0, "test");
+    mi.record_share_difficulty(100.0, "ws", "bb");           // session + round
+    mi.reset_best_difficulty_round(1793000000);
+    mi.update_network_difficulty(4000.0, "test");
+    mi.record_share_difficulty(50.0, "wr", "cc");            // round only
+    mi.update_network_difficulty(8000.0, "test");             // live
+
+    struct Leg { const char* name; double difficulty; double at_share; };
+    const Leg legs[] = {{"all_time", 1000.0, 7000.0}, {"session", 100.0, 2000.0},
+                        {"round", 50.0, 4000.0}};
+    const auto bs = mi.rest_best_share();
+    const auto ls = mi.rest_local_stats()["best_share"];
+    for (const auto* doc : {&bs, &ls}) {
+        const char* src = (doc == &bs) ? "/best_share" : "/local_stats";
+        EXPECT_DOUBLE_EQ(num(*doc, "network_difficulty"), 8000.0) << src;
+        for (const auto& l : legs) {
+            const auto& e = (*doc)[l.name];
+            EXPECT_DOUBLE_EQ(num(e, "difficulty"), l.difficulty) << src << " " << l.name;
+            EXPECT_DOUBLE_EQ(num(e, "network_difficulty_at_share"), l.at_share) << src << " " << l.name;
+            EXPECT_NEAR(num(e, "pct_of_block"), l.difficulty / l.at_share * 100.0, 1e-12)
+                << src << " " << l.name;
+            EXPECT_EQ(basis(e), "at_share") << src << " " << l.name;
+        }
+    }
+    remove_sidecar(log_path);
+}
+
 // ── Tracker share hooks feed the ring only ─────────────────────────────────
 // Every coin's share tracker reports each verified share (any member,
 // startup re-verify, catch-up sync) with its share TARGET through
@@ -579,6 +700,46 @@ std::vector<std::string> call_args(const std::string& s, std::size_t open)
     return args;
 }
 
+std::size_t skip_space(const std::string& s, std::size_t i)
+{
+    while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+    return i;
+}
+
+// The argument lists of every call of `callee` in the body of each lambda
+// passed as the first argument of a `setter(` call in `code`.
+std::vector<std::vector<std::string>> calls_in_setter_lambdas(
+    const std::string& code, const std::string& setter, const std::string& callee,
+    int* lambdas = nullptr)
+{
+    std::vector<std::vector<std::string>> out;
+    const std::string anchor = setter + "(";
+    for (std::size_t pos = code.find(anchor); pos != std::string::npos;
+         pos = code.find(anchor, pos + anchor.size())) {
+        if (pos > 0 && (std::isalnum(static_cast<unsigned char>(code[pos - 1])) || code[pos - 1] == '_'))
+            continue;
+        const std::size_t cap = skip_space(code, pos + anchor.size());
+        if (cap >= code.size() || code[cap] != '[') continue;   // not a lambda
+        const std::size_t cap_end = close_of(code, cap);
+        if (cap_end == std::string::npos) continue;
+        const std::size_t body = code.find('{', cap_end);
+        if (body == std::string::npos) continue;
+        const std::size_t body_end = close_of(code, body);
+        if (body_end == std::string::npos) continue;
+        if (lambdas) ++*lambdas;
+        const std::string fn = code.substr(body, body_end - body);
+        for (std::size_t c = fn.find(callee); c != std::string::npos;
+             c = fn.find(callee, c + callee.size())) {
+            if (c > 0 && (std::isalnum(static_cast<unsigned char>(fn[c - 1])) || fn[c - 1] == '_'))
+                continue;
+            const std::size_t k = skip_space(fn, c + callee.size());
+            if (k >= fn.size() || fn[k] != '(') continue;
+            out.push_back(call_args(fn, k));
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 TEST(BestShareAtTime, TrackerShareHooksDoNotFeedTheBestShare)
@@ -622,5 +783,57 @@ TEST(BestShareAtTime, TrackerShareHooksDoNotFeedTheBestShare)
     }
     for (const char* main : {"main_ltc.cpp", "main_dash.cpp", "main_bip110.cpp"})
         EXPECT_TRUE(wired.count(main)) << main << ": tracker hook not found";
+}
+
+// The stratum Best Share sinks measure the parent legs against the job's
+// block bits: the BTC and BCH set_best_pseudoshare_fn lambdas pass
+// bits_hex_to_difficulty(nbits_hex) to update_best_difficulty, and the DASH
+// set_on_share_difficulty_fn lambda passes it to record_share_difficulty.
+// The sinks are lambdas inside the mains, so this checks their source.
+TEST(BestShareAtTime, StratumSinksPassTheJobsBlockBits)
+{
+    namespace fs = std::filesystem;
+    const fs::path src = fs::path(C2POOL_SRC_ROOT);
+    struct Sink {
+        const char* file;
+        const char* setter;
+        const char* callee;
+        std::size_t args;         // the call's argument count
+        std::size_t bits_arg;     // index of the at-share difficulty argument
+    };
+    const Sink sinks[] = {
+        {"c2pool/main_btc.cpp", "set_best_pseudoshare_fn", "update_best_difficulty", 5, 4},
+        {"impl/bch/pool_entrypoint.hpp", "set_best_pseudoshare_fn", "update_best_difficulty", 5, 4},
+        {"c2pool/main_dash.cpp", "set_on_share_difficulty_fn", "record_share_difficulty", 5, 4},
+    };
+    for (const auto& sk : sinks) {
+        const fs::path p = src / sk.file;
+        ASSERT_TRUE(fs::is_regular_file(p)) << p;
+        int lambdas = 0;
+        const auto calls = calls_in_setter_lambdas(strip_comments(slurp(p)), sk.setter,
+                                                   sk.callee, &lambdas);
+        EXPECT_GE(lambdas, 1) << sk.file << ": no " << sk.setter << " lambda";
+        ASSERT_FALSE(calls.empty()) << sk.file << ": the sink does not call " << sk.callee;
+        for (const auto& args : calls) {
+            ASSERT_EQ(args.size(), sk.args)
+                << sk.file << ": " << sk.callee << " without the at-share difficulty";
+            EXPECT_NE(args[sk.bits_arg].find("bits_hex_to_difficulty(nbits_hex)"), std::string::npos)
+                << sk.file << ": at-share argument is " << args[sk.bits_arg];
+        }
+    }
+}
+
+// bip110 serves as BITCOIN, so its pre-v3 rule is set by its main, before
+// the stat log (and the best-share sidecar with it) is loaded.
+TEST(BestShareAtTime, Bip110DropsPreV3TrackerFedRecords)
+{
+    const auto p = std::filesystem::path(C2POOL_SRC_ROOT) / "c2pool" / "main_bip110.cpp";
+    ASSERT_TRUE(std::filesystem::is_regular_file(p)) << p;
+    const std::string code = strip_comments(slurp(p));
+    const std::size_t set = code.find("set_best_share_tracker_fed_before_v3(true)");
+    const std::size_t load = code.find("load_stat_log(");
+    ASSERT_NE(set, std::string::npos) << "main_bip110.cpp does not drop pre-v3 tracker-fed records";
+    ASSERT_NE(load, std::string::npos);
+    EXPECT_LT(set, load) << "set before load_stat_log, or the old record is already loaded";
 }
 #endif  // C2POOL_SRC_ROOT

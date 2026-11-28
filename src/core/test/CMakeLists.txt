@@ -156,9 +156,12 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # against the network difficulty in effect when the record's hash was
     # found (job block bits / record-time difficulty; the current aux work
     # for the merged legs), served as network_difficulty_at_share with
-    # pct_basis; sidecar v3 round trip, v2 fallback to the live difficulty;
-    # every main_*.cpp share tracker hook calls record_share_difficulty with
-    # update_best=false (source scan under C2POOL_SRC_ROOT). Real
+    # pct_basis, per leg in /best_share and /local_stats; sidecar v3 round
+    # trip, v2 fallback to the live difficulty; a pre-v3 DASH / bip110
+    # primary leg is dropped; every main_*.cpp share tracker hook calls
+    # record_share_difficulty with update_best=false and the BTC / BCH / DASH
+    # stratum sinks pass the job's block bits (source scans under
+    # C2POOL_SRC_ROOT). Real
     # MiningInterface + MergedMiningManager; same fold-into-core_test
     # reasoning as every TU here.
     # web_server_block_budget_test.cpp: the LTC block weight (bad-blk-weight):

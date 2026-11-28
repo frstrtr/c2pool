@@ -12591,7 +12591,8 @@ void MiningInterface::reset_best_difficulty_round(uint64_t ts)
 
 void MiningInterface::record_share_difficulty(double difficulty, const std::string& miner,
                                               const std::string& share_hash,
-                                              bool update_best)
+                                              bool update_best,
+                                              double net_diff_at_share)
 {
     // Feed the rolling-hashrate ring. Independent of the best-diff
     // tracking below; the ring has its own internal lock.
@@ -12610,10 +12611,12 @@ void MiningInterface::record_share_difficulty(double difficulty, const std::stri
     if (difficulty > 0)
         m_recent_share_difficulty.store(difficulty, std::memory_order_relaxed);
 
-    // Primary legs only: the callers that still feed the card through here
-    // (DASH stratum + tracker, bip110 tracker) never fed the merged legs.
+    // Primary legs only: the caller that feeds the card through here (the
+    // DASH stratum feed) has no merged legs. Share tracker hooks pass
+    // update_best=false.
     if (update_best)
-        update_best_difficulty(difficulty, miner, share_hash, /*update_merged=*/false);
+        update_best_difficulty(difficulty, miner, share_hash, /*update_merged=*/false,
+                               net_diff_at_share);
 }
 
 void MiningInterface::update_best_difficulty(double difficulty, const std::string& miner,
@@ -13700,10 +13703,18 @@ void MiningInterface::load_stat_log()
 // difficulty pct_of_block is measured against. An older file loads with it
 // unknown (0), and /best_share then measures that leg against the live
 // difficulty and says so (pct_basis "current").
+//
+// v3 is also the first version written after the DASH and bip110 share
+// tracker hooks stopped feeding the Best Share legs (every verified share of
+// any member, with its share target). On DASH, and on a binary that calls
+// set_best_share_tracker_fed_before_v3 (bip110, served as BITCOIN), a v1/v2
+// primary leg is dropped. The merged leg is loaded as before.
 namespace {
 constexpr int kBestShareSidecarVersion = 3;
 // The first version whose LTC primary leg is a hash this node found.
 constexpr int kBestShareAchievedVersion = 2;
+// The first version whose DASH / bip110 primary leg is a hash this node found.
+constexpr int kBestShareTrackerFreeVersion = 3;
 // The first version that stores network_difficulty_at_share.
 constexpr int kBestShareAtShareVersion = 3;
 
@@ -13769,7 +13780,15 @@ void MiningInterface::load_best_share_all_time()
                      << " is a sharechain share target, not a hash this node found";
             return;
         }
-        const double d = j.value("difficulty", 0.0);
+        const bool tracker_fed = m_blockchain == Blockchain::DASH
+                              || m_best_share_tracker_fed_before_v3;
+        const bool drop_primary = tracker_fed && v < kBestShareTrackerFreeVersion;
+        if (drop_primary)
+            LOG_INFO << "[BestShare] v" << v << " sidecar " << path
+                     << ": all-time difficulty=" << j.value("difficulty", 0.0)
+                     << " dropped (fed by the share tracker hook: a share target,"
+                        " not a hash this node found)";
+        const double d = drop_primary ? 0.0 : j.value("difficulty", 0.0);
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
         if (j.contains("merged") && j["merged"].is_object()) {
             const auto& m = j["merged"];

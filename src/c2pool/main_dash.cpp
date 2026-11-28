@@ -4952,9 +4952,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         if (web_server) {
             core::WebServer* ws = web_server.get();
             work_source->set_on_share_difficulty_fn(
-                [ws](double diff, const std::string& miner, const uint256& pow_hash) {
+                [ws](double diff, const std::string& miner, const uint256& pow_hash,
+                     const std::string& nbits_hex) {
+                    // The job's block bits: the target this hash was checked against.
                     ws->get_mining_interface()->record_share_difficulty(
-                        diff, miner, pow_hash.GetHex());
+                        diff, miner, pow_hash.GetHex(), /*update_best=*/true,
+                        core::MiningInterface::bits_hex_to_difficulty(nbits_hex));
                 });
 
             // ── Recent-blocks feed: DASH block wins into the history card ──

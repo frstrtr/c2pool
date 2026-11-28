@@ -2036,8 +2036,9 @@ TEST(DashboardData, BestPseudoshareHashIsItsHeadersPowHash)
 // A v1 sidecar (no "v") on LTC holds a sharechain share TARGET: the LTC card's
 // only feed was the verify hook, which reported every pool miner's share
 // target. It must not come back as this node's all-time record (field 2026-11:
-// a peer's 21631 on two unrelated nodes). DASH's feeds did not change, so its
-// v1 files keep loading.
+// a peer's 21631 on two unrelated nodes). DASH's v1/v2 primary leg was fed by
+// its share tracker hook too and is dropped below v3
+// (web_server_best_share_at_time_test.cpp).
 TEST(DashboardData, PreFixLtcBestShareSidecarIsDropped)
 {
     const std::string log_path = "/tmp/c2pool_test_bestshare_v1_statlog.json";
@@ -2086,8 +2087,8 @@ TEST(DashboardData, PreFixLtcBestShareSidecarIsDropped)
                            c2pool::address::Blockchain::DASH);
         mi.set_stat_log_path(log_path);
         mi.load_stat_log();
-        EXPECT_DOUBLE_EQ(mi.rest_best_share()["all_time"]["difficulty"].get<double>(), 21631.0)
-            << "DASH's feeds are unchanged; its v1 files load as before";
+        EXPECT_DOUBLE_EQ(mi.rest_best_share()["all_time"]["difficulty"].get<double>(), 0.0)
+            << "a DASH v1 primary leg was fed by the share tracker hook";
     }
     std::remove(log_path.c_str());
     std::remove(side.c_str());

@@ -2745,6 +2745,9 @@ int run_embedded(bool coin_p2p_discover,
             std::filesystem::create_directories(
                 std::filesystem::path(graph_db_path).parent_path(), mkdir_ec);
             mi->set_stat_log_path(graph_db_path);
+            // Before v3 the share tracker hook fed the Best Share legs: a
+            // v1/v2 all-time record is a share target, dropped at load.
+            mi->set_best_share_tracker_fed_before_v3(true);
             mi->load_stat_log();
             LOG_INFO << "[EMB-BIP110] graph_db stats persistence -> " << graph_db_path;
         }
