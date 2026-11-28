@@ -2327,6 +2327,11 @@ jobs:
           # write hits a broken pipe and the process aborts with a non-zero exit
           # (a race that flakes red under CI load). Capture-then-slice avoids that,
           # and we smoke-test on "did it print output", not the binary's own exit code.
+          # The binary logs startup lines on stderr ("[init] sha256: ..."); with
+          # the shell's default 'Stop', a stderr line from a native command is a
+          # terminating NativeCommandError. 'Continue' keeps it as output, as
+          # release.yml's smoke steps do.
+          $ErrorActionPreference = 'Continue'
           $out = & "build_ci/src/c2pool/Release/c2pool.exe" --help 2>&1 | Out-String
           $out -split "`n" | Select-Object -First 3
           if ([string]::IsNullOrWhiteSpace($out)) { Write-Error "binary produced no output"; exit 1 }
