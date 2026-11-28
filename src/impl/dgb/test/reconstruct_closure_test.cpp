@@ -26,6 +26,7 @@
 
 #include <functional>
 #include <map>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -306,13 +307,15 @@ TEST(DgbReconstructClosure, FromTemplateSuccessComposesIdenticalBlock)
 {
     auto sh = make_small_header();
     ::dgb::MerkleLink link;
-    uint256 won = H("a0");
     auto gentx_bytes = noseg_bytes(make_gentx());
     auto ug = unpack_gentx_coinbase(gentx_bytes);
     std::vector<MutableTransaction> other = { make_tx(11), make_tx(22) };
 
     auto expected =
         reconstruct_won_block_from_template(sh, link, ug.tx, ug.txid, other);
+    // The won share is the block: its hash is the rebuilt header's (the
+    // closure relays only that block).
+    const uint256 won = Hash(std::span<const unsigned char>(expected.bytes.data(), 80));
 
     auto closure = make_reconstruct_closure_from_template(
         won_fields(won, sh, link),
@@ -331,12 +334,12 @@ TEST(DgbReconstructClosure, FromTemplateEmptyOtherTxsIsCoinbaseOnly)
 {
     auto sh = make_small_header();
     ::dgb::MerkleLink link;
-    uint256 won = H("a0");
     auto gentx_bytes = noseg_bytes(make_gentx());
     auto ug = unpack_gentx_coinbase(gentx_bytes);
 
     auto expected = reconstruct_won_block_from_template(
         sh, link, ug.tx, ug.txid, std::vector<MutableTransaction>{});
+    const uint256 won = Hash(std::span<const unsigned char>(expected.bytes.data(), 80));
 
     auto closure = make_reconstruct_closure_from_template(
         won_fields(won, sh, link),
