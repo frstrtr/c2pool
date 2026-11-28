@@ -584,6 +584,50 @@ TEST(DashV36E2E, V16PeerRefusedAtHandshakeAndNotBanned)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// 5b. GAP5 step 1: an admitted isolated-v36 peer negotiates the ACTUAL arm
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The selection in NodeImpl::handle_version is `ratcheted = effective_floor >
+// MINIMUM_PROTOCOL_VERSION` and returns PeerConnectionType::actual only for a
+// ratcheted floor. The isolated-v36 profile seeds the floor at
+// ISOLATED_V36_PROTOCOL_VERSION (3601), so protocol_actual.cpp is the LIVE
+// handler set on that profile from boot. "Dormant" holds only for the public
+// profile, which test_dash_addrme.cpp pins as legacy. The admission test above
+// asserts admission and refusal, never the returned type; this one pins the
+// type by running the real NodeImpl::handle_version on a real socket peer.
+TEST(DashV36E2E, AdmittedIsolatedPeerNegotiatesActualArm)
+{
+    IdentityGuard guard;
+    const auto f = fresh_iso();
+    (void)f;
+    PeerSockets sockets;   // outlives the node (declared first)
+    dash::NodeImpl node;
+    ASSERT_EQ(node.runtime_min_protocol_version(), 3601u);
+    ASSERT_GT(node.runtime_min_protocol_version(),
+              SharechainConfig::MINIMUM_PROTOCOL_VERSION)
+        << "isolated profile must seed a ratcheted floor";
+
+    for (uint32_t proto : {3601u, 3700u}) {
+        SCOPED_TRACE("peer protocol " + std::to_string(proto));
+        auto& pair = sockets.next();
+        auto peer = make_socket_peer(pair, sockets.stub);
+        IoThread io(pair.ioc_node);
+        std::optional<pool::PeerConnectionType> t;
+        std::string err;
+        try {
+            t = node.handle_version(make_version(proto, 0x6a95'0000'0000'0000ull + proto), peer);
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        io.stop(pair.ioc_node);
+        ASSERT_EQ(err, "") << "peer must be admitted";
+        ASSERT_TRUE(t.has_value()) << "admitted peer must get a connection type";
+        EXPECT_EQ(*t, pool::PeerConnectionType::actual)
+            << "an admitted isolated-v36 peer must be dispatched to protocol_actual.cpp";
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // 6. The rig's peer stand-in frames `version` exactly as a c2pool node does
 // ═════════════════════════════════════════════════════════════════════════════
 
