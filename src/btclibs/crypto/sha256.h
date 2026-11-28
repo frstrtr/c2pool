@@ -34,10 +34,36 @@ public:
     CSHA256& Reset();
 };
 
-/** Autodetect the best available SHA256 implementation.
- *  Returns the name of the implementation.
+/** Which optimized implementations SHA256AutoDetect may select (Bitcoin
+ *  Core's sha256_implementation mask). AVX2 and SHA-NI are probed only when
+ *  USE_SSE4 is set too, as in Core.
  */
-std::string SHA256AutoDetect();
+namespace sha256_implementation {
+enum UseImplementation : uint8_t {
+    STANDARD = 0,
+    USE_SSE4 = 1 << 0,
+    USE_AVX2 = 1 << 1,
+    USE_SHANI = 1 << 2,
+    USE_SSE4_AND_AVX2 = USE_SSE4 | USE_AVX2,
+    USE_SSE4_AND_SHANI = USE_SSE4 | USE_SHANI,
+    USE_ALL = USE_SSE4 | USE_AVX2 | USE_SHANI,
+};
+}
+
+/** Autodetect the best available SHA256 implementation among those
+ *  use_implementation allows, and install it. Each call starts from the
+ *  scalar implementation, so SHA256AutoDetect(sha256_implementation::STANDARD)
+ *  puts the scalar implementation back.
+ *  Returns the name of the implementation.
+ *  Writes plain global function pointers: call it before any thread hashes.
+ *  It does not self-test; run SHA256SelfTest() after it (core::init_sha256).
+ */
+std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implementation = sha256_implementation::USE_ALL);
+
+/** Known-answer test of the implementation installed now: Transform for 0..8
+ *  blocks, TransformD64 and every D64 width that is installed. Not compiled
+ *  out under NDEBUG. */
+bool SHA256SelfTest();
 
 /** Compute multiple double-SHA256's of 64-byte blobs.
  *  output:  pointer to a blocks*32 byte output buffer

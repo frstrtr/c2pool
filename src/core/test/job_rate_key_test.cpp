@@ -23,6 +23,10 @@
 // share bits, not by the last job built for any connection. The stratum
 // session's side (it passes its login key, it gates by the job's bits) is
 // pinned over TCP in share_test NodeFeeStratumSession.*.
+//
+// And the login's "/N" (desired_share_difficulty) reaches ref_hash_fn with
+// the job, none without one, and never changes the coinbase of a work
+// source that does not use it.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -102,6 +106,7 @@ struct Rig {
     std::vector<unsigned char> seen_payout;
     PayoutKey seen_rate_key{};
     std::optional<uint16_t> seen_donation;   // the donation the ref_hash commits to
+    std::optional<double> seen_share_difficulty{-1.0};   // the login's "/N" (-1: never called)
     Rig()
     {
         mi.set_coin_node(&ltc);
@@ -114,10 +119,12 @@ struct Rig {
                                   uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
                                   const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
                                   const std::vector<uint256>&,
-                                  const std::optional<uint16_t>& donation) {
+                                  const std::optional<uint16_t>& donation,
+                                  const std::optional<double>& share_difficulty) {
             seen_payout = payout;
             seen_rate_key = rate_key;
             seen_donation = donation;
+            seen_share_difficulty = share_difficulty;
             MiningInterface::RefHashResult r;
             r.ref_hash.SetHex(std::string(64, '5'));
             r.bits = 0x207fffff;
@@ -228,4 +235,52 @@ TEST(NodeFeeShareTarget, ASplitJobCommitsItsRefHashToTheSplitDonation)
     EXPECT_EQ(r.seen_payout, p2pkh(0x0e));
     EXPECT_EQ(r.job(key_of(0x0a), p2pkh(0x0a)), p2pkh(0x0a));
     EXPECT_FALSE(r.seen_donation.has_value()) << "a miner's job: the node's donation";
+}
+
+// The login's "/N": build_connection_coinbase_for hands it to ref_hash_fn
+// with the job (a fee job too: the fee job is the login's job); a job without
+// one, and the plain build, hand none.
+TEST(ShareDifficultySuffix, LoginShareDifficultyReachesRefHashFn)
+{
+    Rig r;
+    uint256 prev;
+    prev.SetHex("01");
+    (void)r.mi.build_connection_coinbase_for(key_of(0x0a), prev, "aabbccdd", p2pkh(0x0a), {}, std::nullopt, 512.0);
+    ASSERT_TRUE(r.seen_share_difficulty.has_value());
+    EXPECT_DOUBLE_EQ(*r.seen_share_difficulty, 512.0);
+
+    r.mi.set_node_fee(100.0, p2pkh(0x0e));
+    auto payout = p2pkh(0x0a);
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged;
+    const auto donation = r.mi.decide_job_payout(payout, merged);
+    ASSERT_EQ(payout, p2pkh(0x0e));
+    (void)r.mi.build_connection_coinbase_for(key_of(0x0a), prev, "aabbccdd", payout, merged, donation, 0.25);
+    ASSERT_TRUE(r.seen_share_difficulty.has_value());
+    EXPECT_DOUBLE_EQ(*r.seen_share_difficulty, 0.25) << "the fee job is the login's job";
+
+    (void)r.job(key_of(0x0a), p2pkh(0x0a));
+    EXPECT_FALSE(r.seen_share_difficulty.has_value()) << "no \"/N\": none";
+    r.seen_share_difficulty = -1.0;
+    (void)r.mi.build_connection_coinbase(prev, "aabbccdd", p2pkh(0x0a), {});
+    EXPECT_FALSE(r.seen_share_difficulty.has_value()) << "the plain build: none";
+}
+
+// A work source whose ref_hash_fn does not use "/N" builds the same coinbase
+// with and without it, and the same as the call that does not pass it.
+TEST(ShareDifficultySuffix, CoinbaseUnchangedWhenTheWorkSourceIgnoresIt)
+{
+    Rig r;
+    uint256 prev;
+    prev.SetHex("01");
+    const auto a = r.mi.build_connection_coinbase_for(key_of(0x0a), prev, "aabbccdd", p2pkh(0x0a), {});
+    const auto b = r.mi.build_connection_coinbase_for(key_of(0x0a), prev, "aabbccdd", p2pkh(0x0a), {},
+                                                      std::nullopt, std::nullopt);
+    const auto c = r.mi.build_connection_coinbase_for(key_of(0x0a), prev, "aabbccdd", p2pkh(0x0a), {},
+                                                      std::nullopt, 512.0);
+    ASSERT_FALSE(a.coinb1.empty());
+    EXPECT_EQ(a.coinb1, b.coinb1);
+    EXPECT_EQ(a.coinb2, b.coinb2);
+    EXPECT_EQ(a.coinb1, c.coinb1);
+    EXPECT_EQ(a.coinb2, c.coinb2);
+    EXPECT_EQ(a.snapshot.frozen_ref.bits, c.snapshot.frozen_ref.bits);
 }

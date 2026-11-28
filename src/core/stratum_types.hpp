@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -271,6 +272,25 @@ struct RefHashResult {
     std::vector<unsigned char> frozen_merged_coinbase_info;
 };
 
+/// The PoW hash the vardiff gate computed for a submission: the 80-byte
+/// header it hashed and the 32-byte digest (the hash function's raw output),
+/// from IWorkSource::compute_share_difficulty_pow. The stratum session hands
+/// it to mining_submit (JobSnapshot::gate_pow), which uses it in place of
+/// hashing a header only when that header is byte-equal to `header`.
+struct SharePow {
+    bool valid{false};
+    std::array<unsigned char, 80> header{};
+    std::array<unsigned char, 32> digest{};
+
+    // The digest of `hdr` if it is the header the gate hashed, else nullptr.
+    const unsigned char* digest_for(const unsigned char* hdr, std::size_t len) const
+    {
+        if (!valid || len != header.size() || !std::equal(header.begin(), header.end(), hdr))
+            return nullptr;
+        return digest.data();
+    }
+};
+
 /// All template data frozen at the time a mining job was sent, plus the
 /// share-target bits the miner actually hashed against. Passed back into
 /// IWorkSource::mining_submit() so the work source can validate without
@@ -303,6 +323,9 @@ struct JobSnapshot {
     // split job: work the node cannot attribute, core::kSplitShareDonation);
     // none: the node's own (--give-author). The job's ref_hash committed to it.
     std::optional<uint16_t> share_donation;
+    // The vardiff gate's PoW hash of this submission (not valid when the work
+    // source gives none, or for a caller without a gate).
+    SharePow gate_pow;
 };
 
 /// Atomic snapshot of work-related fields under the work source's mutex.

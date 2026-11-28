@@ -19,6 +19,9 @@
 #include <gtest/gtest.h>
 
 #include <impl/ltc/work_target.hpp>
+#include <core/stratum_username.hpp>
+
+#include <string>
 
 using namespace ltc::stratum;
 
@@ -89,4 +92,95 @@ TEST(LtcWorkTarget, DustRuleAppliesAtZeroRate)
     in.local_hash_rate = 0.0;
     in.pool_aps = 0.0;
     EXPECT_EQ(job_desired_share_target(in).GetHex(), MAX_TARGET_HEX);
+}
+
+// p2pool bitcoin/data.py difficulty_to_target(float(N)) (chain::
+// difficulty_to_target), the target of a login "/N". Derive (python3 -I):
+//   d2t = lambda d: min(int((0xffff0000 * 2**(256-64) + 1)/d - 1 + 0.5), 2**256-1)
+//   "%064x" % d2t(N)
+// 1e-241: the quotient overflows a double, python's int() raises (get_user_details
+// catches it: no target).
+TEST(LtcWorkTarget, DifficultyToTargetIsPythons)
+{
+    struct Case { double n; const char* hex; };
+    const Case cases[] = {
+        {1.0, "00000000ffff0000000000000000000000000000000000000000000000000000"},
+        {512.0, "00000000007fff80000000000000000000000000000000000000000000000000"},
+        {0.5, "00000001fffe0000000000000000000000000000000000000000000000000000"},
+        {1.5, "00000000aaaa0000000000000000000000000000000000000000000000000000"},
+        {3.0, "0000000055550000000000000000000000000000000000000000000000000000"},
+        {7.0, "0000000024922492492492000000000000000000000000000000000000000000"},
+        {65536.0, "000000000000ffff000000000000000000000000000000000000000000000000"},
+        {0.001, "000003e7fc180000000000000000000000000000000000000000000000000000"},
+        {1e6, "00000000000010c6e6d9be4cd700000000000000000000000000000000000000"},
+        {123.456, "000000000212d63ee7b6be400000000000000000000000000000000000000000"},
+        {2.4e-10, "f859515061000000000000000000000000000000000000000000000000000000"},
+        {2.3e-10, MAX_TARGET_HEX},   // min(..., 2**256-1)
+        {1e-240, MAX_TARGET_HEX},
+        {1e50, "00000000000000000000000000000000000000000000000003bdcb8b8b4da940"},
+        {1e300, "0000000000000000000000000000000000000000000000000000000000000000"},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.n);
+        const auto t = chain::difficulty_to_target(c.n);
+        ASSERT_TRUE(t.has_value());
+        EXPECT_EQ(t->GetHex(), c.hex);
+    }
+    EXPECT_FALSE(chain::difficulty_to_target(1e-241).has_value()) << "python: OverflowError";
+    EXPECT_FALSE(chain::difficulty_to_target(0.0).has_value());
+    EXPECT_FALSE(chain::difficulty_to_target(-1.0).has_value());
+}
+
+// A login "/N": p2pool get_work takes desired_share_target from
+// get_user_details and runs neither cap (both under `if desired_share_target
+// is None`), so the desired target is difficulty_to_target(N) whatever the
+// rate and the dust rule (the band clip follows, in compute_share_target).
+// N is in p2pool's units (difficulty 1 = 0x00000000ffff...), not scaled by
+// DUMB_SCRYPT_DIFF. An N whose target python raises on: the caps, as without.
+TEST(LtcWorkTarget, LoginShareDifficultyReplacesBothCaps)
+{
+    JobTargetInputs in;
+    in.local_hash_rate = 5e9;
+    in.share_period = 15;
+    in.pool_aps = 1.455e11;
+    in.subsidy = 625537917;
+    in.donation_percent = 1.0;
+    in.dust_threshold = 3000000;
+    in.spread = 3;
+    in.block_bits = 0x192d56b7;
+    const std::string capped = job_desired_share_target(in).GetHex();
+    in.share_difficulty = 512.0;
+    EXPECT_EQ(job_desired_share_target(in).GetHex(),
+              "00000000007fff80000000000000000000000000000000000000000000000000");
+    in.local_hash_rate = 0.0;   // the dust rule would apply: not with "/N"
+    EXPECT_EQ(job_desired_share_target(in).GetHex(),
+              "00000000007fff80000000000000000000000000000000000000000000000000");
+    in.local_hash_rate = 5e9;
+    in.share_difficulty = 1e-241;
+    EXPECT_EQ(job_desired_share_target(in).GetHex(), capped) << "no target from \"/N\": the caps";
+    in.share_difficulty.reset();
+    EXPECT_EQ(job_desired_share_target(in).GetHex(), capped) << "no \"/N\": unchanged";
+}
+
+// The stratum parser takes a login "+N" / "/N" exactly where
+// chain::difficulty_to_target has a value (stratum_username::parse_login_diff),
+// and both exactly where python's difficulty_to_target(float(N)) does not
+// raise. Derive (python3 -I), the boundary pair included:
+//   d2t = lambda d: min(int((0xffff0000 * 2**(256-64) + 1)/d - 1 + 0.5), 2**256-1)
+//   d2t(float("1.4996739303382901e-241"))  -> OverflowError
+//   d2t(float("1.4996739303382902e-241"))  -> 2**256-1
+TEST(LtcWorkTarget, LoginDiffParseAcceptsWhatDifficultyToTargetDoes)
+{
+    struct Case { const char* n; bool python_takes; };
+    const Case cases[] = {
+        {"1e-300", false}, {"1e-242", false}, {"1e-241", false},
+        {"1.4996739303382901e-241", false}, {"1.4996739303382902e-241", true},
+        {"1.4996739303382903e-241", true}, {"2.7e-241", true}, {"1e-240", true}, {"2.3e-10", true},
+        {"1", true}, {"512", true}, {"1e50", true}, {"1e300", true},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.n);
+        EXPECT_EQ(core::stratum_username::parse_login_diff(c.n).has_value(), c.python_takes);
+        EXPECT_EQ(chain::difficulty_to_target(std::stod(c.n)).has_value(), c.python_takes);
+    }
 }

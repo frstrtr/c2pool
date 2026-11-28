@@ -326,7 +326,8 @@ TEST(TemplateRefreshOnTx, SessionsShareOneTxDataPerGeneration)
                           bool, const std::string&, const uint256&,
                           const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
                           const std::vector<uint256>&,
-                          const std::optional<uint16_t>&) {
+                          const std::optional<uint16_t>&,
+                          const std::optional<double>&) {
         core::MiningInterface::RefHashResult r;
         r.ref_hash.SetHex(std::string(64, '5'));
         r.bits = 0x207fffff;

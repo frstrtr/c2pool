@@ -343,6 +343,7 @@ static void segfault_handler(int sig) {
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 #include <btclibs/util/strencodings.h>
+#include <core/sha256_init.hpp>
 
 // Bring the address validation types into scope
 using Blockchain = c2pool::address::Blockchain;
@@ -865,6 +866,9 @@ static int dump_doge_schedule_anchors(const std::string& dir, const std::string&
 }
 
 int main(int argc, char* argv[]) {
+    // SHA-256 implementation (SSE4 / AVX2 / SHA-NI when the CPU has them),
+    // self-tested, before any thread starts: core/sha256_init.hpp.
+    core::init_sha256();
     // --version: a pure query, answered before anything else runs (data dir,
     // crash handlers, logger, the RLIMIT notice, settings, network), so stdout
     // carries exactly this one line on every platform. Same shape as
@@ -1276,6 +1280,11 @@ int main(int argc, char* argv[]) {
     }
 
     // Parse command line arguments
+    // Each flag is an independent check that ends in `continue` (or returns):
+    // one else-if chain over all of them nests deeper than MSVC allows (C1061,
+    // "blocks nested too deeply"). The checks run in order and the first match
+    // handles the argument, as a chain would; an argument no check takes
+    // reaches the unknown-argument check and then the positional arguments.
     for (int i = 1; i < argc; ++i) {
         if (import_found_blocks_value_at[static_cast<size_t>(i)])
             continue;   // an --import-found-blocks value (the pass above)
@@ -1285,77 +1294,89 @@ int main(int argc, char* argv[]) {
             print_help();
             return 0;
         }
-        else if (arg == "--data-dir" && i + 1 < argc) {
+        if (arg == "--data-dir" && i + 1 < argc) {
             // Root ALL per-instance on-disk state (sharechain LevelDB, addr
             // store, whitelist, logs, ratchet, found-blocks db, ...) under
             // this path so co-located instances never contend the LevelDB
             // LOCK. Default (unset) keeps ~/.c2pool — see issue #722.
             core::filesystem::set_data_dir(argv[++i]);
+            continue;
         }
-        else if (arg == "--testnet") {
+        if (arg == "--testnet") {
             settings->m_testnet = true;
             cli_explicit.insert("testnet");
+            continue;
         }
         // Log level (p2pool: --debug; c2pool extends with standard levels)
-        else if (arg == "--loglevel-trace")    { cli_log_level = "trace"; cli_explicit.insert("log_level"); }
-        else if (arg == "--loglevel-debug" || arg == "--debug")
-                                              { cli_log_level = "debug"; cli_explicit.insert("log_level"); }
-        else if (arg == "--loglevel-info")     { cli_log_level = "info"; cli_explicit.insert("log_level"); }
-        else if (arg == "--loglevel-warning")  { cli_log_level = "warning"; cli_explicit.insert("log_level"); }
-        else if (arg == "--loglevel-error")    { cli_log_level = "error"; cli_explicit.insert("log_level"); }
-        else if (arg == "--loglevel-critical") { cli_log_level = "fatal"; cli_explicit.insert("log_level"); }
+        if (arg == "--loglevel-trace")    { cli_log_level = "trace"; cli_explicit.insert("log_level"); continue; }
+        if (arg == "--loglevel-debug" || arg == "--debug")
+                                          { cli_log_level = "debug"; cli_explicit.insert("log_level"); continue; }
+        if (arg == "--loglevel-info")     { cli_log_level = "info"; cli_explicit.insert("log_level"); continue; }
+        if (arg == "--loglevel-warning")  { cli_log_level = "warning"; cli_explicit.insert("log_level"); continue; }
+        if (arg == "--loglevel-error")    { cli_log_level = "error"; cli_explicit.insert("log_level"); continue; }
+        if (arg == "--loglevel-critical") { cli_log_level = "fatal"; cli_explicit.insert("log_level"); continue; }
         // Network / blockchain selection (p2pool: --net)
-        else if ((arg == "--net" || arg == "--blockchain") && i + 1 < argc) {
+        if ((arg == "--net" || arg == "--blockchain") && i + 1 < argc) {
             blockchain_label = argv[++i];
             blockchain = parse_blockchain(blockchain_label);
             cli_explicit.insert("blockchain");
+            continue;
         }
         // P2Pool P2P sharechain port (p2pool: --p2pool-port)
-        else if ((arg == "--p2pool-port" || arg == "--p2p-port") && i + 1 < argc) {
+        if ((arg == "--p2pool-port" || arg == "--p2p-port") && i + 1 < argc) {
             p2p_port = std::stoi(argv[++i]);
             cli_explicit.insert("p2p_port");
+            continue;
         }
         // Worker/Stratum port (p2pool: -w / --worker-port)
-        else if ((arg == "--worker-port" || arg == "-w" || arg == "--stratum-port") && i + 1 < argc) {
+        if ((arg == "--worker-port" || arg == "-w" || arg == "--stratum-port") && i + 1 < argc) {
             stratum_port = std::stoi(argv[++i]);
             cli_explicit.insert("stratum_port");
+            continue;
         }
         // Web dashboard / JSON-RPC API port
-        else if ((arg == "--http-port" || arg == "--web-port") && i + 1 < argc) {
+        if ((arg == "--http-port" || arg == "--web-port") && i + 1 < argc) {
             http_port = std::stoi(argv[++i]);
             cli_explicit.insert("http_port");
+            continue;
         }
-        else if (arg == "--http-host" && i + 1 < argc) {
+        if (arg == "--http-host" && i + 1 < argc) {
             http_host = argv[++i];
             cli_explicit.insert("http_host");
+            continue;
         }
-        else if (arg == "--external-ip" && i + 1 < argc) {
+        if (arg == "--external-ip" && i + 1 < argc) {
             external_ip = argv[++i];
             cli_explicit.insert("external_ip");
+            continue;
         }
-        else if (arg == "--integrated") {
+        if (arg == "--integrated") {
             integrated_mode = true;
             cli_explicit.insert("integrated");
+            continue;
         }
-        else if (arg == "--solo") {
+        if (arg == "--solo") {
             solo_mode = true;
             integrated_mode = true;  // solo is a variant of integrated
             cli_explicit.insert("solo");
             cli_explicit.insert("integrated");
+            continue;
         }
-        else if (arg == "--custodial") {
+        if (arg == "--custodial") {
             custodial_mode = true;
             integrated_mode = true;  // custodial is a variant of integrated
             cli_explicit.insert("custodial");
             cli_explicit.insert("integrated");
+            continue;
         }
-        else if (arg == "--sharechain") {
+        if (arg == "--sharechain") {
             sharechain_mode = true;
             integrated_mode = false;
             cli_explicit.insert("sharechain");
             cli_explicit.insert("integrated");
+            continue;
         }
-        else if (arg == "--standalone") {
+        if (arg == "--standalone") {
             // Legacy solo mode: minimal stratum + RPC daemon, no embedded SPV
             integrated_mode = false;
             embedded_ltc = false;
@@ -1363,113 +1384,140 @@ int main(int argc, char* argv[]) {
             cli_explicit.insert("integrated");
             cli_explicit.insert("embedded_ltc");
             cli_explicit.insert("embedded_doge");
+            continue;
         }
-        else if (arg == "--embedded-ltc") {
+        if (arg == "--embedded-ltc") {
             embedded_ltc = true;
             cli_explicit.insert("embedded_ltc");
+            continue;
         }
-        else if (arg == "--no-embedded-ltc") {
+        if (arg == "--no-embedded-ltc") {
             embedded_ltc = false;
             cli_explicit.insert("embedded_ltc");
+            continue;
         }
-        else if (arg == "--embedded-doge") {
+        if (arg == "--embedded-doge") {
             embedded_doge = true;
             cli_explicit.insert("embedded_doge");
+            continue;
         }
-        else if (arg == "--no-embedded-doge") {
+        if (arg == "--no-embedded-doge") {
             embedded_doge = false;
             cli_explicit.insert("embedded_doge");
+            continue;
         }
-        else if (arg == "--doge-testnet4alpha") {
+        if (arg == "--doge-testnet4alpha") {
             doge_testnet4alpha = true;
             cli_explicit.insert("doge_testnet4alpha");
+            continue;
         }
-        else if (arg == "--header-checkpoint" && i + 1 < argc) {
+        if (arg == "--header-checkpoint" && i + 1 < argc) {
             header_checkpoint_str = argv[++i];
             cli_explicit.insert("header_checkpoint");
+            continue;
         }
-        else if (arg == "--doge-header-checkpoint" && i + 1 < argc) {
+        if (arg == "--doge-header-checkpoint" && i + 1 < argc) {
             doge_header_checkpoint_str = argv[++i];
             cli_explicit.insert("doge_header_checkpoint");
+            continue;
         }
-        else if (arg == "--ltc-cmpct-v3") {
+        if (arg == "--ltc-cmpct-v3") {
             ltc_cmpct_v3 = true;
             cli_explicit.insert("ltc_cmpct_v3");
+            continue;
         }
-        else if (arg == "--no-ltc-cmpct-v3") {
+        if (arg == "--no-ltc-cmpct-v3") {
             ltc_cmpct_v3 = false;
             cli_explicit.insert("ltc_cmpct_v3");
+            continue;
         }
-        else if (arg == "--ltc-cmpct-hb-peers" && i + 1 < argc) {
+        if (arg == "--ltc-cmpct-hb-peers" && i + 1 < argc) {
             ltc_cmpct_hb_peers = static_cast<uint32_t>(std::stoul(argv[++i]));
             cli_explicit.insert("ltc_cmpct_hb_peers");
+            continue;
         }
-        else if (arg == "--ltc-mweb-fetch-retry") {
+        if (arg == "--ltc-mweb-fetch-retry") {
             ltc_mweb_fetch_retry = true;
             cli_explicit.insert("ltc_mweb_fetch_retry");
+            continue;
         }
-        else if (arg == "--no-ltc-mweb-fetch-retry") {
+        if (arg == "--no-ltc-mweb-fetch-retry") {
             ltc_mweb_fetch_retry = false;
             cli_explicit.insert("ltc_mweb_fetch_retry");
+            continue;
         }
-        else if (arg == "--ltc-mweb-cmpct-provisional") {
+        if (arg == "--ltc-mweb-cmpct-provisional") {
             ltc_mweb_cmpct_provisional = true;
             cli_explicit.insert("ltc_mweb_cmpct_provisional");
+            continue;
         }
-        else if (arg == "--template-tx-check" && i + 1 < argc) {
+        if (arg == "--template-tx-check" && i + 1 < argc) {
             template_tx_check = argv[++i];
             cli_explicit.insert("template_tx_check");
+            continue;
         }
-        else if (arg == "--ltc-mweb-ext" && i + 1 < argc) {
+        if (arg == "--ltc-mweb-ext" && i + 1 < argc) {
             ltc_mweb_ext = argv[++i];
             cli_explicit.insert("ltc_mweb_ext");
+            continue;
         }
-        else if (arg == "--doge-p2p-address" && i + 1 < argc) {
+        if (arg == "--doge-p2p-address" && i + 1 < argc) {
             doge_p2p_address = argv[++i];
             cli_explicit.insert("doge_p2p_address");
+            continue;
         }
-        else if (arg == "--doge-p2p-port" && i + 1 < argc) {
+        if (arg == "--doge-p2p-port" && i + 1 < argc) {
             doge_p2p_port = std::stoi(argv[++i]);
             cli_explicit.insert("doge_p2p_port");
+            continue;
         }
-        else if (arg == "--doge-utxo-full") {
+        if (arg == "--doge-utxo-full") {
             doge_utxo_full = true;
             cli_explicit.insert("doge_utxo_full");
+            continue;
         }
-        else if (arg == "--no-doge-utxo-full") {
+        if (arg == "--no-doge-utxo-full") {
             doge_utxo_full = false;
             cli_explicit.insert("doge_utxo_full");
+            continue;
         }
-        else if (arg == "--doge-utxo-full-dir" && i + 1 < argc) {
+        if (arg == "--doge-utxo-full-dir" && i + 1 < argc) {
             doge_utxo_full_dir = argv[++i];
             cli_explicit.insert("doge_utxo_full_dir");
+            continue;
         }
-        else if (arg == "--ltc-utxo-full") {
+        if (arg == "--ltc-utxo-full") {
             ltc_utxo_full = true;
             cli_explicit.insert("ltc_utxo_full");
+            continue;
         }
-        else if (arg == "--no-ltc-utxo-full") {
+        if (arg == "--no-ltc-utxo-full") {
             ltc_utxo_full = false;
             cli_explicit.insert("ltc_utxo_full");
+            continue;
         }
-        else if (arg == "--ltc-utxo-full-dir" && i + 1 < argc) {
+        if (arg == "--ltc-utxo-full-dir" && i + 1 < argc) {
             ltc_utxo_full_dir = argv[++i];
             cli_explicit.insert("ltc_utxo_full_dir");
+            continue;
         }
-        else if (arg == "--ltc-connect" && i + 1 < argc) {
+        if (arg == "--ltc-connect" && i + 1 < argc) {
             ltc_connect.push_back(argv[++i]);
             cli_explicit.insert("ltc_connect");
+            continue;
         }
-        else if (arg == "--doge-connect" && i + 1 < argc) {
+        if (arg == "--doge-connect" && i + 1 < argc) {
             doge_connect.push_back(argv[++i]);
             cli_explicit.insert("doge_connect");
+            continue;
         }
-        else if (arg == "--import-found-blocks") {
+        if (arg == "--import-found-blocks") {
             // Taken, checked and canonicalized by the pass before this loop
             // (its value is skipped above).
             cli_explicit.insert("import_found_blocks");
+            continue;
         }
-        else if (arg == "--dump-doge-schedule-anchors" && i + 1 < argc) {
+        if (arg == "--dump-doge-schedule-anchors" && i + 1 < argc) {
             // The anchors of a complete hash schedule (no node is started);
             // the checkpoint is the configured one (a --doge-header-checkpoint
             // given before this option, else the built-in).
@@ -1479,7 +1527,7 @@ int main(int argc, char* argv[]) {
                 out_path = argv[++i];
             return dump_doge_schedule_anchors(dir, out_path, doge_header_checkpoint_str);
         }
-        else if (arg == "--utxo-digest" && i + 1 < argc) {
+        if (arg == "--utxo-digest" && i + 1 < argc) {
             // Digest a UTXO LevelDB (no node is started). The DB must not be
             // open in a running node (LevelDB's lock).
             const std::string dir = argv[++i];
@@ -1509,7 +1557,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "  sync          none (an accrual view: anchor unknown)\n";
             return 0;
         }
-        else if (arg == "--utxo-stats" && i + 1 < argc) {
+        if (arg == "--utxo-stats" && i + 1 < argc) {
             // gettxoutsetinfo of a UTXO LevelDB, Dogecoin Core 1.14.9's
             // GetUTXOStats (no node is started; the DB must not be open in a
             // running node: LevelDB's lock).
@@ -1557,7 +1605,7 @@ int main(int argc, char* argv[]) {
                       << st.hash_serialized.GetHex() << "\",\"total_amount\":" << total << "}\n";
             return 0;
         }
-        else if (arg == "--ltc-utxo-stats" && i + 1 < argc) {
+        if (arg == "--ltc-utxo-stats" && i + 1 < argc) {
             // gettxoutsetinfo of a UTXO LevelDB, Litecoin Core 0.21.4's
             // GetUTXOStats (hash_serialized_2; #2137): the LTC full set
             // against litecoind at the same best block. No node is started.
@@ -1604,69 +1652,83 @@ int main(int argc, char* argv[]) {
                       << st.hash_serialized.GetHex() << "\",\"total_amount\":" << total << "}\n";
             return 0;
         }
-        else if (arg == "--config" && i + 1 < argc) {
+        if (arg == "--config" && i + 1 < argc) {
             config_file = argv[++i];
+            continue;
         }
         // Payout address (p2pool: --address)
-        else if ((arg == "--address" || arg == "--solo-address") && i + 1 < argc) {
+        if ((arg == "--address" || arg == "--solo-address") && i + 1 < argc) {
             payout_address = argv[++i];
             solo_address = payout_address;  // legacy compat
             cli_explicit.insert("solo_address");
             cli_explicit.insert("address");
+            continue;
         }
         // Donation (p2pool: --give-author)
-        else if ((arg == "--give-author" || arg == "--dev-donation") && i + 1 < argc) {
+        if ((arg == "--give-author" || arg == "--dev-donation") && i + 1 < argc) {
             dev_donation = std::stod(argv[++i]);
             cli_explicit.insert("dev_donation");
+            continue;
         }
         // Node owner fee (p2pool: -f / --fee)
-        else if ((arg == "-f" || arg == "--fee" || arg == "--node-owner-fee") && i + 1 < argc) {
+        if ((arg == "-f" || arg == "--fee" || arg == "--node-owner-fee") && i + 1 < argc) {
             node_owner_fee = std::stod(argv[++i]);
             cli_explicit.insert("node_owner_fee");
+            continue;
         }
-        else if (arg == "--node-owner-address" && i + 1 < argc) {
+        if (arg == "--node-owner-address" && i + 1 < argc) {
             node_owner_address = argv[++i];
             cli_explicit.insert("node_owner_address");
+            continue;
         }
-        else if ((arg == "--node-owner-merged-address" || arg == "--merged-operator-address") && i + 1 < argc) {
+        if ((arg == "--node-owner-merged-address" || arg == "--merged-operator-address") && i + 1 < argc) {
             node_owner_merged_address = argv[++i];
             cli_explicit.insert("node_owner_merged_address");
+            continue;
         }
-        else if (arg == "--node-owner-script" && i + 1 < argc) {
+        if (arg == "--node-owner-script" && i + 1 < argc) {
             node_owner_script = argv[++i];
             cli_explicit.insert("node_owner_script");
+            continue;
         }
-        else if (arg == "--auto-detect-wallet") {
+        if (arg == "--auto-detect-wallet") {
             auto_detect_wallet = true;
             cli_explicit.insert("auto_detect_wallet");
+            continue;
         }
-        else if (arg == "--no-auto-detect-wallet") {
+        if (arg == "--no-auto-detect-wallet") {
             auto_detect_wallet = false;
             cli_explicit.insert("auto_detect_wallet");
+            continue;
         }
         // Parent coin daemon RPC (p2pool: --coind-address, --coind-rpc-port)
-        else if ((arg == "--coind-address" || arg == "--rpchost" || arg == "--bitcoind-address") && i + 1 < argc) {
+        if ((arg == "--coind-address" || arg == "--rpchost" || arg == "--bitcoind-address") && i + 1 < argc) {
             rpc_host = argv[++i];
             cli_explicit.insert("rpc_host");
+            continue;
         }
-        else if ((arg == "--coind-rpc-port" || arg == "--rpcport" || arg == "--bitcoind-rpc-port") && i + 1 < argc) {
+        if ((arg == "--coind-rpc-port" || arg == "--rpcport" || arg == "--bitcoind-rpc-port") && i + 1 < argc) {
             rpc_port = std::stoi(argv[++i]);
             cli_explicit.insert("rpc_port");
+            continue;
         }
-        else if ((arg == "--rpcuser") && i + 1 < argc) {
+        if ((arg == "--rpcuser") && i + 1 < argc) {
             rpc_user = argv[++i];
             cli_explicit.insert("rpc_user");
+            continue;
         }
-        else if ((arg == "--rpcpassword") && i + 1 < argc) {
+        if ((arg == "--rpcpassword") && i + 1 < argc) {
             rpc_pass = argv[++i];
             cli_explicit.insert("rpc_pass");
+            continue;
         }
         // c2pool-style merged (colon-separated spec)
-        else if (arg == "--merged" && i + 1 < argc) {
+        if (arg == "--merged" && i + 1 < argc) {
             merged_chain_specs.push_back(argv[++i]);
             cli_explicit.insert("merged");
+            continue;
         }
-        else if (arg == "--merged-payout-address" && i + 1 < argc) {
+        if (arg == "--merged-payout-address" && i + 1 < argc) {
             const std::string v = argv[++i];
             const auto colon = v.find(':');
             if (colon == std::string::npos || colon == 0 || colon + 1 == v.size()) {
@@ -1677,172 +1739,208 @@ int main(int argc, char* argv[]) {
             for (auto& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
             merged_payout_addresses[sym] = v.substr(colon + 1);
             cli_explicit.insert("merged_payout_addresses");
+            continue;
         }
         // p2pool-style merged chain flags
-        else if (arg == "--merged-coind-address" && i + 1 < argc) {
+        if (arg == "--merged-coind-address" && i + 1 < argc) {
             merged_coind_address = argv[++i];
             cli_explicit.insert("merged_coind_address");
+            continue;
         }
-        else if (arg == "--merged-coind-rpc-port" && i + 1 < argc) {
+        if (arg == "--merged-coind-rpc-port" && i + 1 < argc) {
             merged_coind_rpc_port = std::stoi(argv[++i]);
             cli_explicit.insert("merged_coind_rpc_port");
+            continue;
         }
-        else if (arg == "--merged-coind-rpc-user" && i + 1 < argc) {
+        if (arg == "--merged-coind-rpc-user" && i + 1 < argc) {
             merged_coind_rpc_user = argv[++i];
             cli_explicit.insert("merged_coind_rpc_user");
+            continue;
         }
-        else if (arg == "--merged-coind-rpc-password" && i + 1 < argc) {
+        if (arg == "--merged-coind-rpc-password" && i + 1 < argc) {
             merged_coind_rpc_pass = argv[++i];
             cli_explicit.insert("merged_coind_rpc_pass");
+            continue;
         }
-        else if (arg == "--merged-coind-p2p-port" && i + 1 < argc) {
+        if (arg == "--merged-coind-p2p-port" && i + 1 < argc) {
             merged_coind_p2p_port = std::stoi(argv[++i]);
             cli_explicit.insert("merged_coind_p2p_port");
+            continue;
         }
-        else if (arg == "--merged-coind-p2p-address" && i + 1 < argc) {
+        if (arg == "--merged-coind-p2p-address" && i + 1 < argc) {
             merged_coind_p2p_address = argv[++i];
             cli_explicit.insert("merged_coind_p2p_address");
+            continue;
         }
         // Parent coin daemon P2P (p2pool: --coind-p2p-port / --bitcoind-p2p-port)
-        else if ((arg == "--coind-p2p-port" || arg == "--bitcoind-p2p-port") && i + 1 < argc) {
+        if ((arg == "--coind-p2p-port" || arg == "--bitcoind-p2p-port") && i + 1 < argc) {
             coind_p2p_port = std::stoi(argv[++i]);
             cli_explicit.insert("coind_p2p_port");
+            continue;
         }
-        else if (arg == "--coind-p2p-address" && i + 1 < argc) {
+        if (arg == "--coind-p2p-address" && i + 1 < argc) {
             coind_p2p_address = argv[++i];
             cli_explicit.insert("coind_p2p_address");
+            continue;
         }
         // Connection limits (p2pool: --max-conns, --outgoing-conns, --disable-upnp)
-        else if (arg == "--max-conns" && i + 1 < argc) {
+        if (arg == "--max-conns" && i + 1 < argc) {
             max_outgoing_conns = std::stoi(argv[++i]);
             max_outgoing_conns_set = true;
+            continue;
         }
-        else if (arg == "--outgoing-conns" && i + 1 < argc) {
+        if (arg == "--outgoing-conns" && i + 1 < argc) {
             max_outgoing_conns = std::stoi(argv[++i]);
             max_outgoing_conns_set = true;
+            continue;
         }
-        else if (arg == "--disable-upnp") {
+        if (arg == "--disable-upnp") {
             /* no-op, c2pool doesn't use UPnP */
+            continue;
         }
-        else if (arg == "--message-blob-hex" && i + 1 < argc) {
+        if (arg == "--message-blob-hex" && i + 1 < argc) {
             operator_message_blob_hex = argv[++i];
             cli_explicit.insert("message_blob_hex");
+            continue;
         }
-        else if (arg == "--coinbase-text" && i + 1 < argc) {
+        if (arg == "--coinbase-text" && i + 1 < argc) {
             coinbase_text = argv[++i];
             cli_explicit.insert("coinbase_text");
+            continue;
         }
-        else if (arg == "--v3601-activation-time" && i + 1 < argc) {
+        if (arg == "--v3601-activation-time" && i + 1 < argc) {
             v3601_activation_time = std::stoull(argv[++i]);
             cli_explicit.insert("v3601_activation_time");
+            continue;
         }
-        else if ((arg == "--network-id" || arg == "--chain-id") && i + 1 < argc) {
+        if ((arg == "--network-id" || arg == "--chain-id") && i + 1 < argc) {
             // Full 8-byte identifier: parse as 64-bit, never truncate to 32 bits
             network_id = std::stoull(argv[++i], nullptr, 16);
             cli_explicit.insert("network_id");
+            continue;
         }
-        else if (arg == "--prefix" && i + 1 < argc) {
+        if (arg == "--prefix" && i + 1 < argc) {
             prefix_override_hex = argv[++i];
             cli_explicit.insert("prefix");
+            continue;
         }
-        else if (arg == "--startup-mode" && i + 1 < argc) {
+        if (arg == "--startup-mode" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "genesis") startup_mode = StartupMode::GENESIS;
             else if (mode == "wait") startup_mode = StartupMode::WAIT;
             else startup_mode = StartupMode::AUTO;
             cli_explicit.insert("startup_mode");
+            continue;
         }
-        else if (arg == "--genesis") {
+        if (arg == "--genesis") {
             startup_mode = StartupMode::GENESIS;
             cli_explicit.insert("startup_mode");
+            continue;
         }
-        else if (arg == "--wait-for-peers") {
+        if (arg == "--wait-for-peers") {
             startup_mode = StartupMode::WAIT;
             cli_explicit.insert("startup_mode");
+            continue;
         }
-        else if (arg == "--startup-timeout" && i + 1 < argc) {
+        if (arg == "--startup-timeout" && i + 1 < argc) {
             startup_timeout = std::stoi(argv[++i]);
             cli_explicit.insert("startup_timeout");
+            continue;
         }
         // Legacy support for old --port option
-        else if (arg == "--port" && i + 1 < argc) {
+        if (arg == "--port" && i + 1 < argc) {
             p2p_port = std::stoi(argv[++i]);
             cli_explicit.insert("p2p_port");
             LOG_WARNING << "--port is deprecated, use --p2pool-port instead";
+            continue;
         }
         // Redistribute mode for empty/broken miner addresses
-        else if (arg == "--redistribute" && i + 1 < argc) {
+        if (arg == "--redistribute" && i + 1 < argc) {
             redistribute_mode_str = argv[++i];
             cli_explicit.insert("redistribute");
+            continue;
         }
         // Stratum tuning
-        else if (arg == "--stratum-min-diff" && i + 1 < argc) {
+        if (arg == "--stratum-min-diff" && i + 1 < argc) {
             stratum_config.min_difficulty = std::stod(argv[++i]);
             cli_explicit.insert("stratum_min_diff");
+            continue;
         }
-        else if (arg == "--stratum-max-diff" && i + 1 < argc) {
+        if (arg == "--stratum-max-diff" && i + 1 < argc) {
             stratum_config.max_difficulty = std::stod(argv[++i]);
             cli_explicit.insert("stratum_max_diff");
+            continue;
         }
-        else if (arg == "--stratum-target-time" && i + 1 < argc) {
+        if (arg == "--stratum-target-time" && i + 1 < argc) {
             stratum_config.target_time = std::stod(argv[++i]);
             cli_explicit.insert("stratum_target_time");
+            continue;
         }
-        else if (arg == "--no-vardiff") {
+        if (arg == "--no-vardiff") {
             stratum_config.vardiff_enabled = false;
             cli_explicit.insert("vardiff_enabled");
+            continue;
         }
-        else if (arg == "--max-coinbase-outputs" && i + 1 < argc) {
+        if (arg == "--max-coinbase-outputs" && i + 1 < argc) {
             stratum_config.max_coinbase_outputs = static_cast<size_t>(std::stoul(argv[++i]));
             cli_explicit.insert("max_coinbase_outputs");
+            continue;
         }
-        else if (arg == "--max-stratum-connections" && i + 1 < argc) {
+        if (arg == "--max-stratum-connections" && i + 1 < argc) {
             stratum_config.max_stratum_connections = static_cast<size_t>(std::stoul(argv[++i]));
             cli_explicit.insert("max_stratum_connections");
+            continue;
         }
-        else if (arg == "--max-stratum-connections-per-ip" && i + 1 < argc) {
+        if (arg == "--max-stratum-connections-per-ip" && i + 1 < argc) {
             stratum_config.max_stratum_connections_per_ip = static_cast<size_t>(std::stoul(argv[++i]));
             cli_explicit.insert("max_stratum_connections_per_ip");
+            continue;
         }
-        else if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0) {
+        if (arg == "--stratum-http" || arg.rfind("--stratum-http=", 0) == 0) {
             if (!core::parse_stratum_http_flag(arg, stratum_http_mode)) {
                 LOG_ERROR << "Bad value: " << arg << " (expected --stratum-http=true, false or auto)";
                 return 1;
             }
             cli_explicit.insert("stratum_http");
+            continue;
         }
-        else if (arg == "--stratum-http-budget" && i + 1 < argc) {
+        if (arg == "--stratum-http-budget" && i + 1 < argc) {
             if (!core::parse_stratum_http_count(argv[++i], stratum_http_limits.budget)) {
                 LOG_ERROR << "Bad value: --stratum-http-budget " << argv[i] << " (expected a count)";
                 return 1;
             }
             cli_explicit.insert("stratum_http_budget");
+            continue;
         }
-        else if (arg == "--stratum-http-per-ip" && i + 1 < argc) {
+        if (arg == "--stratum-http-per-ip" && i + 1 < argc) {
             if (!core::parse_stratum_http_count(argv[++i], stratum_http_limits.per_ip)) {
                 LOG_ERROR << "Bad value: --stratum-http-per-ip " << argv[i] << " (expected a count)";
                 return 1;
             }
             cli_explicit.insert("stratum_http_per_ip");
+            continue;
         }
         // --stratum-tls [HOST:]PORT / --stratum-tls-cert FILE / --stratum-tls-key
         // FILE: the TLS stratum listener (core/stratum_tls.hpp); checked once
         // every flag and setting is read (check_stratum_tls_settings).
-        else if (arg == "--stratum-tls" && i + 1 < argc) {
+        if (arg == "--stratum-tls" && i + 1 < argc) {
             core::stratum_tls_setting().bind = argv[++i];
             cli_explicit.insert("stratum_tls");
+            continue;
         }
-        else if (arg == "--stratum-tls-cert" && i + 1 < argc) {
+        if (arg == "--stratum-tls-cert" && i + 1 < argc) {
             core::stratum_tls_setting().cert = argv[++i];
             cli_explicit.insert("stratum_tls_cert");
+            continue;
         }
-        else if (arg == "--stratum-tls-key" && i + 1 < argc) {
+        if (arg == "--stratum-tls-key" && i + 1 < argc) {
             core::stratum_tls_setting().key = argv[++i];
             cli_explicit.insert("stratum_tls_key");
+            continue;
         }
-        else if ((arg == "--stratum-tls-rate-per-ip" || arg == "--stratum-tls-burst-per-ip"
-                  || arg == "--stratum-tls-handshakes" || arg == "--stratum-tls-handshakes-per-ip")
-                 && i + 1 < argc) {
+        if ((arg == "--stratum-tls-rate-per-ip" || arg == "--stratum-tls-burst-per-ip"
+             || arg == "--stratum-tls-handshakes" || arg == "--stratum-tls-handshakes-per-ip")
+            && i + 1 < argc) {
             std::string err;
             if (!core::parse_stratum_tls_limit_flag(arg, argv[++i], core::stratum_tls_setting(), err)) {
                 LOG_ERROR << err;
@@ -1851,80 +1949,98 @@ int main(int argc, char* argv[]) {
             std::string key = arg.substr(2);   // "stratum_tls_handshakes", the YAML key
             std::replace(key.begin(), key.end(), '-', '_');
             cli_explicit.insert(key);
+            continue;
         }
         // Operational tuning
-        else if (arg == "--log-file" && i + 1 < argc) {
+        if (arg == "--log-file" && i + 1 < argc) {
             log_file = argv[++i];
             cli_explicit.insert("log_file");
+            continue;
         }
-        else if (arg == "--log-rotation-mb" && i + 1 < argc) {
+        if (arg == "--log-rotation-mb" && i + 1 < argc) {
             log_rotation_size_mb = std::stoi(argv[++i]);
             cli_explicit.insert("log_rotation_size_mb");
+            continue;
         }
-        else if (arg == "--log-max-mb" && i + 1 < argc) {
+        if (arg == "--log-max-mb" && i + 1 < argc) {
             log_max_total_mb = std::stoi(argv[++i]);
             cli_explicit.insert("log_max_total_mb");
+            continue;
         }
-        else if (arg == "--log-level" && i + 1 < argc) {
+        if (arg == "--log-level" && i + 1 < argc) {
             log_level_str = argv[++i];
             cli_explicit.insert("log_level");
+            continue;
         }
-        else if (arg == "--p2p-max-peers" && i + 1 < argc) {
+        if (arg == "--p2p-max-peers" && i + 1 < argc) {
             p2p_max_peers = std::stoi(argv[++i]);
             cli_explicit.insert("p2p_max_peers");
+            continue;
         }
-        else if (arg == "--ban-duration" && i + 1 < argc) {
+        if (arg == "--ban-duration" && i + 1 < argc) {
             p2p_ban_duration = std::stoi(argv[++i]);
             cli_explicit.insert("ban_duration");
+            continue;
         }
-        else if (arg == "--rss-limit-mb" && i + 1 < argc) {
+        if (arg == "--rss-limit-mb" && i + 1 < argc) {
             rss_limit_mb = std::stol(argv[++i]);
             cli_explicit.insert("rss_limit_mb");
+            continue;
         }
-        else if (arg == "--cors-origin" && i + 1 < argc) {
+        if (arg == "--cors-origin" && i + 1 < argc) {
             http_cors_origin = argv[++i];
             cli_explicit.insert("cors_origin");
+            continue;
         }
-        else if (arg == "--payout-window" && i + 1 < argc) {
+        if (arg == "--payout-window" && i + 1 < argc) {
             payout_window_seconds = std::stoi(argv[++i]);
             cli_explicit.insert("payout_window_seconds");
+            continue;
         }
-        else if (arg == "--storage-save-interval" && i + 1 < argc) {
+        if (arg == "--storage-save-interval" && i + 1 < argc) {
             storage_save_interval = std::stoi(argv[++i]);
             cli_explicit.insert("storage_save_interval");
+            continue;
         }
-        else if (arg == "--dashboard-dir" && i + 1 < argc) {
+        if (arg == "--dashboard-dir" && i + 1 < argc) {
             dashboard_dir = argv[++i];
             cli_explicit.insert("dashboard_dir");
+            continue;
         }
-        else if (arg == "--analytics-id" && i + 1 < argc) {
+        if (arg == "--analytics-id" && i + 1 < argc) {
             if (!core::parse_analytics_id(argv[++i], analytics_id)) {
                 LOG_ERROR << "Bad value: --analytics-id " << argv[i]
                           << " (expected a Google Analytics measurement ID, G-XXXXXXXXXX)";
                 return 1;
             }
             cli_explicit.insert("analytics_id");
+            continue;
         }
         // Seed node: -n HOST:PORT (p2pool compat)
-        else if (arg == "-n" && i + 1 < argc) {
+        if (arg == "-n" && i + 1 < argc) {
             seed_nodes.push_back(argv[++i]);
+            continue;
         }
         // Flags accepted but ignored (p2pool compat)
-        else if (arg == "--no-console") {
+        if (arg == "--no-console") {
             // c2pool has no interactive console — silently accept
+            continue;
         }
         // Control-plane (M0b)
-        else if (arg == "--settings" && i + 1 < argc) {
+        if (arg == "--settings" && i + 1 < argc) {
             settings_path = argv[++i];
             cli_explicit.insert("settings_path");
+            continue;
         }
-        else if (arg == "--dump-resolved-config") {
+        if (arg == "--dump-resolved-config") {
             want_dump_config = true;
+            continue;
         }
-        else if (arg == "--ack-money-settings") {
+        if (arg == "--ack-money-settings") {
             want_ack_money = true;
+            continue;
         }
-        else if (arg[0] == '-') {
+        if (arg[0] == '-') {
             LOG_ERROR << "Unknown argument: " << arg;
             return 1;
         }
@@ -7540,7 +7656,8 @@ int main(int argc, char* argv[]) {
                     const uint256& witness_root,
                     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
                     const std::vector<uint256>& merkle_branches,
-                    const std::optional<uint16_t>& share_donation)
+                    const std::optional<uint16_t>& share_donation,
+                    const std::optional<double>& desired_share_difficulty)
                     -> core::MiningInterface::RefHashResult
                 {
                     auto guard = p2p_node->read_tracker();
@@ -7601,7 +7718,9 @@ int main(int argc, char* argv[]) {
                     // target (pre_target3, 30x easier than its miner's at the
                     // hard edge), its shares weighed 1/30 of their work and it
                     // ended at its first, quick share, so the operator got a
-                    // fraction of the fee.
+                    // fraction of the fee. A login "/N" replaces both caps
+                    // (get_work: desired_share_target from get_user_details),
+                    // the band clip unchanged.
                     LOG_TRACE << "[ref_hash_fn] getting local_addr_rates...";
                     auto local_addr_rates = web_server.get_local_addr_rates();
                     LOG_TRACE << "[ref_hash_fn] got " << local_addr_rates.size() << " addr rates";
@@ -7615,6 +7734,7 @@ int main(int argc, char* argv[]) {
                     target_in.dust_threshold = ltc::PoolConfig::dust_threshold();
                     target_in.spread = ltc::PoolConfig::SPREAD;
                     target_in.block_bits = bits;
+                    target_in.share_difficulty = desired_share_difficulty;
                     // Cap 2's pool rate: over the last hour of shares at the
                     // prev share, once the chain is that deep; whatever the
                     // job's local rate (p2pool applies the dust rule at no
@@ -7659,6 +7779,9 @@ int main(int argc, char* argv[]) {
                                  << " max_bits=" << share_max_bits << std::dec
                                  << " share_diff=" << sd << " max_diff=" << md
                                  << " local_hr=" << local_hash_rate
+                                 << (desired_share_difficulty
+                                         ? " login_share_diff=" + std::to_string(*desired_share_difficulty)
+                                         : std::string())
                                  << " desired=" << desired_target.GetHex().substr(0, 16);
                     }
 
