@@ -20,10 +20,13 @@
 
 #include <gtest/gtest.h>
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -465,3 +468,159 @@ TEST(BestShareAtTime, NoDifficultyAtRecordTimeFallsBackToTheLiveOne)
     EXPECT_EQ(basis(bs["round"]), "current");
 }
 
+// ── Tracker share hooks feed the ring only ─────────────────────────────────
+// Every coin's share tracker reports each verified share (any member,
+// startup re-verify, catch-up sync) with its share TARGET through
+// m_on_share_difficulty. That is not a hash this node found, and stamped with
+// the difficulty at record time a share synced hours late would read against
+// today's difficulty. Every main that wires the hook to
+// record_share_difficulty passes update_best=false (LTC, DASH, bip110); the
+// Best Share legs come from local stratum submits only (p2pool work.py). The
+// hooks are lambdas inside the mains, so this checks their source.
+#ifdef C2POOL_SRC_ROOT
+namespace {
+
+std::string slurp(const std::filesystem::path& p)
+{
+    std::ifstream f(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+// End of the string / char / raw-string literal that starts at i.
+std::size_t skip_literal(const std::string& s, std::size_t i)
+{
+    const std::size_t n = s.size();
+    if (s[i] == 'R' && i + 1 < n && s[i + 1] == '"') {
+        const std::size_t open = s.find('(', i + 2);
+        if (open == std::string::npos) return n;
+        const std::string close = ")" + s.substr(i + 2, open - (i + 2)) + "\"";
+        const std::size_t end = s.find(close, open + 1);
+        return end == std::string::npos ? n : end + close.size();
+    }
+    const char q = s[i];
+    for (++i; i < n && s[i] != q && s[i] != '\n'; ++i)
+        if (s[i] == '\\') ++i;
+    return i < n ? i + 1 : n;
+}
+
+bool literal_start(const std::string& s, std::size_t i)
+{
+    if (s[i] == '"') return true;
+    if (s[i] == '\'') {
+        // A digit separator (1'000) is not a character literal.
+        return !(i > 0 && std::isxdigit(static_cast<unsigned char>(s[i - 1])));
+    }
+    return s[i] == 'R' && i + 1 < s.size() && s[i + 1] == '"'
+        && (i == 0 || !(std::isalnum(static_cast<unsigned char>(s[i - 1])) || s[i - 1] == '_'));
+}
+
+// C++ source with comments blanked; literals kept.
+std::string strip_comments(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size();) {
+        if (s.compare(i, 2, "//") == 0) {
+            while (i < s.size() && s[i] != '\n') ++i;
+        } else if (s.compare(i, 2, "/*") == 0) {
+            const std::size_t end = s.find("*/", i + 2);
+            i = (end == std::string::npos) ? s.size() : end + 2;
+            out += ' ';
+        } else if (literal_start(s, i)) {
+            const std::size_t end = skip_literal(s, i);
+            out.append(s, i, end - i);
+            i = end;
+        } else {
+            out += s[i++];
+        }
+    }
+    return out;
+}
+
+// Index just past the bracket closing the one at `open` (npos if none).
+std::size_t close_of(const std::string& s, std::size_t open)
+{
+    const char o = s[open], c = (o == '(') ? ')' : (o == '{') ? '}' : ']';
+    int depth = 0;
+    for (std::size_t i = open; i < s.size();) {
+        if (literal_start(s, i)) { i = skip_literal(s, i); continue; }
+        if (s[i] == o) ++depth;
+        else if (s[i] == c && --depth == 0) return i + 1;
+        ++i;
+    }
+    return std::string::npos;
+}
+
+std::string trim(const std::string& s)
+{
+    std::size_t b = 0, e = s.size();
+    while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
+// The top-level arguments of the call whose '(' is at open.
+std::vector<std::string> call_args(const std::string& s, std::size_t open)
+{
+    std::vector<std::string> args;
+    const std::size_t end = close_of(s, open);
+    if (end == std::string::npos) return args;
+    std::size_t start = open + 1;
+    int depth = 0;
+    for (std::size_t i = open + 1; i + 1 < end;) {
+        if (literal_start(s, i)) { i = skip_literal(s, i); continue; }
+        const char ch = s[i];
+        if (ch == '(' || ch == '{' || ch == '[') ++depth;
+        else if (ch == ')' || ch == '}' || ch == ']') --depth;
+        else if (ch == ',' && depth == 0) { args.push_back(trim(s.substr(start, i - start))); start = i + 1; }
+        ++i;
+    }
+    args.push_back(trim(s.substr(start, end - 1 - start)));
+    return args;
+}
+
+}  // namespace
+
+TEST(BestShareAtTime, TrackerShareHooksDoNotFeedTheBestShare)
+{
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(C2POOL_SRC_ROOT) / "c2pool";
+    ASSERT_TRUE(fs::is_directory(dir)) << dir;
+    std::set<std::string> wired;
+    for (const auto& ent : fs::recursive_directory_iterator(dir)) {
+        const std::string name = ent.path().filename().string();
+        if (name.rfind("main_", 0) != 0 || ent.path().extension() != ".cpp") continue;
+        const std::string code = strip_comments(slurp(ent.path()));
+        const std::string hook = "m_on_share_difficulty";
+        for (std::size_t pos = code.find(hook); pos != std::string::npos;
+             pos = code.find(hook, pos + hook.size())) {
+            std::size_t j = pos + hook.size();
+            while (j < code.size() && std::isspace(static_cast<unsigned char>(code[j]))) ++j;
+            if (j + 1 >= code.size() || code[j] != '=' || code[j + 1] == '=') continue;
+            ++j;
+            while (j < code.size() && std::isspace(static_cast<unsigned char>(code[j]))) ++j;
+            if (j >= code.size() || code[j] != '[') continue;   // not a lambda
+            const std::size_t body = code.find('{', close_of(code, j));
+            ASSERT_NE(body, std::string::npos) << name;
+            const std::size_t body_end = close_of(code, body);
+            ASSERT_NE(body_end, std::string::npos) << name;
+            const std::string fn = code.substr(body, body_end - body);
+            const std::string call = "record_share_difficulty";
+            for (std::size_t c = fn.find(call); c != std::string::npos;
+                 c = fn.find(call, c + call.size())) {
+                std::size_t k = c + call.size();
+                while (k < fn.size() && std::isspace(static_cast<unsigned char>(fn[k]))) ++k;
+                if (k >= fn.size() || fn[k] != '(') continue;
+                const auto args = call_args(fn, k);
+                wired.insert(name);
+                ASSERT_EQ(args.size(), 4u)
+                    << name << ": a tracker hook calls record_share_difficulty without "
+                       "update_best=false, so peer share targets reach the Best Share legs";
+                EXPECT_EQ(args[3], "false") << name;
+            }
+        }
+    }
+    for (const char* main : {"main_ltc.cpp", "main_dash.cpp", "main_bip110.cpp"})
+        EXPECT_TRUE(wired.count(main)) << main << ": tracker hook not found";
+}
+#endif  // C2POOL_SRC_ROOT

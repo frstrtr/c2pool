@@ -2556,17 +2556,19 @@ int run_embedded(bool coin_p2p_discover,
                         "(explorer window walk + V36? column feed + pplns overlay; "
                         "read-only) — explorer/PPLNS-view/V36? now reflect the mint";
 
-            // P5 — Best Share card + hashrate ring. The tracker already FIRES
+            // P5 — hashrate ring + share stats. The tracker FIRES
             // m_on_share_difficulty for every verified share (share_tracker.hpp)
-            // with (difficulty, miner); it was never wired on this lane, so
-            // record_share_difficulty() was never called and the card read
-            // "— / no record yet" FOREVER while 4 rigs submitted shares all day.
-            // Set once at startup before think() begins; the callback runs under
-            // the compute thread's exclusive lock (same as the stats publish),
-            // touches no consensus/mint/coinbase state. LTC ref main_ltc.cpp:4446.
+            // with (difficulty, miner). Set once at startup before think()
+            // begins; the callback runs under the compute thread's exclusive
+            // lock (same as the stats publish), touches no consensus/mint/
+            // coinbase state. LTC ref main_ltc.cpp m_on_share_difficulty.
+            // A verified share (any member, startup re-verify, catch-up sync)
+            // carries its share target, not a hash this node found, so it
+            // does not reach the Best Share legs (update_best=false).
             scn->tracker().m_on_share_difficulty =
                 [mi](double diff, const std::string& miner) {
-                    mi->record_share_difficulty(diff, miner);
+                    mi->record_share_difficulty(diff, miner, /*share_hash=*/"",
+                                                /*update_best=*/false);
                 };
 
             // P2-remainder — the seams the window+pplns commit left unwired:

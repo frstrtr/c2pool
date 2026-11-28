@@ -2970,10 +2970,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                     : dash::dashboard::P2SH_VERSION_MAINNET);
                         if (!addr.empty()) shown = std::move(addr);
                     }
-                    // The share hash rides through so best_share.hash names
-                    // the record share instead of rendering "".
+                    // Ring and share stats only: a verified share (any
+                    // member, startup re-verify, catch-up sync) carries its
+                    // share target, not a hash this node found. The Best
+                    // Share legs are fed by the stratum submit feed below
+                    // (set_on_share_difficulty_fn), as on LTC.
                     ws->get_mining_interface()->record_share_difficulty(
-                        diff, shown, share_hash.GetHex());
+                        diff, shown, share_hash.GetHex(), /*update_best=*/false);
                 };
         }
 
@@ -4942,11 +4945,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // the found hash (target_to_difficulty(pow_hash)) + miner + pow-hash.
         // record_share_difficulty tracks the pool-wide/session/round max WITH
         // the hash + timestamp; /best_share + /local_stats render it. This is
-        // the PRIMARY best-share feed on the DASH solo path — the tracker's
-        // verified-share m_on_share_difficulty hook (wired above) almost never
-        // fires here because solo shares seldom mint onto the sharechain, so
-        // without this the 🎯 Best Share card sat empty. Display only; the
-        // callback touches no share/target/payout logic (consensus-neutral).
+        // the ONLY Best Share feed on DASH: the tracker's verified-share
+        // m_on_share_difficulty hook (wired above) feeds the ring and share
+        // stats only (update_best=false). Display only; the callback touches
+        // no share/target/payout logic (consensus-neutral).
         if (web_server) {
             core::WebServer* ws = web_server.get();
             work_source->set_on_share_difficulty_fn(

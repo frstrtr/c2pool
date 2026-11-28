@@ -1939,7 +1939,7 @@ TEST(DashboardData, SharechainShareTargetsDoNotReachBestShare)
     EXPECT_EQ(bs["round"]["miner"].get<std::string>(), "w1");
     EXPECT_DOUBLE_EQ(bs["merged"]["round"]["difficulty"].get<double>(), 1.5e6);
 
-    // Default (DASH / bip110 callers) still raises the PRIMARY legs only.
+    // Default (the DASH stratum submit feed) raises the PRIMARY legs only.
     mi.record_share_difficulty(2.0e6, "dash", "ab");
     bs = mi.rest_best_share();
     EXPECT_DOUBLE_EQ(bs["round"]["difficulty"].get<double>(), 2.0e6);
