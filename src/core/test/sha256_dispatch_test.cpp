@@ -17,6 +17,12 @@
 //      read through the real environment.
 //   4. The self-check: a failing self-test puts the scalar implementation
 //      back, logs an error and does not abort; hashes stay correct.
+//   5. Bounds (Linux): no implementation reads or writes a byte outside the
+//      buffers it is given. Inputs and outputs sit against PROT_NONE pages
+//      (mmap/mprotect), so a stray access faults in any build, sanitized or
+//      not: SHA-256 (CSHA256 Write/Finalize) of 0..256 bytes and 1 MiB
+//      (+0..63), sha256d (Hash) of 0..256 bytes and 1 MiB, SHA256D64 over
+//      1..8 blocks, at unaligned starts; every digest equals the scalar one.
 //
 // The scalar implementation is what a process runs before SHA256AutoDetect;
 // each case below puts it back when it ends.
@@ -38,6 +44,11 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -323,3 +334,201 @@ TEST_F(Sha256Dispatch, FailedSelfTestFallsBackToStandardWithoutAborting)
         << log2.str();
     EXPECT_EQ(sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 }
+
+#ifdef __linux__
+namespace {
+
+// Bytes [lo(), hi()) of an anonymous mapping between two PROT_NONE pages:
+// touching the byte before lo() or the byte at hi() raises SIGSEGV.
+class GuardedBuffer {
+public:
+    explicit GuardedBuffer(size_t min_size)
+    {
+        const long ps = sysconf(_SC_PAGESIZE);
+        page_ = ps > 0 ? static_cast<size_t>(ps) : 4096;
+        span_ = (min_size + page_ - 1) / page_ * page_;
+        total_ = span_ + 2 * page_;
+        void* m = mmap(nullptr, total_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) return;
+        map_ = static_cast<unsigned char*>(m);
+        ok_ = mprotect(map_, page_, PROT_NONE) == 0 &&
+              mprotect(map_ + page_ + span_, page_, PROT_NONE) == 0;
+    }
+    ~GuardedBuffer()
+    {
+        if (map_) munmap(map_, total_);
+    }
+    GuardedBuffer(const GuardedBuffer&) = delete;
+    GuardedBuffer& operator=(const GuardedBuffer&) = delete;
+
+    bool ok() const { return ok_; }
+    unsigned char* lo() const { return map_ + page_; }
+    unsigned char* hi() const { return map_ + page_ + span_; }
+
+private:
+    size_t page_ = 0;
+    size_t span_ = 0;
+    size_t total_ = 0;
+    unsigned char* map_ = nullptr;
+    bool ok_ = false;
+};
+
+using Digest = std::array<unsigned char, 32>;
+
+// Fill of the SHA256D64 output buffer around the output.
+constexpr unsigned char kSentinel = 0xa5;
+
+Digest sha256_of(const unsigned char* p, size_t n)
+{
+    Digest d{};
+    CSHA256().Write(p, n).Finalize(d.data());
+    return d;
+}
+
+Digest digest_of(const uint256& h)
+{
+    Digest d{};
+    std::copy(h.data(), h.data() + 32, d.begin());
+    return d;
+}
+
+} // namespace
+
+// Every mask, against guard pages:
+//   - low: the message starts at lo() + o, o = 0..63 (o = 0: its first byte
+//     follows a PROT_NONE page), lengths 0..256 and 1 MiB;
+//   - high: the message ends at hi() (its last byte precedes a PROT_NONE
+//     page), lengths 0..256 and 1 MiB + k, k = 0..63, so its start falls on
+//     every offset mod 64; for 0..256 also written in two pieces cut at
+//     c = 0..63, which puts the chunk Transform reads from the caller's
+//     buffer at every offset mod 64, ending at hi();
+//   - sha256d (Hash) of every message of 0..256 bytes above, and of the
+//     1 MiB one at lo() and ending at hi();
+//   - SHA256D64 over 1..8 blocks (1-, 2-, 4- and 8-way), input ending at one
+//     guard page and output ending at another, then both at lo() + o; the
+//     output is exactly 32 bytes per block (sentinel bytes around it intact).
+// A message of length n is the first n bytes of one random stream.
+TEST_F(Sha256Dispatch, NoImplementationTouchesBytesOutsideItsBuffers)
+{
+    constexpr size_t kMiB = size_t{1} << 20;
+    constexpr size_t kOffsets = 64;
+    constexpr size_t kSmall = 256;
+    constexpr size_t kMaxD64 = 8;
+
+    std::vector<unsigned char> stream(kMiB + kOffsets);
+    std::mt19937 rng(20261128u);
+    for (auto& b : stream) b = static_cast<unsigned char>(rng());
+
+    // Scalar references, indexed by length: 0..256, then 1 MiB + k at
+    // kSmall + 1 + k.
+    ASSERT_EQ(SHA256AutoDetect(sha256_implementation::STANDARD), "standard");
+    std::vector<size_t> lens;
+    std::vector<Digest> ref_sha, ref_d;
+    for (size_t n = 0; n <= kSmall; ++n) {
+        lens.push_back(n);
+        ref_sha.push_back(sha256_of(stream.data(), n));
+        ref_d.push_back(digest_of(Hash(std::span<const unsigned char>(stream.data(), n))));
+    }
+    {
+        CSHA256 sha;
+        sha.Write(stream.data(), kMiB);
+        CHash256 sha_d;
+        sha_d.Write(std::span<const unsigned char>(stream.data(), kMiB));
+        for (size_t k = 0; k < kOffsets; ++k) {
+            lens.push_back(kMiB + k);
+            CSHA256 s = sha;
+            Digest d{};
+            s.Write(stream.data() + kMiB, k).Finalize(d.data());
+            ref_sha.push_back(d);
+            CHash256 h = sha_d;
+            h.Write(std::span<const unsigned char>(stream.data() + kMiB, k)).Finalize(std::span<unsigned char>(d.data(), 32));
+            ref_d.push_back(d);
+        }
+    }
+    std::vector<unsigned char> ref_d64(kMaxD64 * 32);
+    for (size_t b = 0; b < kMaxD64; ++b) {
+        const uint256 h = Hash(std::span<const unsigned char>(stream.data() + 64 * b, 64));
+        std::copy(h.data(), h.data() + 32, ref_d64.begin() + 32 * b);
+    }
+
+    GuardedBuffer msg(kMiB + kOffsets);
+    GuardedBuffer d64_in(kMaxD64 * 64 + kOffsets);
+    GuardedBuffer d64_out(kMaxD64 * 32 + kOffsets);
+    ASSERT_TRUE(msg.ok() && d64_in.ok() && d64_out.ok());
+
+    std::vector<std::string> names;
+    for (auto mask : kMasks) {
+        names.push_back(SHA256AutoDetect(mask));
+        std::cout << "[KAT] guard pages: mask " << int(mask) << " -> " << names.back() << "\n";
+    }
+    std::cout << std::flush;
+
+    size_t bad = 0;
+    size_t checks = 0;
+    auto report = [&](size_t m, const char* what, size_t n, size_t at) {
+        if (++bad <= 10)
+            ADD_FAILURE() << what << " differs from scalar: mask " << int(kMasks[m]) << " (" << names[m]
+                          << "), " << n << " bytes, offset " << at;
+    };
+    auto check = [&](size_t m, size_t i, const unsigned char* p, const char* where, size_t at, bool sha256d) {
+        const size_t n = lens[i];
+        ++checks;
+        if (sha256_of(p, n) != ref_sha[i]) report(m, where, n, at);
+        if (!sha256d) return;
+        ++checks;
+        if (digest_of(Hash(std::span<const unsigned char>(p, n))) != ref_d[i]) report(m, "sha256d", n, at);
+    };
+
+    // low: start at lo() + o.
+    for (size_t o = 0; o < kOffsets; ++o) {
+        unsigned char* p = msg.lo() + o;
+        std::copy(stream.begin(), stream.begin() + kMiB, p);
+        for (size_t m = 0; m < std::size(kMasks); ++m) {
+            SHA256AutoDetect(kMasks[m]);
+            for (size_t i = 0; i <= kSmall; ++i) check(m, i, p, "SHA-256 (low)", o, true);
+            check(m, kSmall + 1, p, "SHA-256 (low)", o, o == 0);   // 1 MiB
+        }
+    }
+
+    // high: end at hi().
+    for (size_t i = 0; i < lens.size(); ++i) {
+        const size_t n = lens[i];
+        unsigned char* p = msg.hi() - n;
+        std::copy(stream.begin(), stream.begin() + n, p);
+        for (size_t m = 0; m < std::size(kMasks); ++m) {
+            SHA256AutoDetect(kMasks[m]);
+            check(m, i, p, "SHA-256 (high)", (kOffsets - n % kOffsets) % kOffsets, n <= kSmall || n == kMiB);
+            if (n > kSmall) continue;
+            for (size_t c = 0; c < kOffsets && c <= n; ++c) {
+                Digest d{};
+                CSHA256().Write(p, c).Write(p + c, n - c).Finalize(d.data());
+                ++checks;
+                if (d != ref_sha[i]) report(m, "SHA-256 (high, two pieces)", n, c);
+            }
+        }
+    }
+
+    // SHA256D64: input and output at the high guard pages, then at lo() + o.
+    auto d64 = [&](size_t m, size_t blocks, unsigned char* in, unsigned char* out, size_t at) {
+        std::copy(stream.begin(), stream.begin() + 64 * blocks, in);
+        std::fill(d64_out.lo(), d64_out.hi(), kSentinel);
+        SHA256D64(out, in, blocks);
+        ++checks;
+        if (!std::equal(out, out + 32 * blocks, ref_d64.begin())) report(m, "SHA256D64", 64 * blocks, at);
+        const bool before = std::all_of(d64_out.lo(), out, [](unsigned char x) { return x == kSentinel; });
+        const bool after = std::all_of(out + 32 * blocks, d64_out.hi(), [](unsigned char x) { return x == kSentinel; });
+        if (!before || !after) report(m, "SHA256D64 output bounds", 64 * blocks, at);
+    };
+    for (size_t m = 0; m < std::size(kMasks); ++m) {
+        SHA256AutoDetect(kMasks[m]);
+        for (size_t blocks = 1; blocks <= kMaxD64; ++blocks) {
+            d64(m, blocks, d64_in.hi() - 64 * blocks, d64_out.hi() - 32 * blocks, 0);
+            for (size_t o = 0; o < kOffsets; ++o)
+                d64(m, blocks, d64_in.lo() + o, d64_out.lo() + o, o);
+        }
+    }
+
+    std::cout << "[KAT] guard pages: " << checks << " checks, " << bad << " mismatches\n";
+    EXPECT_EQ(bad, 0u);
+}
+#endif // __linux__
