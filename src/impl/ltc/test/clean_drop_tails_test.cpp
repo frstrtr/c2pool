@@ -35,6 +35,9 @@
 //   * The REAL NodeImpl::clean_tracker on a 20k chain draining 1000 layers
 //     removes what master's loop removes, cache on and off; the exclusive
 //     hold and the pass duration of both are printed.
+//   * The [CLEAN] pass line (held_ms, drop_ms, total_ms, removed, layers,
+//     cache): its format and when it is due, one line from a real pass, and
+//     the timing guard at the clean pass's exclusive lock.
 //   * With $C2POOL_REPLAY_STORE_LTC naming a copy of a recorded LTC store
 //     (<dir>/litecoin/sharechain_leveldb, copied again before it is opened):
 //     master's loop against the cached one on the loaded tracker at the
@@ -55,11 +58,14 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <random>
+#include <regex>
 #include <set>
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -67,6 +73,10 @@
 
 #include <boost/asio.hpp>
 #include <boost/log/core.hpp>
+#include <boost/log/sinks/sync_frontend.hpp>
+#include <boost/log/sinks/text_ostream_backend.hpp>
+#include <boost/make_shared.hpp>
+#include <boost/shared_ptr.hpp>
 
 #include <c2pool/storage/sharechain_storage.hpp>
 #include <core/filesystem.hpp>
@@ -616,6 +626,8 @@ TEST_F(LtcCleanDropTails, RandomForestsCachedRemovesWhatTheMasterLoopRemoves)
                 res_off = ltc::drop_tails(c, hc, CL, /*diag_log=*/false, &rem_uncached);
             }
             ASSERT_FALSE(res.cache_mismatch) << "seed " << seed << " variant " << variant;
+            EXPECT_TRUE(res.cached);
+            EXPECT_FALSE(res_off.cached);
             ASSERT_EQ(rem_cached, rem_old) << "seed " << seed << " variant " << variant;
             ASSERT_EQ(rem_uncached, rem_old) << "seed " << seed << " variant " << variant;
             EXPECT_EQ(static_cast<size_t>(res.total_dropped), rem_old.size());
@@ -948,6 +960,117 @@ TEST_F(LtcCleanDropTails, RealCleanPassRemovesWhatTheMasterLoopRemoves)
                 timing[0].max_hold_us / 1000.0, timing[0].pass_us / 1000.0,
                 timing[1].max_hold_us / 1000.0, timing[1].pass_us / 1000.0);
     EXPECT_LT(timing[1].max_hold_us, timing[0].max_hold_us);
+}
+
+// ── The [CLEAN] pass line ────────────────────────────────────────────────────
+
+TEST_F(LtcCleanDropTails, PassLineFormatAndWhenItIsDue)
+{
+    ltc::CleanPassTiming t;
+    t.held_us = 123456;
+    t.drop_us = 7890;
+    t.total_us = 130000;
+    t.removed = 1000;
+    t.layers = 1000;
+    t.cached = true;
+    EXPECT_EQ(ltc::clean_pass_log_line(t),
+              "[CLEAN] pass held_ms=123.5 drop_ms=7.9 total_ms=130.0 removed=1000 layers=1000 cache=on");
+    t.cached = false;
+    EXPECT_NE(ltc::clean_pass_log_line(t).find(" cache=off"), std::string::npos);
+
+    ltc::CleanPassTiming idle;   // nothing removed, held under 1 ms: no line
+    idle.held_us = 999;
+    EXPECT_FALSE(ltc::clean_pass_log_due(idle));
+    idle.held_us = 1000;
+    EXPECT_TRUE(ltc::clean_pass_log_due(idle));
+    idle.held_us = 100000;      // every hold of 100 ms or more
+    EXPECT_TRUE(ltc::clean_pass_log_due(idle));
+    ltc::CleanPassTiming quick_drop;   // removed something: always
+    quick_drop.removed = 1;
+    EXPECT_TRUE(ltc::clean_pass_log_due(quick_drop));
+}
+
+namespace {
+
+// Records every Boost.Log line for inspection (LOG_INFO is BOOST_LOG_TRIVIAL).
+class PassLogCapture
+{
+public:
+    PassLogCapture() : stream_(boost::make_shared<std::ostringstream>())
+    {
+        auto backend = boost::make_shared<boost::log::sinks::text_ostream_backend>();
+        backend->add_stream(stream_);
+        backend->auto_flush(true);
+        sink_ = boost::make_shared<sink_t>(backend);
+        boost::log::core::get()->add_sink(sink_);
+    }
+    ~PassLogCapture() { boost::log::core::get()->remove_sink(sink_); }
+    std::string str() const { return stream_->str(); }
+
+private:
+    using sink_t = boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>;
+    boost::shared_ptr<std::ostringstream> stream_;
+    boost::shared_ptr<sink_t> sink_;
+};
+
+}  // namespace
+
+// A real pass that drains (300 shares, threshold 2*50+10: 191 layers) logs
+// exactly one [CLEAN] pass line, with every field.
+TEST_F(LtcCleanDropTails, RealCleanPassLogsOnePassLine)
+{
+    const bool was = boost::log::core::get()->get_logging_enabled();
+    boost::log::core::get()->set_logging_enabled(true);
+    std::string logged;
+    {
+        boost::asio::io_context ioc;
+        auto node = std::make_unique<CleanNode>(ioc);
+        build_node_trunk(*node, 300);
+        node->m_coin_params.chain_length = 50;
+        PassLogCapture cap;
+        PassTiming timing;
+        ASSERT_TRUE(run_clean_pass(*node, ioc, timing));
+        logged = cap.str();
+    }
+    boost::log::core::get()->set_logging_enabled(was);
+    const std::regex line(R"(\[CLEAN\] pass held_ms=[0-9]+\.[0-9] drop_ms=[0-9]+\.[0-9] total_ms=[0-9]+\.[0-9] removed=191 layers=191 cache=on)");
+    size_t lines = 0, matching = 0;
+    std::istringstream in(logged);
+    for (std::string l; std::getline(in, l);) {
+        if (l.find("[CLEAN] pass ") == std::string::npos)
+            continue;
+        ++lines;
+        matching += std::regex_search(l, line) ? 1 : 0;
+    }
+    EXPECT_EQ(lines, 1u) << logged.substr(0, 4000);
+    EXPECT_EQ(matching, 1u) << "the line must carry every field";
+}
+
+// The guard that times the hold is the first thing in the clean pass's lock
+// scope (destroyed just before the lock, on every exit), and the line is
+// written after the lock is released, only when due.
+TEST_F(LtcCleanDropTails, PassLineIsTimedAroundTheCleanPassLock)
+{
+    std::ifstream in(std::string(C2POOL_IMPL_DIR) + "/ltc/node.cpp");
+    ASSERT_TRUE(in.good());
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+    const size_t clean = src.find("void NodeImpl::clean_tracker()");
+    ASSERT_NE(clean, std::string::npos);
+    const size_t lock = src.find("std::unique_lock lock(m_tracker_mutex);  // exclusive\n", clean);
+    ASSERT_NE(lock, std::string::npos);
+    const size_t timer = src.find("} hold_timer{pass_timing, pass_held, std::chrono::steady_clock::now(), pass_t0};", lock);
+    ASSERT_NE(timer, std::string::npos);
+    EXPECT_EQ(src.find("best_at_entry = best_at_exit", lock) > timer, true)
+        << "the timing guard comes right after the lock, before Step 1";
+    const size_t drop = src.find("ltc::drop_tails(m_tracker, m_supersede_hint, CL);", timer);
+    ASSERT_NE(drop, std::string::npos);
+    const size_t catch_all = src.find("LOG_ERROR << \"[CLEAN] failed on compute thread: unknown error\";", drop);
+    ASSERT_NE(catch_all, std::string::npos);
+    const size_t log = src.find("if (pass_held && ltc::clean_pass_log_due(pass_timing))", catch_all);
+    ASSERT_NE(log, std::string::npos) << "the line is written after the lock scope";
+    EXPECT_NE(src.find("LOG_INFO << ltc::clean_pass_log_line(pass_timing);", log), std::string::npos);
 }
 
 // ── The recorded store ───────────────────────────────────────────────────────

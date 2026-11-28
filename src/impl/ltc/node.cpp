@@ -3460,8 +3460,27 @@ void NodeImpl::clean_tracker()
       // set), captured from Step-1's think() result and consulted by Step-2's head
       // GC so a head we are ACTIVELY downloading toward is not purged mid-catch-up.
       std::set<uint256> desired_parents;
+      // [CLEAN] pass line: the exclusive hold, timed with steady_clock from the
+      // lock taken to its release (the guard below is destroyed just before
+      // the lock is, on every exit from the scope).
+      ltc::CleanPassTiming pass_timing;
+      bool pass_held = false;
+      const auto pass_t0 = std::chrono::steady_clock::now();
       try {
         std::unique_lock lock(m_tracker_mutex);  // exclusive
+        struct HoldTimer {
+            ltc::CleanPassTiming& t;
+            bool& held;
+            std::chrono::steady_clock::time_point t0;
+            std::chrono::steady_clock::time_point pass_t0;
+            ~HoldTimer()
+            {
+                const auto now = std::chrono::steady_clock::now();
+                t.held_us = std::chrono::duration_cast<std::chrono::microseconds>(now - t0).count();
+                t.total_us = std::chrono::duration_cast<std::chrono::microseconds>(now - pass_t0).count();
+                held = true;
+            }
+        } hold_timer{pass_timing, pass_held, std::chrono::steady_clock::now(), pass_t0};
         best_at_entry = best_at_exit = m_best_share_hash;
 
         // Step 1: Run think() inline (already holds the lock)
@@ -3632,8 +3651,14 @@ void NodeImpl::clean_tracker()
     // Each head's height is walked once per pass and then kept exact across
     // the removals (clean_drop_tails.hpp): same decisions, same order.
     {
+        const auto drop_t0 = std::chrono::steady_clock::now();
         const ltc::DropTailsResult dropped =
             ltc::drop_tails(m_tracker, m_supersede_hint, CL);
+        pass_timing.drop_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - drop_t0).count();
+        pass_timing.removed = dropped.total_dropped;
+        pass_timing.layers = dropped.layers;
+        pass_timing.cached = dropped.cached;
         if (dropped.cache_mismatch)
             LOG_ERROR << "[clean-drop-tails] head-height cache disagreed with a fresh walk:"
                       << " cache disabled, every later pass walks each height";
@@ -3741,6 +3766,10 @@ void NodeImpl::clean_tracker()
       } catch (...) {
         LOG_ERROR << "[CLEAN] failed on compute thread: unknown error";
       }
+      // Lock released. One line per pass that held it: removed something, or
+      // held it 1 ms or more (every hold of 100 ms or more is logged).
+      if (pass_held && ltc::clean_pass_log_due(pass_timing))
+          LOG_INFO << ltc::clean_pass_log_line(pass_timing);
       // Entry against exit: a best share Step 1 moved and Step 4 kept is a
       // change (it was compared Step 4 against Step 1 and never notified),
       // and one a later step threw past still is. Notified once, below.

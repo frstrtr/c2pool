@@ -49,6 +49,7 @@
 #include <cstdio>
 #include <functional>
 #include <map>
+#include <string>
 #include <vector>
 
 #include <core/log.hpp>
@@ -68,8 +69,41 @@ struct DropTailsResult
 {
     int total_dropped{0};
     int layers{0};               // iterations that found something to remove
+    bool cached{false};          // the call used the head-height cache
     bool cache_mismatch{false};  // the end-of-call height check failed (cache now off)
 };
+
+/// One clean_tracker pass, timed on the compute thread with steady_clock: the
+/// pass takes the exclusive tracker lock once (Steps 1-5), so its one hold is
+/// both the longest and the total exclusive hold of the pass.
+struct CleanPassTiming
+{
+    int64_t held_us{0};    // the exclusive tracker lock held (lock taken -> released)
+    int64_t drop_us{0};    // the drop-tails step inside that hold
+    int64_t total_us{0};   // the pass on the compute thread: lock wait + hold
+    int removed{0};
+    int layers{0};
+    bool cached{false};
+};
+
+/// The [CLEAN] pass line is due when the pass removed something or held the
+/// lock for 1 ms or more (so every hold of 100 ms or more is logged, and an
+/// idle 5 s cadence of sub-millisecond passes is not).
+inline bool clean_pass_log_due(const CleanPassTiming& t)
+{
+    return t.removed > 0 || t.held_us >= 1000;
+}
+
+/// `[CLEAN] pass held_ms=... drop_ms=... total_ms=... removed=N layers=L cache=on|off`
+inline std::string clean_pass_log_line(const CleanPassTiming& t)
+{
+    char buf[200];
+    std::snprintf(buf, sizeof buf,
+                  "[CLEAN] pass held_ms=%.1f drop_ms=%.1f total_ms=%.1f removed=%d layers=%d cache=%s",
+                  t.held_us / 1000.0, t.drop_us / 1000.0, t.total_us / 1000.0,
+                  t.removed, t.layers, t.cached ? "on" : "off");
+    return buf;
+}
 
 /// The drop-tails step. `Tracker` is ltc::ShareTracker (chain, verified);
 /// `Hint` is ltc::SupersedeHint. `diag_log` keeps the node's per-removal stderr
@@ -85,6 +119,7 @@ DropTailsResult drop_tails(Tracker& tracker, const Hint& supersede_hint, int32_t
     DropTailsResult res;
     std::map<uint256, int32_t> head_height;   // see the header comment
     const bool use_cache = !drop_tails_height_cache_disabled().load(std::memory_order_relaxed);
+    res.cached = use_cache;
     auto height_of = [&](const uint256& head) -> int32_t {
         if (!use_cache)
             return tracker.chain.get_height(head);
