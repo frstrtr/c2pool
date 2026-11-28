@@ -28,6 +28,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <ctime>
@@ -214,6 +215,54 @@ inline bool underfill_guard_trips(uint64_t selected_bytes,
     return near_empty && has_backlog;
 }
 
+// ── Block time (Bitcoin Core UpdateTime / BIP113) ───────────────────────────
+// A block is invalid ("time-too-old") unless nTime > MedianTimePast(prev).
+// Core's miner never stamps raw wall clock: UpdateTime() sets
+// nTime = max(MTP(prev) + 1, now), and GBT reports mintime = MTP(prev) + 1.
+// Stamping wall clock breaks whenever the chain's MTP runs ahead of local
+// time -- a testnet3 min-diff storm, a skewed peer clock, a fresh regtest
+// chain seeded in the future. The G3b testnet3 block found 2026-10-25 was
+// rejected exactly this way (MTP ~98 min ahead of wall clock).
+inline constexpr uint32_t MEDIAN_TIME_SPAN = 11;
+
+/// Core CBlockIndex::GetMedianTimePast: median nTime over `tip` and up to
+/// MEDIAN_TIME_SPAN-1 ancestors, walked by prev-hash (not height, so a
+/// concurrent reorg cannot splice in another branch). A short chain uses
+/// whatever ancestors exist; the walk stops at a null prev (genesis or a
+/// fast-start checkpoint root). Returns sorted[n/2], matching Core.
+inline uint32_t median_time_past(const HeaderChain& chain, const IndexEntry& tip)
+{
+    std::vector<uint32_t> times;
+    times.reserve(MEDIAN_TIME_SPAN);
+    times.push_back(tip.header.m_timestamp);
+    uint256 prev = tip.header.m_previous_block;
+    while (times.size() < MEDIAN_TIME_SPAN && !prev.IsNull()) {
+        auto e = chain.get_header(prev);
+        if (!e) break;
+        times.push_back(e->header.m_timestamp);
+        prev = e->header.m_previous_block;
+    }
+    std::sort(times.begin(), times.end());
+    return times[times.size() / 2];
+}
+
+/// Core UpdateTime: the earliest valid time is MTP + 1; never go below it.
+inline uint32_t clamp_block_time(uint32_t now, uint32_t mtp)
+{
+    return std::max<uint32_t>(now, mtp + 1);
+}
+
+/// Re-stamp a cached template's curtime to "now" without undercutting the
+/// template's own mintime (MTP + 1). Used by the stratum work source, which
+/// refreshes curtime on every job instead of reusing the build-time value.
+inline uint32_t restamp_curtime(const nlohmann::json& tmpl, uint32_t now)
+{
+    uint32_t mintime = 0;
+    if (auto it = tmpl.find("mintime"); it != tmpl.end() && it->is_number())
+        mintime = static_cast<uint32_t>(it->get<int64_t>());
+    return std::max<uint32_t>(now, mintime);
+}
+
 // ─── TemplateBuilder ─────────────────────────────────────────────────────────
 
 /// Builds an LTC block template from a validated HeaderChain and Mempool.
@@ -227,7 +276,7 @@ inline bool underfill_guard_trips(uint64_t selected_bytes,
 ///   previousblockhash — SHA256d hex of tip header (big-endian display)
 ///   bits              — compact target for next block as 8-char hex
 ///   height            — next block height
-///   curtime           — current wall-clock timestamp
+///   curtime           — max(wall clock, MTP + 1)  (Core UpdateTime)
 ///   coinbasevalue     — miner subsidy in satoshis (no fees — no UTXO set)
 ///   transactions      — array with "data" (hex) and "txid" per tx
 ///   rules             — ["segwit"]
@@ -235,7 +284,7 @@ inline bool underfill_guard_trips(uint64_t selected_bytes,
 ///   sigoplimit        — 80000
 ///   sizelimit         — 4000000
 ///   weightlimit       — 4000000
-///   mintime           — tip.timestamp + 1
+///   mintime           — MTP(tip) + 1  (BIP113 lower bound)
 class TemplateBuilder {
 public:
     // BIP9 base version — all modern blocks use 0x20000000 as the base with
@@ -268,7 +317,9 @@ public:
 
         const IndexEntry& tip       = *tip_opt;
         uint32_t          next_h    = tip.height + 1;
-        uint32_t          now_ts    = static_cast<uint32_t>(std::time(nullptr));
+        const uint32_t    mtp       = median_time_past(chain, tip);
+        uint32_t          now_ts    = clamp_block_time(
+            static_cast<uint32_t>(std::time(nullptr)), mtp);
 
         // ── Next difficulty ────────────────────────────────────────────────
         auto get_ancestor = [&](uint32_t h) -> std::optional<IndexEntry> {
@@ -384,7 +435,7 @@ public:
         data["sigoplimit"]        = 80000;
         data["sizelimit"]         = 4'000'000;
         data["weightlimit"]       = 4'000'000;
-        data["mintime"]           = static_cast<int64_t>(tip.header.m_timestamp + 1);
+        data["mintime"]           = static_cast<int64_t>(mtp) + 1;
 
         LOG_INFO << "[EMB-BTC] TemplateBuilder: height=" << next_h
                  << " version=0x" << std::hex << block_version << std::dec
@@ -395,6 +446,7 @@ public:
                  << " txs=" << data["transactions"].size()
                  << " tip_ts=" << tip.header.m_timestamp
                  << " now=" << now_ts
+                 << " mtp=" << mtp
                  << " synced=" << chain.is_synced();
         auto t1 = std::chrono::steady_clock::now();
         auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
