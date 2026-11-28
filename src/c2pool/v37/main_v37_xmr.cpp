@@ -2425,13 +2425,6 @@ int main(int argc, char** argv) {
                 if (!removed) removed = a;
                 continue;
             }
-            // The flags are matched by two consecutive else-if chains: one chain
-            // over all of them nests deeper than MSVC allows (C1061, "blocks
-            // nested too deeply"). The first ends in `else flag_matched = false;`
-            // and a match there is recorded and moves on to the next argument,
-            // so every flag is still tried in order and only the second chain's
-            // final else rejects an argument no flag takes.
-            bool flag_matched = true;
             if (a == "--version" || a == "-V") {
                 cs::print_version();
                 return 0;
@@ -2542,13 +2535,7 @@ int main(int argc, char** argv) {
             }
             else if (a == "--follow-only") cfg.follow_only = true;
             else if (a == "--native-txpool-warm-timeout-ms") cfg.native_txpool_warm_timeout_ms = u64();
-            else flag_matched = false;
-            if (flag_matched) {
-                record();
-                continue;
-            }
-            // Second chain (see the note above the first).
-            if (a == "--relay-listen") cfg.relay_listen = value();
+            else if (a == "--relay-listen") cfg.relay_listen = value();
             else if (a == "--relay-peer") cfg.relay_peers.push_back(value());
             else if (a == "--no-relay-bootstrap") g_no_relay_bootstrap = true;
             else if (a == "--relay-max-inbound" || a == "--relay-max-peers") g_relay_max_inbound = static_cast<std::size_t>(u64());
