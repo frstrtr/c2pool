@@ -466,6 +466,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # ltc_stratum_merkle_fold_test.cpp: core compute_merkle_branches over the
     # embedded template's m_hashes folds back to the txid merkle root
     # [coinbase, tx1..txN], N = 0..9 and 33. Same folding rule.
+    #
+    # clean_drop_tails_test.cpp: clean_tracker's drop-tails step with a
+    # per-pass head-height cache (clean_drop_tails.hpp, X1 A3): master's loop
+    # verbatim against it over random forests, the safety net, the REAL
+    # NodeImpl::clean_tracker pass, and (C2POOL_REPLAY_STORE_LTC set) a
+    # recorded store. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -478,6 +484,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         build_stops_test.cpp
         chain_topology_endpoints_kat_test.cpp
         chain_walk_window_test.cpp
+        clean_drop_tails_test.cpp
         cmpct_litecoind_vector_test.cpp
         cmpct_v3_mweb_state_test.cpp
         compact_block_merkle_test.cpp

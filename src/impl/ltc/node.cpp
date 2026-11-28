@@ -6,6 +6,7 @@
 #include "share_tx_refs.hpp"
 #include "persisted_reload.hpp"
 #include "think_gate.hpp"
+#include "clean_drop_tails.hpp"
 
 #include <core/reloaded_block_flag.hpp>   // core::restore_block_flag (a reloaded share keeps its block flag)
 #include <core/common.hpp>
@@ -3459,8 +3460,27 @@ void NodeImpl::clean_tracker()
       // set), captured from Step-1's think() result and consulted by Step-2's head
       // GC so a head we are ACTIVELY downloading toward is not purged mid-catch-up.
       std::set<uint256> desired_parents;
+      // [CLEAN] pass line: the exclusive hold, timed with steady_clock from the
+      // lock taken to its release (the guard below is destroyed just before
+      // the lock is, on every exit from the scope).
+      ltc::CleanPassTiming pass_timing;
+      bool pass_held = false;
+      const auto pass_t0 = std::chrono::steady_clock::now();
       try {
         std::unique_lock lock(m_tracker_mutex);  // exclusive
+        struct HoldTimer {
+            ltc::CleanPassTiming& t;
+            bool& held;
+            std::chrono::steady_clock::time_point t0;
+            std::chrono::steady_clock::time_point pass_t0;
+            ~HoldTimer()
+            {
+                const auto now = std::chrono::steady_clock::now();
+                t.held_us = std::chrono::duration_cast<std::chrono::microseconds>(now - t0).count();
+                t.total_us = std::chrono::duration_cast<std::chrono::microseconds>(now - pass_t0).count();
+                held = true;
+            }
+        } hold_timer{pass_timing, pass_held, std::chrono::steady_clock::now(), pass_t0};
         best_at_entry = best_at_exit = m_best_share_hash;
 
         // Step 1: Run think() inline (already holds the lock)
@@ -3628,93 +3648,25 @@ void NodeImpl::clean_tracker()
     // C++ implementation of the p2pool tail-dropping step.
     // p2pool has NO best-chain protection — the 2*CHAIN_LENGTH+10 threshold
     // ensures only shares far beyond the PPLNS window are removed.
+    // Each head's height is walked once per pass and then kept exact across
+    // the removals (clean_drop_tails.hpp): same decisions, same order.
     {
-        int total_dropped = 0;
-        for (int iter = 0; iter < 1000; ++iter)
-        {
-            std::vector<uint256> to_remove;
-            auto tails_copy = m_tracker.chain.get_tails();
-            for (auto& [tail_hash, head_hashes] : tails_copy)
-            {
-                // Restart-reorg: never drop the tail of the converging challenger
-                // segment. An unrooted challenger needs its FULL ~2*CL depth to
-                // reach CHAIN_LENGTH verified shares; trimming its bottom mid-
-                // verification silently restarts convergence (looks like the
-                // original stickiness). The exemption lifts once it verifies to
-                // CHAIN_LENGTH and the hint deactivates, when normal drop-tails
-                // resumes. Matched by segment id (the shared missing-parent).
-                if (m_supersede_hint.active) {
-                    try {
-                        if (m_tracker.chain.contains(tail_hash) &&
-                            m_tracker.chain.get_last(tail_hash) == m_supersede_hint.target_segment_last)
-                            continue;
-                    } catch (...) {}
-                }
-
-                int32_t min_height = 0;  // default 0 → skip if no valid heads
-                for (auto& hh : head_hashes) {
-                    if (!m_tracker.chain.contains(hh)) continue;
-                    auto h = m_tracker.chain.get_height(hh);
-                    if (min_height == 0 || h < min_height)
-                        min_height = h;
-                }
-                if (min_height < 2 * CL + 10) continue;
-
-                if (iter == 0) {
-                    LOG_WARNING << "[drop-tails-QUALIFY] tail=" << tail_hash.GetHex().substr(0,16)
-                                << " min_height=" << min_height << " threshold=" << (2*CL+10)
-                                << " n_heads=" << head_hashes.size()
-                                << " chain_size=" << m_tracker.chain.size();
-                }
-
-                // p2pool node.py:386: to_remove.update(tracker.reverse.get(tail, set()))
-                auto& rev = m_tracker.chain.get_reverse();
-                auto rev_it = rev.find(tail_hash);
-                if (rev_it != rev.end()) {
-                    for (const auto& child : rev_it->second)
-                        to_remove.push_back(child);
-                }
-            }
-
-            if (to_remove.empty()) break;
-
-            // p2pool node.py:392-398
-            size_t _drop_idx = 0;
-            for (const auto& aftertail : to_remove)
-            {
-                try {
-                    // DIAG: contabo 2026-04-21 froze 40s inside
-                    // unordered_map::contains() on an aftertail at bucket 2332.
-                    // If we spin here again this is the last line flushed —
-                    // gives us the iter index, which aftertail triggered it,
-                    // and the queue size to correlate with the freeze.
-                    std::fprintf(stderr,
-                        "[drop-tails-PRE] iter=%d drop_idx=%zu/%zu aftertail=%.16s "
-                        "chain_size=%zu\n",
-                        iter, _drop_idx, to_remove.size(),
-                        aftertail.GetHex().c_str(),
-                        m_tracker.chain.size());
-                    std::fflush(stderr);
-                    ++_drop_idx;
-
-                    if (!m_tracker.chain.contains(aftertail)) continue;
-                    // p2pool node.py:393: if items[aftertail].previous_hash not in tails: continue
-                    auto* idx = m_tracker.chain.get_index(aftertail);
-                    if (!idx) continue;
-                    if (!m_tracker.chain.get_tails().count(idx->tail)) {
-                        continue;
-                    }
-                    if (m_tracker.verified.contains(aftertail))
-                        m_tracker.verified.remove(aftertail, /*owns_data=*/false);
-                    m_tracker.chain.remove(aftertail);
-                    ++total_dropped;
-                } catch (...) {}
-            }
-        }
-        if (total_dropped > 0)
-            LOG_INFO << "[clean-drop-tails] dropped " << total_dropped << " shares"
+        const auto drop_t0 = std::chrono::steady_clock::now();
+        const ltc::DropTailsResult dropped =
+            ltc::drop_tails(m_tracker, m_supersede_hint, CL);
+        pass_timing.drop_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - drop_t0).count();
+        pass_timing.removed = dropped.total_dropped;
+        pass_timing.layers = dropped.layers;
+        pass_timing.cached = dropped.cached;
+        if (dropped.cache_mismatch)
+            LOG_ERROR << "[clean-drop-tails] head-height cache disagreed with a fresh walk:"
+                      << " cache disabled, every later pass walks each height";
+        if (dropped.total_dropped > 0)
+            LOG_INFO << "[clean-drop-tails] dropped " << dropped.total_dropped << " shares"
                      << " chain_size=" << m_tracker.chain.size()
-                     << " heads=" << m_tracker.chain.get_heads().size();
+                     << " heads=" << m_tracker.chain.get_heads().size()
+                     << " layers=" << dropped.layers;
     }
 
     // Step 4: re-score after pruning (inline, already holding lock)
@@ -3814,6 +3766,10 @@ void NodeImpl::clean_tracker()
       } catch (...) {
         LOG_ERROR << "[CLEAN] failed on compute thread: unknown error";
       }
+      // Lock released. One line per pass that held it: removed something, or
+      // held it 1 ms or more (every hold of 100 ms or more is logged).
+      if (pass_held && ltc::clean_pass_log_due(pass_timing))
+          LOG_INFO << ltc::clean_pass_log_line(pass_timing);
       // Entry against exit: a best share Step 1 moved and Step 4 kept is a
       // change (it was compared Step 4 against Step 1 and never notified),
       // and one a later step threw past still is. Notified once, below.
