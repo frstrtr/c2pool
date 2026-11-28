@@ -13,7 +13,10 @@
 //                    address-string hex as the miner;
 //   submit callback: ltc::dashboard::row_from_submit over the stratum
 //                    submit's context, labelled this_node -- never the
-//                    sharechain best share as the block's share.
+//                    sharechain best share as the block's share;
+//   RPC mode       : a parent verifier is wired over litecoind
+//                    (ltc::coin::found_block::rpc_parent_verdict), so rows
+//                    do not stay pending forever (G3b L3, 2026-11-24).
 //
 // The 2026-11-12 find (LTC 3211872) showed every one of these on master.
 // ---------------------------------------------------------------------------
@@ -118,4 +121,15 @@ TEST(LtcFoundBlockWiring, SubmitCallbackRecordsTheMintedShareAsThisNode)
         << "the sharechain best share is the winner's PARENT, not the block's share";
     EXPECT_NE(cb.find("BlockAuthorship::this_node"), std::string::npos)
         << "the node that submitted the block found it";
+}
+
+TEST(LtcFoundBlockWiring, RpcModeWiresTheParentVerdict)
+{
+    const auto src = main_ltc();
+    const auto rpc_branch = section(src, "if (!embedded_ltc) {\n                coin_iface", "} else if (embedded_broadcaster");
+    ASSERT_FALSE(rpc_branch.empty()) << "the RPC-mode coin_iface branch is not in main_ltc.cpp";
+    EXPECT_NE(rpc_branch.find("set_block_verify_fn("), std::string::npos)
+        << "RPC mode must wire a parent block verifier: without one every row stays pending";
+    EXPECT_NE(rpc_branch.find("ltc::coin::found_block::rpc_parent_verdict("), std::string::npos)
+        << "the RPC-mode verdict is the embedded rule over litecoind (rpc_parent_verdict)";
 }

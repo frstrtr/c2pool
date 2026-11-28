@@ -218,6 +218,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # tip is not a confirmation, a best-chain block confirms once 6 deep.
     # Same folding rule.
     #
+    # found_block_rpc_view_test.cpp: the same verdict on an LTC parent block
+    # in RPC mode (--no-embedded-ltc), over litecoind's best chain
+    # (rpc_parent_verdict: getblockcount/getblockhash/getblockheader): a
+    # side-branch or unseen block is orphaned 6 deep, a best-chain block
+    # confirms 6 deep, RPC errors and a daemon that is down leave it pending.
+    # Same folding rule.
+    #
     # dashboard_found_block_test.cpp: one LTC find -> the same /recent_blocks
     # row on the finder (ltc::dashboard::row_from_submit, fed by the stratum
     # submit that minted the share) and on every peer (row_from_share, off the
@@ -503,6 +510,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
         found_block_peer_txid_test.cpp
+        found_block_rpc_view_test.cpp
         found_block_verify_test.cpp
         found_block_wiring_test.cpp
         head_retention_test.cpp

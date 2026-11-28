@@ -293,6 +293,7 @@ static void segfault_handler(int sig) {
 #include <impl/ltc/coin/utxo_order.hpp>
 #include <impl/ltc/coin/utxo_view_stats.hpp>
 #include <impl/ltc/coin/found_block_verify.hpp>
+#include <impl/ltc/coin/found_block_rpc_view.hpp>
 #include <impl/ltc/coin/header_sync.hpp>
 #include <impl/ltc/coin/cold_start_tick.hpp>
 // Phase 5: Embedded DOGE node for daemonless merged mining
@@ -3778,6 +3779,29 @@ int main(int argc, char* argv[]) {
                 coin_iface = std::make_unique<ltc::coin::CoinNode>(
                     /*embedded*/nullptr, /*rpc*/node_rpc.get());
                 web_server.set_coin_node(coin_iface.get());
+
+                // Block verification in RPC mode: the same verdict as the
+                // embedded node's (parent_verdict), over litecoind's best
+                // chain. Without it every parent row on /recent_blocks stayed
+                // pending for the life of the node.
+                if (node_rpc) {
+                    auto* mi = web_server.get_mining_interface();
+                    mi->set_block_verify_fn(
+                        [rpc = node_rpc.get(), mi](const std::string& hash_hex) -> int {
+                            uint256 h;
+                            h.SetHex(hash_hex);
+                            ltc::coin::found_block::RpcLookups calls;
+                            calls.getblockcount = [rpc]() { return rpc->getblockcount(); };
+                            calls.getblockhash = [rpc](uint32_t height) { return rpc->getblockhash(height); };
+                            calls.getblockheader = [rpc](const uint256& hh) { return rpc->getblockheader(hh); };
+                            try {
+                                return ltc::coin::found_block::rpc_parent_verdict(
+                                    std::move(calls), h, found_block_height(*mi, hash_hex));
+                            } catch (...) {
+                                return 0;  // cannot tell: pending
+                            }
+                        });
+                }
             } else if (embedded_broadcaster && embedded_chain) {
                 // Wire embedded node + header-sync callback (now that web_server is alive)
                 coin_iface = std::make_unique<ltc::coin::CoinNode>(
