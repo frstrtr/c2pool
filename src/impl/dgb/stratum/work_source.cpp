@@ -32,6 +32,7 @@
 #include <impl/dgb/coin/aux_doge_mm_commitment.hpp>  // AUX_MM_COMMITMENT_SIZE (44-byte MM blob)
 #include <impl/dgb/coin/won_block_serialize.hpp>   // serialize_won_block SSOT (won-block framing)
 #include <impl/dgb/coin/header_sample_build.hpp>// compact_to_target (compact bits -> u256)
+#include <impl/dgb/coin/u256_core_bridge.hpp>   // to_core_uint256 (DC merged-submit parent_hash)
 
 #include <core/log.hpp>
 #include <core/hash.hpp>                        // Hash (sha256d) for coinbase txid + merkle pair
@@ -236,12 +237,16 @@ uint64_t DGBWorkSource::get_work_generation() const
     return work_generation_.load(std::memory_order_relaxed);
 }
 
-bool DGBWorkSource::has_merged_chain(uint32_t /*chain_id*/) const
+bool DGBWorkSource::has_merged_chain(uint32_t chain_id) const
 {
-    // DGB V36 default build: standalone Scrypt parent, no merged mining.
-    // The DGB-as-DOGE-parent dual-parent path (-DAUX_DOGE=ON) is a V36
-    // STRETCH, parked behind the shared DOGE-aux settle — not wired here.
-    return false;
+    // DGB-as-DOGE-parent (phase DC): consult the merged-mining manager main_dgb
+    // set when a --merged DOGE spec stood up the aux backend. Mirrors the BTC->NMC
+    // parent lane (btc work_source.cpp:204). No --merged => no manager => false,
+    // byte-identical to standalone Scrypt DGB. Stratum uses this to keep a
+    // miner's DOGE login address and to accept a DOGE-primary username under the
+    // #961 B1 payout check; while it was hard-false both were dropped/rejected
+    // even with the manager live.
+    return mm_manager_ != nullptr && mm_manager_->has_chain(chain_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -810,16 +815,10 @@ nlohmann::json DGBWorkSource::mining_submit(
                     HexStr(Span<const uint8_t>(header.data(), 80));
                 std::string parent_coinbase_hex =
                     HexStr(Span<const uint8_t>(coinbase.data(), coinbase.size()));
-                // dgb::coin::u256 -> core uint256: both hold a 32-byte
-                // little-endian image; serialize pow_hash's limbs LE and read
-                // them back through uint256's LE-vector ctor. The scrypt PoW hash
-                // IS the parent block hash the aux-target gate compares.
-                std::vector<unsigned char> ph_le(32, 0);
-                for (int i = 0; i < 4; ++i)
-                    for (int j = 0; j < 8; ++j)
-                        ph_le[i * 8 + j] =
-                            static_cast<unsigned char>((pow_hash.limb[i] >> (8 * j)) & 0xff);
-                uint256 parent_hash(ph_le);
+                // The scrypt PoW hash IS the parent hash the aux-target gate
+                // compares; bridge it through the KAT-pinned SSOT
+                // (coin/u256_core_bridge.hpp).
+                const uint256 parent_hash = dgb::coin::to_core_uint256(pow_hash);
                 mm_manager_->try_submit_merged_blocks(
                     parent_header_hex, parent_coinbase_hex,
                     job->merkle_branches, 0, parent_hash);
