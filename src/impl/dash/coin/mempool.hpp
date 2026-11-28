@@ -1714,7 +1714,74 @@ private:
                                     ? std::to_string(stored.fee) : "?")
                      << (evicted > 0 ? " evict=" + std::to_string(evicted) : "");
         }
+        // A new tx can be the missing parent of pooled children (a CPFP
+        // chain, a mixing round whose DSTX arrived before its input tx): prove
+        // them now instead of at the next block connect, by which time dashd
+        // has usually mined them.
+        reprove_children_locked(txid, utxo);
         return true;
+    }
+
+    /// Prove the fee of an entry the template selector cannot use yet
+    /// (fee_fold_proven == false) by running compute_fee_locked, the proof
+    /// the selector trusts, again. Two states qualify:
+    ///   * fee unknown: priced in place, then indexed (the pre-existing
+    ///     recompute behaviour);
+    ///   * FORCED (fee_known without fee_fold_proven: a DSTX admitted at fee 0
+    ///     because an input could not be priced): proved on a COPY, so a
+    ///     failed proof leaves the forced relay state untouched. Only a
+    ///     successful proof replaces fee/fee_known/fee_fold_proven, and the
+    ///     feerate index is re-keyed under the proven modified fee.
+    /// Returns true when the entry became fold-proven.
+    bool reprove_locked(const uint256& txid, MempoolEntry& entry,
+                        ::core::coin::UTXOViewCache* utxo)
+    {
+        if (entry.fee_fold_proven) return false;
+        if (!entry.fee_known) {
+            if (!compute_fee_locked(entry, utxo)) return false;
+            m_feerate_index.insert(FeeKey{entry.modified_fee(), entry.base_size, txid});
+            return entry.fee_fold_proven;
+        }
+        MempoolEntry proof = entry;
+        if (!compute_fee_locked(proof, utxo) || !proof.fee_fold_proven) return false;
+        m_feerate_index.erase(FeeKey{entry.modified_fee(), entry.base_size, txid});
+        entry.fee             = proof.fee;
+        entry.fee_known       = true;
+        entry.fee_fold_proven = true;
+        m_feerate_index.insert(FeeKey{entry.modified_fee(), entry.base_size, txid});
+        return true;
+    }
+
+    /// Re-prove the pooled entries that spend `parent`'s outputs, and their
+    /// descendants in turn (a proven child can unlock a grandchild). Bounded.
+    void reprove_children_locked(const uint256& parent,
+                                 ::core::coin::UTXOViewCache* utxo)
+    {
+        static constexpr size_t kMaxReprove = 1000;
+        std::vector<uint256> work{parent};
+        size_t proved = 0, visits = 0;
+        while (!work.empty() && visits < kMaxReprove) {
+            const uint256 p = work.back();
+            work.pop_back();
+            auto pit = m_pool.find(p);
+            if (pit == m_pool.end()) continue;
+            const uint32_t n_out = static_cast<uint32_t>(pit->second.tx.vout.size());
+            for (uint32_t i = 0; i < n_out && visits < kMaxReprove; ++i) {
+                auto sit = m_spent_outputs.find(std::make_pair(p, i));
+                if (sit == m_spent_outputs.end()) continue;
+                ++visits;
+                auto cit = m_pool.find(sit->second);
+                if (cit == m_pool.end()) continue;
+                if (reprove_locked(cit->first, cit->second, utxo)) {
+                    ++proved;
+                    work.push_back(cit->first);
+                }
+            }
+        }
+        if (proved > 0) {
+            LOG_INFO << "[MEMPOOL] parent " << parent.GetHex().substr(0, 16)
+                     << " arrived: " << proved << " pooled descendant(s) now fold-proven";
+        }
     }
 
     /// W5-B: bounded mapDeltas (dashd CTxMemPool::mapDeltas). FIFO-evicted
@@ -2387,34 +2454,37 @@ public:
         m_total_bytes = 0;
     }
 
-    /// Re-attempt fee computation for entries marked fee_known=false.
-    /// Call after a block-connect: the block's outputs are now in
-    /// UTXO and may resolve previously-unknown inputs. Returns the
-    /// number of newly-resolved entries.
+    /// Re-attempt the fee proof for every entry the template selector
+    /// cannot use yet (fee_fold_proven == false; see reprove_locked):
+    /// fee-unknown entries AND forced-fee DSTX entries. Call after a
+    /// block-connect: the block's outputs are now in UTXO and may resolve
+    /// previously-unpriceable inputs. Returns the number of entries that
+    /// became fold-proven (resolved + promoted).
     int recompute_unknown_fees(::core::coin::UTXOViewCache* utxo)
     {
         if (!utxo) return 0;
         std::lock_guard<std::mutex> lock(m_mutex);
-        int resolved = 0, still_unknown = 0;
+        int resolved = 0, still_unknown = 0, promoted = 0, still_forced = 0;
         uint64_t resolved_fees = 0;
         for (auto& [txid, entry] : m_pool) {
-            if (entry.fee_known) continue;
-            if (compute_fee_locked(entry, utxo)) {
-                m_feerate_index.insert(
-                    FeeKey{entry.modified_fee(), entry.base_size, txid});
+            if (entry.fee_fold_proven) continue;
+            const bool forced = entry.fee_known;
+            if (reprove_locked(txid, entry, utxo)) {
                 resolved_fees += entry.fee;
-                ++resolved;
+                ++(forced ? promoted : resolved);
             } else {
-                ++still_unknown;
+                ++(forced ? still_forced : still_unknown);
             }
         }
-        if (resolved > 0 || still_unknown > 0) {
+        if (resolved > 0 || still_unknown > 0 || promoted > 0) {
             LOG_INFO << "[MEMPOOL] fee revalidation: resolved=" << resolved
                      << " still_unknown=" << still_unknown
+                     << " promoted_forced=" << promoted
+                     << " still_forced=" << still_forced
                      << " resolved_fees=" << resolved_fees << " sat"
                      << " pool_size=" << m_pool.size();
         }
-        return resolved;
+        return resolved + promoted;
     }
 
     // ── Queries ────────────────────────────────────────────────────
