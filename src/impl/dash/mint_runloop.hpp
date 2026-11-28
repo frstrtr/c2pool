@@ -144,12 +144,15 @@ inline uint256 desired_share_target(const core::CoinParams& params,
 // FrozenJobRegistry keeps every job served in the last 420 s, so a per-job copy
 // of a full template's hex would pin one copy of the same bodies per job (and
 // the registry counts a vector once per pointer). The memo keys on the template's
-// complete tx hash list (a txid is the hash of its body, so equal lists mean
-// equal bodies) and holds only weak_ptrs: it never extends a body vector's life
-// past the last frozen job that references it. Thread-safe (stratum sessions
-// build producer jobs concurrently). A template stored by the work source
-// brings its own encoded vector (DashWorkData::m_tx_hex_shared) and never
-// reaches the memo; see build_producer_job.
+// complete tx hash list, and on the bytes of every body whose txid does not
+// cover all of them: equal txids mean equal bodies except for a v24 version 2
+// asset unlock, whose re-signed instances share one txid
+// (bodies_match_under_equal_txids). It holds only weak_ptrs: it never extends
+// a body vector's life past the last frozen job that references it.
+// Thread-safe (stratum sessions build producer jobs concurrently). A template
+// stored by the work source brings its own encoded vector
+// (DashWorkData::m_tx_hex_shared) and never reaches the memo; see
+// build_producer_job.
 class TemplateBodiesMemo
 {
 public:
@@ -160,7 +163,8 @@ public:
         for (auto it = m_slots.begin(); it != m_slots.end();) {
             auto sp = it->bodies.lock();
             if (!sp) { it = m_slots.erase(it); continue; }
-            if (it->tx_hashes == wd.m_tx_hashes && sp->size() == wd.m_tx_data_hex.size())
+            if (it->tx_hashes == wd.m_tx_hashes
+                && dash::coin::bodies_match_under_equal_txids(*sp, wd.m_tx_data_hex))
                 return sp;
             ++it;
         }

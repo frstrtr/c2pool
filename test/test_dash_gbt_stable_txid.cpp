@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// The txids a dashd getblocktemplate reply is read with (coin/gbt_transactions.hpp),
-// on real Dash Core 24.0.2 testnet blocks that carry version 2 asset unlocks.
+// The txids a dashd getblocktemplate reply is read with (coin/gbt_transactions.hpp)
+// and the body memo of build_producer_job (mint_runloop.hpp), on real Dash Core
+// 24.0.2 testnet blocks that carry version 2 asset unlocks.
 //
 // A version 2 asset unlock's txid (CTransaction::GetHash) zeroes the quorum
 // signing info before hashing; the SHA256d of its whole bytes is its instance
@@ -21,7 +22,9 @@
 //   * a "hash" that disagrees with the bytes is reported, not silently used;
 //   * the embedded build's ids (dash_txid of the same txs) fold to the same
 //     body root as the reader's, so the embedded-vs-dashd tx-root xcheck
-//     compares like with like.
+//     compares like with like;
+//   * TemplateBodiesMemo never serves a re-signed unlock (same stable txid,
+//     other bytes) with its previous instance's bytes.
 
 #include <gtest/gtest.h>
 
@@ -31,6 +34,7 @@
 #include <impl/dash/coin/gbt_transactions.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
 #include <impl/dash/coinbase_builder.hpp>       // merkle_branches_raw, sha256d
+#include <impl/dash/mint_runloop.hpp>           // TemplateBodiesMemo
 
 #include <btclibs/util/strencodings.h>
 
@@ -40,6 +44,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstring>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -343,6 +348,86 @@ TEST(DashGbtStableTxid, EmbeddedAndDashdBodyFoldsAgreeOverTheSameTxs)
         EXPECT_EQ(dash::coin::compute_merkle_root(embedded_ids),
                   dash::coin::compute_merkle_root(dref.m_tx_hashes));
     }
+}
+
+// ── TemplateBodiesMemo: a re-signed unlock is never served with old bytes ────
+
+// Another instance of the same withdrawal: one byte of its quorum signature
+// changed. Same stable txid, other bytes, other instance hash.
+std::string resigned(const std::string& unlock_hex)
+{
+    std::string h = unlock_hex;
+    const size_t pos = h.size() - 2;             // the last byte of quorumSig
+    h[pos] = h[pos] == 'a' ? 'b' : 'a';
+    return h;
+}
+
+DashWorkData template_with(const std::vector<std::string>& bodies)
+{
+    DashWorkData w;
+    nlohmann::json txs = nlohmann::json::array();
+    for (const auto& b : bodies) txs.push_back(nlohmann::json{{"data", b}});
+    dash::coin::append_gbt_transactions(txs, w);
+    return w;
+}
+
+TEST(DashGbtStableTxid, ResignedUnlockSharesTheTxidNotTheBytes)
+{
+    const auto& rb = block_1599900();
+    const std::string a = rb.tx_hex[5];
+    const std::string b = resigned(a);
+    ASSERT_NE(a, b);
+    MutableTransaction ta, tb;
+    { PackStream s(ParseHex(a)); s >> ta; }
+    { PackStream s(ParseHex(b)); s >> tb; }
+    EXPECT_EQ(dash::coin::dash_txid(ta), dash::coin::dash_txid(tb));
+    EXPECT_NE(dash::coin::dash_instance_hash(ta), dash::coin::dash_instance_hash(tb));
+    EXPECT_TRUE(dash::coin::txid_may_omit_body_bytes(a));
+    EXPECT_FALSE(dash::coin::bodies_match_under_equal_txids({a}, {b}));
+    EXPECT_TRUE(dash::coin::bodies_match_under_equal_txids({a}, {a}));
+}
+
+TEST(DashGbtStableTxid, BodiesMemoNeverServesAResignedUnlockWithOldBytes)
+{
+    const auto& rb = block_1599900();
+    // A normal tx, then a v2 unlock: two templates over the same txids, the
+    // second carrying a re-signed instance of the unlock.
+    size_t normal = 0;
+    for (size_t i = 1; i < rb.block.m_txs.size(); ++i)
+        if (rb.block.m_txs[i].type == 0) { normal = i; break; }
+    ASSERT_NE(normal, 0u);
+    const std::string unlock = rb.tx_hex[5];
+    const DashWorkData first  = template_with({rb.tx_hex[normal], unlock});
+    const DashWorkData second = template_with({rb.tx_hex[normal], resigned(unlock)});
+    ASSERT_EQ(first.m_tx_hashes, second.m_tx_hashes);
+    ASSERT_NE(first.m_tx_data_hex, second.m_tx_data_hex);
+
+    dash::mint::TemplateBodiesMemo memo;
+    const auto sp1 = memo.get(first);               // kept alive: a frozen job holds it
+    ASSERT_TRUE(sp1);
+    EXPECT_EQ(*sp1, first.m_tx_data_hex);
+    const auto sp2 = memo.get(second);
+    ASSERT_TRUE(sp2);
+    EXPECT_EQ(*sp2, second.m_tx_data_hex) << "memo served the previous instance's bytes";
+    EXPECT_NE(sp1.get(), sp2.get());
+
+    // Equal bodies still share one vector, and each instance finds its own.
+    EXPECT_EQ(memo.get(first).get(), sp1.get());
+    EXPECT_EQ(memo.get(second).get(), sp2.get());
+}
+
+// The store's reuse rule shares the predicate: a re-signed unlock on the same
+// tip is a fresh vector, never the previous template's.
+TEST(DashGbtStableTxid, TemplateStoreReuseRejectsAResignedUnlock)
+{
+    const auto& rb = block_1599900();
+    DashWorkData prev = template_with({rb.tx_hex[5]});
+    prev.m_tx_hex_shared = dash::coin::TemplateTxHex::encode(prev.m_tx_data_hex, 1);
+    DashWorkData same = template_with({rb.tx_hex[5]});
+    DashWorkData next = template_with({resigned(rb.tx_hex[5])});
+    ASSERT_EQ(prev.m_tx_hashes, next.m_tx_hashes);
+    EXPECT_TRUE(dash::coin::template_tx_hex_reusable(prev, same));
+    EXPECT_FALSE(dash::coin::template_tx_hex_reusable(prev, next));
 }
 
 } // namespace
