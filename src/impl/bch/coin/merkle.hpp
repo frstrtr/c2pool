@@ -12,9 +12,10 @@
 // builder, M4) and the consumer side (p2p_node full-block accept, M5) compute
 // the root through one implementation rather than two divergent copies.
 //
-// p2pool-merged-v36 SURFACE: NONE. This is the consensus merkle of the parent
-// BCH block -- it never touches share hashing, the share merkle_link, the
-// coinbase commitment, or PPLNS. Source-only / build-inert.
+// p2pool-merged-v36 SURFACE: compute_merkle_root/merkle_hash_pair are the
+// consensus merkle of the parent BCH block. stratum_merkle_siblings is the
+// coinbase-left branch list the stratum job hands the miner; the same list
+// becomes the share's merkle_link (index 0).
 // ---------------------------------------------------------------------------
 
 #include <core/hash.hpp>
@@ -50,6 +51,42 @@ inline uint256 compute_merkle_root(std::vector<uint256> hashes) {
         hashes = std::move(next);
     }
     return hashes[0];
+}
+
+/// Coinbase-left merkle branch siblings for a stratum job.
+///
+/// `tx_hashes` is WorkData::m_hashes: the body txids [tx1..txN] in block
+/// (CTOR) order, with NO coinbase slot. The block's merkle tree has the
+/// coinbase as leaf 0, so a placeholder leaf is prepended before folding. At
+/// each level the sibling of the left-most (coinbase-descended) node is
+/// emitted. Contract:
+///     acc = coinbase_txid
+///     for b in siblings: acc = merkle_hash_pair(acc, b)
+///     acc == compute_merkle_root([coinbase_txid, tx1..txN])
+/// Returns {} for a coinbase-only template (the coinbase txid is the root).
+inline std::vector<uint256> stratum_merkle_siblings(const std::vector<uint256>& tx_hashes) {
+    if (tx_hashes.empty()) return {};
+
+    std::vector<uint256> level;
+    level.reserve(tx_hashes.size() + 1);
+    level.push_back(uint256::ZERO);  // coinbase placeholder (leaf 0)
+    level.insert(level.end(), tx_hashes.begin(), tx_hashes.end());
+
+    std::vector<uint256> siblings;
+    while (level.size() > 1) {
+        siblings.push_back(level[1]);  // right sibling of the coinbase node
+
+        std::vector<uint256> next;
+        next.reserve((level.size() + 2) / 2);
+        next.push_back(uint256::ZERO);  // placeholder for (coinbase, level[1])
+        for (size_t i = 2; i < level.size(); i += 2) {
+            const uint256& l = level[i];
+            const uint256& r = (i + 1 < level.size()) ? level[i + 1] : level[i];
+            next.push_back(merkle_hash_pair(l, r));
+        }
+        level = std::move(next);
+    }
+    return siblings;
 }
 
 } // namespace coin

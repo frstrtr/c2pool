@@ -441,6 +441,12 @@ private:
     // mempool_ via TemplateBuilder). Returns nullptr if the header chain has
     // no tip yet (pre-IBD / uninitialized).
     std::shared_ptr<const bch::coin::rpc::WorkData> cached_template() const;
+
+    // Stratum merkle branches folded from an already-read template snapshot,
+    // so build_connection_coinbase freezes branches and tx_data from one `wd`.
+    // The no-arg override delegates here with cached_template().
+    std::vector<std::string> get_stratum_merkle_branches(
+        const std::shared_ptr<const bch::coin::rpc::WorkData>& wd) const;
 };
 
 }  // namespace bch::stratum
