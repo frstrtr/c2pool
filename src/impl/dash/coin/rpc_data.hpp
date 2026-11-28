@@ -431,6 +431,23 @@ inline bool txid_may_omit_body_bytes(const std::string& body_hex) noexcept
         && body_hex[6] == '0' && body_hex[7] == '0';
 }
 
+// Whether two index-aligned body lists that sit under EQUAL tx-hash lists hold
+// the same bodies. Equal txids pin equal bytes for every body except one whose
+// txid may leave bytes out (txid_may_omit_body_bytes): those must be
+// byte-equal too, or a re-signed asset unlock would be served with its old
+// instance's bytes. Lists of different sizes never match.
+inline bool bodies_match_under_equal_txids(const std::vector<std::string>& was,
+                                           const std::vector<std::string>& now) noexcept
+{
+    if (was.size() != now.size()) return false;
+    for (size_t i = 0; i < now.size(); ++i) {
+        if ((txid_may_omit_body_bytes(now[i]) || txid_may_omit_body_bytes(was[i]))
+            && was[i] != now[i])
+            return false;
+    }
+    return true;
+}
+
 // The template store's reuse rule: may the template `next` carry the vector
 // `prev` carries (TemplateTxHex::reuse) instead of a fresh encode? Only when
 // that vector holds exactly next's bodies, in next's order:
@@ -451,9 +468,9 @@ inline bool txid_may_omit_body_bytes(const std::string& body_hex) noexcept
 // requestedHeight window or its quorum runs out. The byte check covers that;
 // the tip rule is a second, independent barrier at exactly that boundary. It
 // costs nothing measurable: a new block nearly always mines some of the
-// template's txs, and a coinbase-only template's vector is empty. For
-// comparison, the memo in build_producer_job (mint_runloop.hpp) matches on the
-// hash list and the body count alone, on any tip.
+// template's txs, and a coinbase-only template's vector is empty. The memo in
+// build_producer_job (mint_runloop.hpp) applies the same body rule
+// (bodies_match_under_equal_txids), on any tip.
 inline bool template_tx_hex_reusable(const DashWorkData& prev, const DashWorkData& next)
 {
     const auto& v = prev.m_tx_hex_shared.hex();
@@ -462,13 +479,7 @@ inline bool template_tx_hex_reusable(const DashWorkData& prev, const DashWorkDat
     const size_t n = next.m_tx_hashes.size();
     if (next.m_tx_data_hex.size() != n || v->size() != n) return false;
     if (prev.m_tx_hashes != next.m_tx_hashes) return false;
-    for (size_t i = 0; i < n; ++i) {
-        const std::string& was = (*v)[i];
-        const std::string& now = next.m_tx_data_hex[i];
-        if ((txid_may_omit_body_bytes(now) || txid_may_omit_body_bytes(was)) && was != now)
-            return false;
-    }
-    return true;
+    return bodies_match_under_equal_txids(*v, next.m_tx_data_hex);
 }
 
 } // namespace coin

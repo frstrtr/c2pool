@@ -676,6 +676,14 @@ void HttpSession::process_request()
             }
 
             nlohmann::json rest_result;
+            // The routes are matched by four consecutive else-if chains, because
+            // a single chain over all of them nests deeper than MSVC allows
+            // (C1061, "blocks nested too deeply"). The first three chains end in
+            // `else route_matched = false;`, and each later chain runs only while
+            // no earlier one matched, so every route is still tried in the
+            // original order and only the last chain's final else serves a
+            // target that no route takes.
+            bool route_matched = true;
             // Per-coin REST override (unset on every coin but c2pool-v37-xmr):
             // the coin answers the path itself, or returns nullopt to fall through.
             std::optional<nlohmann::json> rest_override = mining_interface_->call_rest_override(target);
@@ -823,738 +831,758 @@ void HttpSession::process_request()
                 send_response(std::move(response));
                 return;
             }
-            // ── p2pool legacy compatibility endpoints ──────────────────────
-            else if (target == "/local_stats")
-                rest_result = mining_interface_->rest_local_stats();
-            else if (target == "/miner_thresholds")
-                rest_result = mining_interface_->rest_miner_thresholds();
-            else if (target == "/web/version")
-                rest_result = mining_interface_->rest_web_version();
-            else if (target == "/web/currency_info")
-                rest_result = mining_interface_->rest_web_currency_info();
-            else if (target == "/payout_addr")
-                rest_result = mining_interface_->rest_payout_addr();
-            else if (target == "/payout_addrs")
-                rest_result = mining_interface_->rest_payout_addrs();
-            else if (target == "/web/best_share_hash")
-                rest_result = mining_interface_->rest_web_best_share_hash();
-            else if (target == "/web/sync_status")
-                rest_result = mining_interface_->rest_sync_status();
-            else if (target == "/p2pool_global_stats")
-                rest_result = mining_interface_->rest_p2pool_global_stats();
+            else
+                route_matched = false;
 
-            // ── Additional p2pool-compatible REST endpoints ────────────────
-            else if (target == "/rate")
-                rest_result = mining_interface_->rest_rate();
-            else if (target == "/difficulty")
-                rest_result = mining_interface_->rest_difficulty();
-            else if (target == "/user_stales")
-                rest_result = mining_interface_->rest_user_stales();
-            else if (target == "/peer_addresses") {
-                response.set(http::field::content_type, "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_peer_addresses(is_direct_local());
-                response.prepare_payload();
-                send_response(std::move(response));
-                return;
-            }
-            else if (target == "/peer_versions")
-                rest_result = mining_interface_->rest_peer_versions(is_direct_local());
-            else if (target == "/peer_txpool_sizes")
-                rest_result = mining_interface_->rest_peer_txpool_sizes(is_direct_local());
-            else if (target == "/peer_list")
-                rest_result = mining_interface_->rest_peer_list(is_direct_local());
-            else if (target == "/pings")
-                rest_result = mining_interface_->rest_pings(is_direct_local());
-            else if (target == "/stale_rates")
-                rest_result = mining_interface_->rest_stale_rates();
-            else if (target == "/node_info")
-                rest_result = mining_interface_->rest_node_info();
-            else if (target == "/api/node_topology")
-                rest_result = mining_interface_->rest_node_topology();
-            else if (target == "/embedded_oracle")
-                rest_result = mining_interface_->rest_embedded_oracle();
-            else if (target == "/embedded_template")
-                rest_result = mining_interface_->rest_embedded_template();
-            else if (target == "/mempool_entry") {
-                // Fee-parity shadow tooling: one mempool entry's candidacy.
-                // Direct-local only, like /api/utxo/scan.
-                auto answer = [&](int status, const nlohmann::json& j) {
-                    response.result(static_cast<http::status>(status));
-                    response.body() = j.dump();
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                };
-                if (!is_direct_local()) {
-                    answer(403, {{"error", "mempool-entry-local-only"}});
-                    return;
-                }
-                auto j = mining_interface_->rest_mempool_entry(getQueryParam("txid"));
-                int st = j.is_object() ? j.value("http_status", 200) : 200;
-                if (st < 100 || st > 599) st = 200;
-                if (j.is_object()) j.erase("http_status");
-                answer(st, j);
-                return;
-            }
+            // Second route chain (see the note above the first).
+            if (!route_matched) {
+                route_matched = true;
+                // ── p2pool legacy compatibility endpoints ──────────────────────
+                if (target == "/local_stats")
+                    rest_result = mining_interface_->rest_local_stats();
+                else if (target == "/miner_thresholds")
+                    rest_result = mining_interface_->rest_miner_thresholds();
+                else if (target == "/web/version")
+                    rest_result = mining_interface_->rest_web_version();
+                else if (target == "/web/currency_info")
+                    rest_result = mining_interface_->rest_web_currency_info();
+                else if (target == "/payout_addr")
+                    rest_result = mining_interface_->rest_payout_addr();
+                else if (target == "/payout_addrs")
+                    rest_result = mining_interface_->rest_payout_addrs();
+                else if (target == "/web/best_share_hash")
+                    rest_result = mining_interface_->rest_web_best_share_hash();
+                else if (target == "/web/sync_status")
+                    rest_result = mining_interface_->rest_sync_status();
+                else if (target == "/p2pool_global_stats")
+                    rest_result = mining_interface_->rest_p2pool_global_stats();
 
-            // ── Control-plane M1 (SAFE half): READ-ONLY resolved-config +
-            // catalog schema. Loopback-only (same posture as /api/admin/*):
-            // /api/config carries the node's fee/address posture and
-            // /api/config/schema is compiled constants, but both stay local
-            // until the control-token lands with the write path. Exact-match
-            // (schema BEFORE the bare path) so the substr dispatch cannot
-            // confuse the two. Unwired (no publish / no set_config_fns) => 404.
-            else if (target == "/api/tx-inject-status") {
-                // Read-only tx-injection lane status (#157). Loopback-only,
-                // same posture as /api/config: it reveals whether the injection
-                // lane is armed, which is local-operator information. SHOWS
-                // state only — never arms, submits, or writes config.
-                if (!is_direct_local()) {
-                    response.result(http::status::forbidden);
-                    response.body() = R"({"error":"tx-inject status is local-only"})";
+                // ── Additional p2pool-compatible REST endpoints ────────────────
+                else if (target == "/rate")
+                    rest_result = mining_interface_->rest_rate();
+                else if (target == "/difficulty")
+                    rest_result = mining_interface_->rest_difficulty();
+                else if (target == "/user_stales")
+                    rest_result = mining_interface_->rest_user_stales();
+                else if (target == "/peer_addresses") {
+                    response.set(http::field::content_type, "text/plain; charset=utf-8");
+                    response.body() = mining_interface_->rest_peer_addresses(is_direct_local());
                     response.prepare_payload();
                     send_response(std::move(response));
                     return;
                 }
-                rest_result = build_tx_inject_status_json();
-            }
-            else if (target == "/api/utxo/scan") {
-                // c2wallet Scan & Plan (N1): read-only scan of the full UTXO
-                // set for a few scripts. Direct-local only: a loopback peer
-                // with no forwarded header, so a same-host reverse proxy
-                // (whose requests come from 127.0.0.1) never reaches it. The
-                // scan runs on the MiningInterface's scan thread; this thread
-                // waits for it (bounded, rest_utxo_scan).
-                auto answer = [&](int status, const nlohmann::json& j) {
-                    response.result(static_cast<http::status>(status));
-                    response.body() = j.dump();
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                };
-                if (!is_direct_local()) {
-                    answer(403, {{"ok", false}, {"error", "utxo-scan-local-only"}});
-                    return;
-                }
-                if (!mining_interface_->has_utxo_scan_fn()) {
-                    answer(404, {{"ok", false}, {"error", "utxo-scan-not-wired"}});
-                    return;
-                }
-                const auto qp = raw_target.find('?');
-                auto j = mining_interface_->rest_utxo_scan(
-                    qp == std::string::npos ? std::string() : raw_target.substr(qp + 1));
-                int st = j.is_object() ? j.value("http_status", 200) : 200;
-                if (st < 100 || st > 599) st = 200;
-                if (j.is_object()) j.erase("http_status");
-                answer(st, j);
-                return;
-            }
-            else if (target == "/api/tx-inject/ledger") {
-                // Read-only per-inject ledger (S4). Loopback-only, same posture
-                // as /api/tx-inject-status: it names the txids this node is
-                // injecting. SHOWS state only.
-                if (!is_direct_local()) {
-                    response.result(http::status::forbidden);
-                    response.body() = R"({"error":"tx-inject ledger is local-only"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = build_tx_inject_ledger_json();
-            }
-            else if (target == "/api/config" || target == "/api/config/schema") {
-                if (!is_direct_local()) {
-                    response.result(http::status::forbidden);
-                    response.body() = R"({"error":"Config API is local-only"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                if (!mining_interface_->has_config_fns()) {
-                    response.result(http::status::not_found);
-                    response.body() = R"({"error":"config endpoint not wired"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = (target == "/api/config/schema")
-                    ? mining_interface_->rest_config_schema()
-                    : mining_interface_->rest_config();
-            }
-            else if (target == "/luck_stats")
-                rest_result = mining_interface_->rest_luck_stats();
-            else if (target == "/ban_stats")
-                rest_result = mining_interface_->rest_ban_stats(is_direct_local());
-            else if (target == "/stratum_security")
-                rest_result = mining_interface_->rest_stratum_security();
-            else if (target == "/best_share")
-                rest_result = mining_interface_->rest_best_share();
-            else if (target == "/version_signaling")
-                rest_result = mining_interface_->rest_version_signaling();
-            else if (target == "/v36_status")
-                rest_result = mining_interface_->rest_v36_status();
-            else if (target == "/tracker_debug")
-                rest_result = mining_interface_->rest_tracker_debug();
-            else if (target == "/p2p_stats")
-                rest_result = build_p2p_stats_json();
-
-            // Merged mining endpoints
-            else if (target == "/merged_stats")
-                rest_result = mining_interface_->rest_merged_stats();
-            else if (target == "/current_merged_payouts")
-                rest_result = mining_interface_->rest_current_merged_payouts();
-            else if (target == "/pplns/current")
-                rest_result = mining_interface_->rest_pplns_current();
-            else if (target.rfind("/pplns/miner/", 0) == 0) {
-                // /pplns/miner/<address> — extract address from path.
-                std::string addr = target.substr(std::string("/pplns/miner/").size());
-                // URL-decode (spec §5.2 "MUST be URL-encoded by the client").
-                std::string decoded;
-                decoded.reserve(addr.size());
-                for (size_t i = 0; i < addr.size(); ++i) {
-                    if (addr[i] == '%' && i + 2 < addr.size()) {
-                        auto hex = addr.substr(i + 1, 2);
-                        try {
-                            decoded.push_back(static_cast<char>(
-                                std::stoi(hex, nullptr, 16)));
-                            i += 2;
-                        } catch (...) {
-                            decoded.push_back(addr[i]);
-                        }
-                    } else if (addr[i] == '+') {
-                        decoded.push_back(' ');
-                    } else {
-                        decoded.push_back(addr[i]);
-                    }
-                }
-                rest_result = mining_interface_->rest_pplns_miner(decoded);
-            }
-            else if (target == "/recent_merged_blocks")
-                rest_result = mining_interface_->rest_recent_merged_blocks();
-            else if (target == "/all_merged_blocks")
-                rest_result = mining_interface_->rest_all_merged_blocks();
-            else if (target == "/discovered_merged_blocks")
-                rest_result = mining_interface_->rest_discovered_merged_blocks();
-            else if (target == "/broadcaster_status")
-                rest_result = mining_interface_->rest_broadcaster_status();
-            else if (target == "/merged_broadcaster_status")
-                rest_result = mining_interface_->rest_merged_broadcaster_status();
-            else if (target == "/network_difficulty")
-                rest_result = mining_interface_->rest_network_difficulty();
-
-            // /web/ sub-endpoints (share chain inspection)
-            else if (target == "/web/heads")
-                rest_result = mining_interface_->rest_web_heads();
-            else if (target == "/web/verified_heads")
-                rest_result = mining_interface_->rest_web_verified_heads();
-            else if (target == "/web/tails")
-                rest_result = mining_interface_->rest_web_tails();
-            else if (target == "/web/verified_tails")
-                rest_result = mining_interface_->rest_web_verified_tails();
-            else if (target == "/web/my_share_hashes")
-                rest_result = mining_interface_->rest_web_my_share_hashes();
-            else if (target == "/web/my_share_hashes50")
-                rest_result = mining_interface_->rest_web_my_share_hashes50();
-            else if (target == "/web/log_json")
-                rest_result = mining_interface_->rest_web_log_json();
-
-            // Path-parameterised endpoints (starts_with matching)
-            // Each path parameter is URL-decoded and validated before use.
-            else if (target.substr(0, 13) == "/miner_stats/") {
-                std::string addr = url_decode(target.substr(13));
-                if (!is_valid_address_chars(addr)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid address parameter"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_miner_stats(addr);
-            }
-            else if (target.substr(0, 15) == "/miner_payouts/") {
-                std::string addr = url_decode(target.substr(15));
-                if (!is_valid_address_chars(addr)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid address parameter"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_miner_payouts(addr);
-            }
-            else if (target.substr(0, 22) == "/merged_miner_payouts/") {
-                std::string addr = url_decode(target.substr(22));
-                if (!is_valid_address_chars(addr)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid address parameter"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_merged_miner_payouts(addr);
-            }
-            else if (target.substr(0, 18) == "/patron_sendmany/") {
-                std::string total = url_decode(target.substr(18));
-                if (!is_valid_address_chars(total)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid parameter"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                response.set(http::field::content_type, "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_patron_sendmany(total).dump();
-                response.prepare_payload();
-                send_response(std::move(response));
-                return;
-            }
-            else if (target.substr(0, 13) == "/found_block/") {
-                // #946: one found-block row (the /recent_blocks shape) by
-                // full block hash; an unknown hash is a 404, not an empty row.
-                std::string hash = url_decode(target.substr(13));
-                if (!is_valid_hex_hash(hash)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_found_block(hash);
-                if (rest_result.is_null()) {
-                    response.result(http::status::not_found);
-                    response.body() = R"({"error":"unknown found block"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-            }
-            else if (target.substr(0, 11) == "/web/share/") {
-                std::string hash = url_decode(target.substr(11));
-                if (!is_valid_hex_hash(hash)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_web_share(hash);
-            }
-            else if (target.substr(0, 20) == "/web/payout_address/") {
-                std::string hash = url_decode(target.substr(20));
-                if (!is_valid_hex_hash(hash)) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_web_payout_address(hash);
-            }
-            else if (target.substr(0, 16) == "/web/graph_data/") {
-                // /web/graph_data/<source>/<view>
-                std::string rest_path = url_decode(target.substr(16));
-                auto slash_pos = rest_path.find('/');
-                std::string source = (slash_pos != std::string::npos) ? rest_path.substr(0, slash_pos) : rest_path;
-                std::string view   = (slash_pos != std::string::npos) ? rest_path.substr(slash_pos + 1) : "";
-                if (!is_valid_graph_param(source) || (!view.empty() && !is_valid_graph_param(view))) {
-                    response.result(http::status::bad_request);
-                    response.body() = R"({"error":"Invalid graph source/view parameter"})";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                rest_result = mining_interface_->rest_web_graph_data(source, view);
-            }
-
-            // ── Coin peer sharing (public, rate-limited) ──────────────
-            else if (target == "/api/coin_peers") {
-                auto remote_ip = socket_.remote_endpoint().address().to_string();
-                auto result = mining_interface_->rest_coin_peers(remote_ip);
-                if (result.contains("error")) {
-                    response.result(http::status::too_many_requests);
-                    response.set(http::field::retry_after, "10");
-                }
-                response.body() = result.dump();
-                response.prepare_payload();
-                send_response(std::move(response));
-                return;
-            }
-
-            else {
-                // ── Admin API endpoints (loopback-only) ───────────────────
-                if (target.substr(0, 16) == "/api/admin/pool/") {
-                    if (!is_direct_local()) {
-                        response.result(http::status::forbidden);
-                        response.body() = R"({"error":"Admin API is local-only"})";
+                else if (target == "/peer_versions")
+                    rest_result = mining_interface_->rest_peer_versions(is_direct_local());
+                else if (target == "/peer_txpool_sizes")
+                    rest_result = mining_interface_->rest_peer_txpool_sizes(is_direct_local());
+                else if (target == "/peer_list")
+                    rest_result = mining_interface_->rest_peer_list(is_direct_local());
+                else if (target == "/pings")
+                    rest_result = mining_interface_->rest_pings(is_direct_local());
+                else if (target == "/stale_rates")
+                    rest_result = mining_interface_->rest_stale_rates();
+                else if (target == "/node_info")
+                    rest_result = mining_interface_->rest_node_info();
+                else if (target == "/api/node_topology")
+                    rest_result = mining_interface_->rest_node_topology();
+                else if (target == "/embedded_oracle")
+                    rest_result = mining_interface_->rest_embedded_oracle();
+                else if (target == "/embedded_template")
+                    rest_result = mining_interface_->rest_embedded_template();
+                else if (target == "/mempool_entry") {
+                    // Fee-parity shadow tooling: one mempool entry's candidacy.
+                    // Direct-local only, like /api/utxo/scan.
+                    auto answer = [&](int status, const nlohmann::json& j) {
+                        response.result(static_cast<http::status>(status));
+                        response.body() = j.dump();
                         response.prepare_payload();
                         send_response(std::move(response));
-                        return;
-                    }
-                    if (!mining_interface_->has_admin_fns()) {
-                        response.result(http::status::not_found);
-                        response.body() = R"({"error":"Admin API not enabled"})";
-                        response.prepare_payload();
-                        send_response(std::move(response));
-                        return;
-                    }
-
-                    std::string ep = target.substr(16); // after "/api/admin/pool/"
-                    // strip query string
-                    auto qpos = ep.find('?');
-                    if (qpos != std::string::npos) ep = ep.substr(0, qpos);
-
-                    auto parse_host_port = [&](uint16_t& port_out) -> std::string {
-                        std::string host = getQueryParam("host");
-                        std::string ip_q = getQueryParam("ip");
-                        port_out = 0;
-                        if (!host.empty()) {
-                            auto hp = core::parse_host_port(host);
-                            host = hp.host;
-                            if (hp.port) port_out = *hp.port;
-                        } else {
-                            host = ip_q;
-                        }
-                        std::string port_q = getQueryParam("port");
-                        if (!port_q.empty()) {
-                            try { port_out = static_cast<uint16_t>(std::stoul(port_q)); } catch (...) {}
-                        }
-                        return host;
                     };
-
-                    if (ep == "bans/list") {
-                        rest_result = mining_interface_->call_admin_list_bans();
-                    } else if (ep == "bans/add") {
-                        std::string ip = getQueryParam("ip");
-                        int dur = 0;
-                        try { auto d = getQueryParam("duration"); if (!d.empty()) dur = std::stoi(d); } catch (...) {}
-                        rest_result = mining_interface_->call_admin_ban_ip(ip, dur);
-                    } else if (ep == "bans/remove") {
-                        std::string ip = getQueryParam("ip");
-                        rest_result = mining_interface_->call_admin_unban_ip(ip);
-                    } else if (ep == "whitelist/list") {
-                        rest_result = mining_interface_->call_admin_list_whitelist();
-                    } else if (ep == "whitelist/add") {
-                        uint16_t p = 0;
-                        std::string h = parse_host_port(p);
-                        rest_result = mining_interface_->call_admin_whitelist_add(h, p);
-                    } else if (ep == "whitelist/remove") {
-                        uint16_t p = 0;
-                        std::string h = parse_host_port(p);
-                        rest_result = mining_interface_->call_admin_whitelist_remove(h, p);
-                    } else if (ep == "peers/list") {
-                        rest_result = mining_interface_->call_admin_list_peers();
-                    } else if (ep == "peers/drop") {
-                        std::string ip = getQueryParam("ip");
-                        rest_result = mining_interface_->call_admin_drop_peer(ip);
-                    } else if (ep == "peers/dial") {
-                        uint16_t p = 0;
-                        std::string h = parse_host_port(p);
-                        rest_result = mining_interface_->call_admin_dial_peer(h, p);
-                    } else {
-                        rest_result = nlohmann::json{{"ok", false}, {"error", "Unknown admin endpoint"}};
+                    if (!is_direct_local()) {
+                        answer(403, {{"error", "mempool-entry-local-only"}});
+                        return;
                     }
+                    auto j = mining_interface_->rest_mempool_entry(getQueryParam("txid"));
+                    int st = j.is_object() ? j.value("http_status", 200) : 200;
+                    if (st < 100 || st > 599) st = 200;
+                    if (j.is_object()) j.erase("http_status");
+                    answer(st, j);
+                    return;
                 }
-                // ── Admin API: embedded-coin peer management ──────────────
-                else if (target.substr(0, 16) == "/api/admin/coin/") {
+
+                // ── Control-plane M1 (SAFE half): READ-ONLY resolved-config +
+                // catalog schema. Loopback-only (same posture as /api/admin/*):
+                // /api/config carries the node's fee/address posture and
+                // /api/config/schema is compiled constants, but both stay local
+                // until the control-token lands with the write path. Exact-match
+                // (schema BEFORE the bare path) so the substr dispatch cannot
+                // confuse the two. Unwired (no publish / no set_config_fns) => 404.
+                else if (target == "/api/tx-inject-status") {
+                    // Read-only tx-injection lane status (#157). Loopback-only,
+                    // same posture as /api/config: it reveals whether the injection
+                    // lane is armed, which is local-operator information. SHOWS
+                    // state only — never arms, submits, or writes config.
                     if (!is_direct_local()) {
                         response.result(http::status::forbidden);
-                        response.body() = R"({"error":"Admin API is local-only"})";
+                        response.body() = R"({"error":"tx-inject status is local-only"})";
                         response.prepare_payload();
                         send_response(std::move(response));
                         return;
                     }
-                    if (!mining_interface_->has_admin_coin_fns()) {
+                    rest_result = build_tx_inject_status_json();
+                }
+                else if (target == "/api/utxo/scan") {
+                    // c2wallet Scan & Plan (N1): read-only scan of the full UTXO
+                    // set for a few scripts. Direct-local only: a loopback peer
+                    // with no forwarded header, so a same-host reverse proxy
+                    // (whose requests come from 127.0.0.1) never reaches it. The
+                    // scan runs on the MiningInterface's scan thread; this thread
+                    // waits for it (bounded, rest_utxo_scan).
+                    auto answer = [&](int status, const nlohmann::json& j) {
+                        response.result(static_cast<http::status>(status));
+                        response.body() = j.dump();
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                    };
+                    if (!is_direct_local()) {
+                        answer(403, {{"ok", false}, {"error", "utxo-scan-local-only"}});
+                        return;
+                    }
+                    if (!mining_interface_->has_utxo_scan_fn()) {
+                        answer(404, {{"ok", false}, {"error", "utxo-scan-not-wired"}});
+                        return;
+                    }
+                    const auto qp = raw_target.find('?');
+                    auto j = mining_interface_->rest_utxo_scan(
+                        qp == std::string::npos ? std::string() : raw_target.substr(qp + 1));
+                    int st = j.is_object() ? j.value("http_status", 200) : 200;
+                    if (st < 100 || st > 599) st = 200;
+                    if (j.is_object()) j.erase("http_status");
+                    answer(st, j);
+                    return;
+                }
+                else if (target == "/api/tx-inject/ledger") {
+                    // Read-only per-inject ledger (S4). Loopback-only, same posture
+                    // as /api/tx-inject-status: it names the txids this node is
+                    // injecting. SHOWS state only.
+                    if (!is_direct_local()) {
+                        response.result(http::status::forbidden);
+                        response.body() = R"({"error":"tx-inject ledger is local-only"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                    rest_result = build_tx_inject_ledger_json();
+                }
+                else if (target == "/api/config" || target == "/api/config/schema") {
+                    if (!is_direct_local()) {
+                        response.result(http::status::forbidden);
+                        response.body() = R"({"error":"Config API is local-only"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                    if (!mining_interface_->has_config_fns()) {
                         response.result(http::status::not_found);
-                        response.body() = R"({"error":"Coin admin API not enabled"})";
+                        response.body() = R"({"error":"config endpoint not wired"})";
                         response.prepare_payload();
                         send_response(std::move(response));
                         return;
                     }
-
-                    std::string ep = target.substr(16); // after "/api/admin/coin/"
-                    auto qpos = ep.find('?');
-                    if (qpos != std::string::npos) ep = ep.substr(0, qpos);
-
-                    std::string chain = getQueryParam("chain");
-                    if (chain.empty()) chain = mining_interface_->primary_chain_key();
-
-                    if (ep == "peers/list") {
-                        rest_result = mining_interface_->call_admin_coin_list_peers(chain);
-                    } else if (ep == "peer/add") {
-                        std::string host = getQueryParam("host");
-                        uint16_t port = 0;
-                        // Host may be "A.B.C.D:PORT" (combined) OR "A.B.C.D" with separate ?port=
-                        if (!host.empty()) {
-                            auto hp = core::parse_host_port(host);
-                            host = hp.host;
-                            if (hp.port) port = *hp.port;
-                        }
-                        std::string port_q = getQueryParam("port");
-                        if (!port_q.empty()) {
-                            try { port = static_cast<uint16_t>(std::stoul(port_q)); } catch (...) {}
-                        }
-                        rest_result = mining_interface_->call_admin_coin_add_peer(chain, host, port);
-                    } else {
-                        rest_result = nlohmann::json{{"ok", false}, {"error", "Unknown coin admin endpoint"}};
-                    }
+                    rest_result = (target == "/api/config/schema")
+                        ? mining_interface_->rest_config_schema()
+                        : mining_interface_->rest_config();
                 }
                 else
-                // ── Explorer API endpoints (loopback-only) ────────────────
-                if (target.substr(0, 14) == "/api/explorer/") {
-                    // Loopback guard: only accept requests from 127.0.0.1 / ::1
-                    // (never on the stratum port)
-                    auto remote_addr = socket_.remote_endpoint().address();
-                    if (opts_.stratum_port || !remote_addr.is_loopback()) {
-                        response.result(http::status::forbidden);
-                        response.body() = R"({"error":"Explorer API is local-only"})";
+                    route_matched = false;
+            }
+
+            // Third route chain.
+            if (!route_matched) {
+                route_matched = true;
+                if (target == "/luck_stats")
+                    rest_result = mining_interface_->rest_luck_stats();
+                else if (target == "/ban_stats")
+                    rest_result = mining_interface_->rest_ban_stats(is_direct_local());
+                else if (target == "/stratum_security")
+                    rest_result = mining_interface_->rest_stratum_security();
+                else if (target == "/best_share")
+                    rest_result = mining_interface_->rest_best_share();
+                else if (target == "/version_signaling")
+                    rest_result = mining_interface_->rest_version_signaling();
+                else if (target == "/v36_status")
+                    rest_result = mining_interface_->rest_v36_status();
+                else if (target == "/tracker_debug")
+                    rest_result = mining_interface_->rest_tracker_debug();
+                else if (target == "/p2p_stats")
+                    rest_result = build_p2p_stats_json();
+
+                // Merged mining endpoints
+                else if (target == "/merged_stats")
+                    rest_result = mining_interface_->rest_merged_stats();
+                else if (target == "/current_merged_payouts")
+                    rest_result = mining_interface_->rest_current_merged_payouts();
+                else if (target == "/pplns/current")
+                    rest_result = mining_interface_->rest_pplns_current();
+                else if (target.rfind("/pplns/miner/", 0) == 0) {
+                    // /pplns/miner/<address> — extract address from path.
+                    std::string addr = target.substr(std::string("/pplns/miner/").size());
+                    // URL-decode (spec §5.2 "MUST be URL-encoded by the client").
+                    std::string decoded;
+                    decoded.reserve(addr.size());
+                    for (size_t i = 0; i < addr.size(); ++i) {
+                        if (addr[i] == '%' && i + 2 < addr.size()) {
+                            auto hex = addr.substr(i + 1, 2);
+                            try {
+                                decoded.push_back(static_cast<char>(
+                                    std::stoi(hex, nullptr, 16)));
+                                i += 2;
+                            } catch (...) {
+                                decoded.push_back(addr[i]);
+                            }
+                        } else if (addr[i] == '+') {
+                            decoded.push_back(' ');
+                        } else {
+                            decoded.push_back(addr[i]);
+                        }
+                    }
+                    rest_result = mining_interface_->rest_pplns_miner(decoded);
+                }
+                else if (target == "/recent_merged_blocks")
+                    rest_result = mining_interface_->rest_recent_merged_blocks();
+                else if (target == "/all_merged_blocks")
+                    rest_result = mining_interface_->rest_all_merged_blocks();
+                else if (target == "/discovered_merged_blocks")
+                    rest_result = mining_interface_->rest_discovered_merged_blocks();
+                else if (target == "/broadcaster_status")
+                    rest_result = mining_interface_->rest_broadcaster_status();
+                else if (target == "/merged_broadcaster_status")
+                    rest_result = mining_interface_->rest_merged_broadcaster_status();
+                else if (target == "/network_difficulty")
+                    rest_result = mining_interface_->rest_network_difficulty();
+
+                // /web/ sub-endpoints (share chain inspection)
+                else if (target == "/web/heads")
+                    rest_result = mining_interface_->rest_web_heads();
+                else if (target == "/web/verified_heads")
+                    rest_result = mining_interface_->rest_web_verified_heads();
+                else if (target == "/web/tails")
+                    rest_result = mining_interface_->rest_web_tails();
+                else if (target == "/web/verified_tails")
+                    rest_result = mining_interface_->rest_web_verified_tails();
+                else if (target == "/web/my_share_hashes")
+                    rest_result = mining_interface_->rest_web_my_share_hashes();
+                else if (target == "/web/my_share_hashes50")
+                    rest_result = mining_interface_->rest_web_my_share_hashes50();
+                else if (target == "/web/log_json")
+                    rest_result = mining_interface_->rest_web_log_json();
+                else
+                    route_matched = false;
+            }
+
+            // Fourth route chain: its final else is the admin, explorer and
+            // static-file dispatch.
+            if (!route_matched) {
+                // Path-parameterised endpoints (starts_with matching)
+                // Each path parameter is URL-decoded and validated before use.
+                if (target.substr(0, 13) == "/miner_stats/") {
+                    std::string addr = url_decode(target.substr(13));
+                    if (!is_valid_address_chars(addr)) {
+                        response.result(http::status::bad_request);
+                        response.body() = R"({"error":"Invalid address parameter"})";
                         response.prepare_payload();
                         send_response(std::move(response));
                         return;
                     }
-
-                    if (!mining_interface_->is_explorer_enabled()) {
+                    rest_result = mining_interface_->rest_miner_stats(addr);
+                }
+                else if (target.substr(0, 15) == "/miner_payouts/") {
+                    std::string addr = url_decode(target.substr(15));
+                    if (!is_valid_address_chars(addr)) {
+                        response.result(http::status::bad_request);
+                        response.body() = R"({"error":"Invalid address parameter"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                    rest_result = mining_interface_->rest_miner_payouts(addr);
+                }
+                else if (target.substr(0, 22) == "/merged_miner_payouts/") {
+                    std::string addr = url_decode(target.substr(22));
+                    if (!is_valid_address_chars(addr)) {
+                        response.result(http::status::bad_request);
+                        response.body() = R"({"error":"Invalid address parameter"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                    rest_result = mining_interface_->rest_merged_miner_payouts(addr);
+                }
+                else if (target.substr(0, 18) == "/patron_sendmany/") {
+                    std::string total = url_decode(target.substr(18));
+                    if (!is_valid_address_chars(total)) {
+                        response.result(http::status::bad_request);
+                        response.body() = R"({"error":"Invalid parameter"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                    response.set(http::field::content_type, "text/plain; charset=utf-8");
+                    response.body() = mining_interface_->rest_patron_sendmany(total).dump();
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                else if (target.substr(0, 13) == "/found_block/") {
+                    // #946: one found-block row (the /recent_blocks shape) by
+                    // full block hash; an unknown hash is a 404, not an empty row.
+                    std::string hash = url_decode(target.substr(13));
+                    if (!is_valid_hex_hash(hash)) {
+                        response.result(http::status::bad_request);
+                        response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                    rest_result = mining_interface_->rest_found_block(hash);
+                    if (rest_result.is_null()) {
                         response.result(http::status::not_found);
-                        response.body() = R"({"error":"Explorer not enabled"})";
+                        response.body() = R"({"error":"unknown found block"})";
                         response.prepare_payload();
                         send_response(std::move(response));
                         return;
-                    }
-
-                    std::string chain = getQueryParam("chain");
-                    if (chain.empty()) chain = mining_interface_->primary_chain_key();
-
-                    std::string ep = target.substr(14);
-
-                    // Daemonless coin-chain query hook first: when a coin
-                    // backend can answer from its own validated state (DASH's
-                    // header chain), its answer — including a refusal that
-                    // names the blocking condition — is served verbatim.
-                    //
-                    // Methods a coin backend may answer from its own validated
-                    // state. getblock/getblockheader/getrawtransaction joined the
-                    // list when the daemonless block-data policy landed: the
-                    // header chain answers getblockheader in full and getblock
-                    // partially, and REFUSES the body-backed shapes with a named
-                    // reason rather than letting the request fall through to a
-                    // branch that would answer {} (#99).
-                    const bool coin_owned_query =
-                        (ep == "getblockchaininfo" || ep == "getbestblockhash"
-                         || ep == "getblockhash"   || ep == "getblockheader"
-                         || ep == "getblock"       || ep == "getrawtransaction");
-                    if (coin_owned_query && mining_interface_->has_coin_chain_query_fn()) {
-                        rest_result = [&]() -> nlohmann::json {
-                            nlohmann::json qp = nlohmann::json::array();
-                            if (ep == "getblockheader" || ep == "getblock") {
-                                // hash, or height resolved through the same hook.
-                                std::string hash = getQueryParam("hash");
-                                if (hash.empty()) {
-                                    std::string h_str = getQueryParam("height");
-                                    if (!h_str.empty()) {
-                                        nlohmann::json hp = nlohmann::json::array();
-                                        try { hp.push_back(static_cast<uint32_t>(std::stoul(h_str))); }
-                                        catch (...) {
-                                            return nlohmann::json{
-                                                {"error", ep + " withheld: height parameter '"
-                                                          + h_str + "' is not a number "
-                                                          "(threshold: decimal height)"},
-                                                {"code", "BAD_PARAMS"},
-                                                {"method", ep}};
-                                        }
-                                        auto hj = mining_interface_->call_coin_chain_query(
-                                            "getblockhash", hp, chain);
-                                        if (hj.is_string()) hash = hj.get<std::string>();
-                                        else return hj;   // propagate the refusal verbatim
-                                    }
-                                }
-                                if (hash.empty())
-                                    return nlohmann::json{
-                                        {"error", ep + " withheld: neither ?hash= nor ?height= "
-                                                  "was supplied (threshold: one of them)"},
-                                        {"code", "BAD_PARAMS"},
-                                        {"method", ep}};
-                                qp.push_back(hash);
-                                if (ep == "getblock") {
-                                    auto vs = getQueryParam("verbosity");
-                                    if (vs.empty()) vs = getQueryParam("verbose");
-                                    if (!vs.empty()) {
-                                        if (vs == "true")       qp.push_back(1);
-                                        else if (vs == "false") qp.push_back(0);
-                                        else { try { qp.push_back(std::stoi(vs)); } catch (...) {} }
-                                    }
-                                } else {
-                                    auto vs = getQueryParam("verbose");
-                                    if (vs == "false") qp.push_back(false);
-                                }
-                            } else if (ep == "getrawtransaction") {
-                                qp.push_back(getQueryParam("txid"));
-                            } else if (ep == "getblockhash") {
-                                std::string height_str = getQueryParam("height");
-                                if (height_str.empty())
-                                    return nlohmann::json{
-                                        {"error", "getblockhash withheld: missing height "
-                                                  "parameter (threshold: ?height=<n> required)"},
-                                        {"code", "BAD_PARAMS"},
-                                        {"method", ep}};
-                                try { qp.push_back(static_cast<uint32_t>(std::stoul(height_str))); }
-                                catch (...) {
-                                    return nlohmann::json{
-                                        {"error", "getblockhash withheld: height parameter '"
-                                                  + height_str + "' is not a number "
-                                                  "(threshold: decimal height)"},
-                                        {"code", "BAD_PARAMS"},
-                                        {"method", ep}};
-                                }
-                            }
-                            return mining_interface_->call_coin_chain_query(ep, qp, chain);
-                        }();
-                    } else if (ep == "getblockchaininfo" && mining_interface_->has_explorer_chaininfo_fn()) {
-                        rest_result = mining_interface_->call_explorer_chaininfo(chain);
-                    } else if (ep == "getblockhash" && mining_interface_->has_explorer_blockhash_fn()) {
-                        std::string height_str = getQueryParam("height");
-                        uint32_t h = 0;
-                        try { h = static_cast<uint32_t>(std::stoul(height_str)); } catch (...) {}
-                        auto hash = mining_interface_->call_explorer_blockhash(h, chain);
-                        if (hash.empty()) {
-                            rest_result = nlohmann::json{{"error", "Block not found"}};
-                        } else {
-                            rest_result = nlohmann::json{{"result", hash}};
-                        }
-                    } else if (ep == "getblock" && mining_interface_->has_explorer_getblock_fn()) {
-                        std::string hash = getQueryParam("hash");
-                        // Also support height lookup
-                        if (hash.empty()) {
-                            std::string h_str = getQueryParam("height");
-                            if (!h_str.empty() && mining_interface_->has_explorer_blockhash_fn()) {
-                                uint32_t h = 0;
-                                try { h = static_cast<uint32_t>(std::stoul(h_str)); } catch (...) {}
-                                hash = mining_interface_->call_explorer_blockhash(h, chain);
-                            }
-                        }
-                        if (hash.empty()) {
-                            rest_result = nlohmann::json{{"error", "Missing hash or height parameter"}};
-                        } else {
-                            rest_result = mining_interface_->call_explorer_getblock(hash, chain);
-                        }
-                    } else if (ep == "getmempoolinfo" && mining_interface_->has_explorer_mempoolinfo_fn()) {
-                        rest_result = mining_interface_->call_explorer_mempoolinfo(chain);
-                    } else if (ep == "getrawmempool" && mining_interface_->has_explorer_rawmempool_fn()) {
-                        bool verbose = getQueryParam("verbose") == "true";
-                        uint32_t limit = 500;
-                        try { auto ls = getQueryParam("limit"); if (!ls.empty()) limit = std::min(5000u, static_cast<uint32_t>(std::stoul(ls))); } catch (...) {}
-                        rest_result = mining_interface_->call_explorer_rawmempool(chain, verbose, limit);
-                    } else if (ep == "getmempoolentry" && mining_interface_->has_explorer_mempoolentry_fn()) {
-                        std::string txid_param = getQueryParam("txid");
-                        if (txid_param.empty()) {
-                            rest_result = nlohmann::json{{"error", "Missing txid parameter"}};
-                        } else {
-                            rest_result = mining_interface_->call_explorer_mempoolentry(txid_param, chain);
-                        }
-                    } else {
-                        rest_result = nlohmann::json{{"error", "Unknown explorer endpoint"}};
                     }
                 }
-                else {
-                // ── Static file serving (dashboard gate) ───────────────────
-                const auto& dashboard_dir = mining_interface_->get_dashboard_dir();
-                if (!dashboard_dir.empty()) {
-                    std::string file_path = target;
-                    if (file_path == "/" || file_path.empty())
-                        file_path = mining_interface_->is_node_ready()
-                            ? "/dashboard.html" : "/loading.html";
+                else if (target.substr(0, 11) == "/web/share/") {
+                    std::string hash = url_decode(target.substr(11));
+                    if (!is_valid_hex_hash(hash)) {
+                        response.result(http::status::bad_request);
+                        response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                    rest_result = mining_interface_->rest_web_share(hash);
+                }
+                else if (target.substr(0, 20) == "/web/payout_address/") {
+                    std::string hash = url_decode(target.substr(20));
+                    if (!is_valid_hex_hash(hash)) {
+                        response.result(http::status::bad_request);
+                        response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                    rest_result = mining_interface_->rest_web_payout_address(hash);
+                }
+                else if (target.substr(0, 16) == "/web/graph_data/") {
+                    // /web/graph_data/<source>/<view>
+                    std::string rest_path = url_decode(target.substr(16));
+                    auto slash_pos = rest_path.find('/');
+                    std::string source = (slash_pos != std::string::npos) ? rest_path.substr(0, slash_pos) : rest_path;
+                    std::string view   = (slash_pos != std::string::npos) ? rest_path.substr(slash_pos + 1) : "";
+                    if (!is_valid_graph_param(source) || (!view.empty() && !is_valid_graph_param(view))) {
+                        response.result(http::status::bad_request);
+                        response.body() = R"({"error":"Invalid graph source/view parameter"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                    rest_result = mining_interface_->rest_web_graph_data(source, view);
+                }
 
-                    // During startup, redirect all HTML pages to loading.html
-                    // (except loading.html itself). Only loading.html + sync_status
-                    // + currency_info work during early startup.
-                    if (file_path != "/loading.html" && file_path.find(".html") != std::string::npos) {
-                        bool node_ready = mining_interface_->is_node_ready();
-                        if (!node_ready) {
-                            response.result(http::status::temporary_redirect);
-                            response.set(http::field::location, "/loading.html");
-                            response.body() = "";
+                // ── Coin peer sharing (public, rate-limited) ──────────────
+                else if (target == "/api/coin_peers") {
+                    auto remote_ip = socket_.remote_endpoint().address().to_string();
+                    auto result = mining_interface_->rest_coin_peers(remote_ip);
+                    if (result.contains("error")) {
+                        response.result(http::status::too_many_requests);
+                        response.set(http::field::retry_after, "10");
+                    }
+                    response.body() = result.dump();
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+
+                else {
+                    // ── Admin API endpoints (loopback-only) ───────────────────
+                    if (target.substr(0, 16) == "/api/admin/pool/") {
+                        if (!is_direct_local()) {
+                            response.result(http::status::forbidden);
+                            response.body() = R"({"error":"Admin API is local-only"})";
                             response.prepare_payload();
                             send_response(std::move(response));
                             return;
                         }
+                        if (!mining_interface_->has_admin_fns()) {
+                            response.result(http::status::not_found);
+                            response.body() = R"({"error":"Admin API not enabled"})";
+                            response.prepare_payload();
+                            send_response(std::move(response));
+                            return;
+                        }
+
+                        std::string ep = target.substr(16); // after "/api/admin/pool/"
+                        // strip query string
+                        auto qpos = ep.find('?');
+                        if (qpos != std::string::npos) ep = ep.substr(0, qpos);
+
+                        auto parse_host_port = [&](uint16_t& port_out) -> std::string {
+                            std::string host = getQueryParam("host");
+                            std::string ip_q = getQueryParam("ip");
+                            port_out = 0;
+                            if (!host.empty()) {
+                                auto hp = core::parse_host_port(host);
+                                host = hp.host;
+                                if (hp.port) port_out = *hp.port;
+                            } else {
+                                host = ip_q;
+                            }
+                            std::string port_q = getQueryParam("port");
+                            if (!port_q.empty()) {
+                                try { port_out = static_cast<uint16_t>(std::stoul(port_q)); } catch (...) {}
+                            }
+                            return host;
+                        };
+
+                        if (ep == "bans/list") {
+                            rest_result = mining_interface_->call_admin_list_bans();
+                        } else if (ep == "bans/add") {
+                            std::string ip = getQueryParam("ip");
+                            int dur = 0;
+                            try { auto d = getQueryParam("duration"); if (!d.empty()) dur = std::stoi(d); } catch (...) {}
+                            rest_result = mining_interface_->call_admin_ban_ip(ip, dur);
+                        } else if (ep == "bans/remove") {
+                            std::string ip = getQueryParam("ip");
+                            rest_result = mining_interface_->call_admin_unban_ip(ip);
+                        } else if (ep == "whitelist/list") {
+                            rest_result = mining_interface_->call_admin_list_whitelist();
+                        } else if (ep == "whitelist/add") {
+                            uint16_t p = 0;
+                            std::string h = parse_host_port(p);
+                            rest_result = mining_interface_->call_admin_whitelist_add(h, p);
+                        } else if (ep == "whitelist/remove") {
+                            uint16_t p = 0;
+                            std::string h = parse_host_port(p);
+                            rest_result = mining_interface_->call_admin_whitelist_remove(h, p);
+                        } else if (ep == "peers/list") {
+                            rest_result = mining_interface_->call_admin_list_peers();
+                        } else if (ep == "peers/drop") {
+                            std::string ip = getQueryParam("ip");
+                            rest_result = mining_interface_->call_admin_drop_peer(ip);
+                        } else if (ep == "peers/dial") {
+                            uint16_t p = 0;
+                            std::string h = parse_host_port(p);
+                            rest_result = mining_interface_->call_admin_dial_peer(h, p);
+                        } else {
+                            rest_result = nlohmann::json{{"ok", false}, {"error", "Unknown admin endpoint"}};
+                        }
                     }
+                    // ── Admin API: embedded-coin peer management ──────────────
+                    else if (target.substr(0, 16) == "/api/admin/coin/") {
+                        if (!is_direct_local()) {
+                            response.result(http::status::forbidden);
+                            response.body() = R"({"error":"Admin API is local-only"})";
+                            response.prepare_payload();
+                            send_response(std::move(response));
+                            return;
+                        }
+                        if (!mining_interface_->has_admin_coin_fns()) {
+                            response.result(http::status::not_found);
+                            response.body() = R"({"error":"Coin admin API not enabled"})";
+                            response.prepare_payload();
+                            send_response(std::move(response));
+                            return;
+                        }
 
-                    std::error_code fec;
-                    std::filesystem::path base = std::filesystem::weakly_canonical(dashboard_dir);
-                    std::filesystem::path requested = base / file_path.substr(1);
-                    auto resolved = std::filesystem::canonical(requested, fec);
+                        std::string ep = target.substr(16); // after "/api/admin/coin/"
+                        auto qpos = ep.find('?');
+                        if (qpos != std::string::npos) ep = ep.substr(0, qpos);
 
-                    if (!fec && resolved.string().substr(0, base.string().size()) == base.string()
-                             && std::filesystem::is_regular_file(resolved))
-                    {
-                        // MIME type detection
-                        std::string ext = resolved.extension().string();
-                        std::string mime = "application/octet-stream";
-                        if (ext == ".html" || ext == ".htm") mime = "text/html; charset=utf-8";
-                        else if (ext == ".js" || ext == ".mjs") mime = "application/javascript; charset=utf-8";
-                        else if (ext == ".css")  mime = "text/css; charset=utf-8";
-                        else if (ext == ".json") mime = "application/json; charset=utf-8";
-                        else if (ext == ".ico")  mime = "image/x-icon";
-                        else if (ext == ".png")  mime = "image/png";
-                        else if (ext == ".svg")  mime = "image/svg+xml";
-                        else if (ext == ".txt")  mime = "text/plain; charset=utf-8";
-                        else if (ext == ".woff2") mime = "font/woff2";
-                        else if (ext == ".woff") mime = "font/woff";
-                        else if (ext == ".map")  mime = "application/json";
+                        std::string chain = getQueryParam("chain");
+                        if (chain.empty()) chain = mining_interface_->primary_chain_key();
 
-                        std::ifstream file(resolved, std::ios::binary);
-                        std::string contents((std::istreambuf_iterator<char>(file)),
-                                             std::istreambuf_iterator<char>());
+                        if (ep == "peers/list") {
+                            rest_result = mining_interface_->call_admin_coin_list_peers(chain);
+                        } else if (ep == "peer/add") {
+                            std::string host = getQueryParam("host");
+                            uint16_t port = 0;
+                            // Host may be "A.B.C.D:PORT" (combined) OR "A.B.C.D" with separate ?port=
+                            if (!host.empty()) {
+                                auto hp = core::parse_host_port(host);
+                                host = hp.host;
+                                if (hp.port) port = *hp.port;
+                            }
+                            std::string port_q = getQueryParam("port");
+                            if (!port_q.empty()) {
+                                try { port = static_cast<uint16_t>(std::stoul(port_q)); } catch (...) {}
+                            }
+                            rest_result = mining_interface_->call_admin_coin_add_peer(chain, host, port);
+                        } else {
+                            rest_result = nlohmann::json{{"ok", false}, {"error", "Unknown coin admin endpoint"}};
+                        }
+                    }
+                    else
+                    // ── Explorer API endpoints (loopback-only) ────────────────
+                    if (target.substr(0, 14) == "/api/explorer/") {
+                        // Loopback guard: only accept requests from 127.0.0.1 / ::1
+                        // (never on the stratum port)
+                        auto remote_addr = socket_.remote_endpoint().address();
+                        if (opts_.stratum_port || !remote_addr.is_loopback()) {
+                            response.result(http::status::forbidden);
+                            response.body() = R"({"error":"Explorer API is local-only"})";
+                            response.prepare_payload();
+                            send_response(std::move(response));
+                            return;
+                        }
 
-                        // Analytics tag + consent bar (core/analytics_tag.hpp), when
-                        // --analytics-id / web.analytics_id is set: HTML only, never
-                        // under /control/, /api/, /web/log, /logs/ or with a token.
-                        const auto qmark = raw_target.find('?');
-                        const std::string tag_query = qmark == std::string::npos ? std::string()
-                                                                                 : raw_target.substr(qmark + 1);
-                        if ((ext == ".html" || ext == ".htm") && core::analytics_allowed_target(target, tag_query))
-                            core::inject_analytics_tag(contents, mining_interface_->get_analytics_id());
+                        if (!mining_interface_->is_explorer_enabled()) {
+                            response.result(http::status::not_found);
+                            response.body() = R"({"error":"Explorer not enabled"})";
+                            response.prepare_payload();
+                            send_response(std::move(response));
+                            return;
+                        }
 
-                        // Per-coin payout-scheme label (empty on every coin but
-                        // c2pool-v37-xmr, whose scheme is WRS / PPR, never PPLNS).
-                        const auto& scheme_label = mining_interface_->get_payout_scheme_label();
-                        if (!scheme_label.empty() &&
-                            (ext == ".html" || ext == ".htm" || ext == ".js" || ext == ".mjs"))
-                            core::rewrite_payout_scheme_label(contents, scheme_label);
+                        std::string chain = getQueryParam("chain");
+                        if (chain.empty()) chain = mining_interface_->primary_chain_key();
 
-                        // Explorer nav link injection removed — each HTML page has
-                        // client-side JS that checks currency_info.explorer_enabled
-                        // and injects the link dynamically. Server-side injection was
-                        // fragile (depended on exact ">Classic</a>" text) and caused
-                        // duplicate buttons on pages that had both mechanisms.
+                        std::string ep = target.substr(14);
 
-                        response.set(http::field::content_type, mime);
-                        // HTML entry points must always revalidate. Caching the shell for an
-                        // hour meant a plain browser refresh kept serving a stale dashboard
-                        // after any update or redeploy. Static assets (js/css/img/map) keep
-                        // the long cache; only the .html/.htm shells get no-cache.
-                        if (ext == ".html" || ext == ".htm")
-                            response.set(http::field::cache_control, "no-cache");
-                        else
-                            response.set(http::field::cache_control, "public, max-age=3600");
-                        response.body() = std::move(contents);
+                        // Daemonless coin-chain query hook first: when a coin
+                        // backend can answer from its own validated state (DASH's
+                        // header chain), its answer — including a refusal that
+                        // names the blocking condition — is served verbatim.
+                        //
+                        // Methods a coin backend may answer from its own validated
+                        // state. getblock/getblockheader/getrawtransaction joined the
+                        // list when the daemonless block-data policy landed: the
+                        // header chain answers getblockheader in full and getblock
+                        // partially, and REFUSES the body-backed shapes with a named
+                        // reason rather than letting the request fall through to a
+                        // branch that would answer {} (#99).
+                        const bool coin_owned_query =
+                            (ep == "getblockchaininfo" || ep == "getbestblockhash"
+                             || ep == "getblockhash"   || ep == "getblockheader"
+                             || ep == "getblock"       || ep == "getrawtransaction");
+                        if (coin_owned_query && mining_interface_->has_coin_chain_query_fn()) {
+                            rest_result = [&]() -> nlohmann::json {
+                                nlohmann::json qp = nlohmann::json::array();
+                                if (ep == "getblockheader" || ep == "getblock") {
+                                    // hash, or height resolved through the same hook.
+                                    std::string hash = getQueryParam("hash");
+                                    if (hash.empty()) {
+                                        std::string h_str = getQueryParam("height");
+                                        if (!h_str.empty()) {
+                                            nlohmann::json hp = nlohmann::json::array();
+                                            try { hp.push_back(static_cast<uint32_t>(std::stoul(h_str))); }
+                                            catch (...) {
+                                                return nlohmann::json{
+                                                    {"error", ep + " withheld: height parameter '"
+                                                              + h_str + "' is not a number "
+                                                              "(threshold: decimal height)"},
+                                                    {"code", "BAD_PARAMS"},
+                                                    {"method", ep}};
+                                            }
+                                            auto hj = mining_interface_->call_coin_chain_query(
+                                                "getblockhash", hp, chain);
+                                            if (hj.is_string()) hash = hj.get<std::string>();
+                                            else return hj;   // propagate the refusal verbatim
+                                        }
+                                    }
+                                    if (hash.empty())
+                                        return nlohmann::json{
+                                            {"error", ep + " withheld: neither ?hash= nor ?height= "
+                                                      "was supplied (threshold: one of them)"},
+                                            {"code", "BAD_PARAMS"},
+                                            {"method", ep}};
+                                    qp.push_back(hash);
+                                    if (ep == "getblock") {
+                                        auto vs = getQueryParam("verbosity");
+                                        if (vs.empty()) vs = getQueryParam("verbose");
+                                        if (!vs.empty()) {
+                                            if (vs == "true")       qp.push_back(1);
+                                            else if (vs == "false") qp.push_back(0);
+                                            else { try { qp.push_back(std::stoi(vs)); } catch (...) {} }
+                                        }
+                                    } else {
+                                        auto vs = getQueryParam("verbose");
+                                        if (vs == "false") qp.push_back(false);
+                                    }
+                                } else if (ep == "getrawtransaction") {
+                                    qp.push_back(getQueryParam("txid"));
+                                } else if (ep == "getblockhash") {
+                                    std::string height_str = getQueryParam("height");
+                                    if (height_str.empty())
+                                        return nlohmann::json{
+                                            {"error", "getblockhash withheld: missing height "
+                                                      "parameter (threshold: ?height=<n> required)"},
+                                            {"code", "BAD_PARAMS"},
+                                            {"method", ep}};
+                                    try { qp.push_back(static_cast<uint32_t>(std::stoul(height_str))); }
+                                    catch (...) {
+                                        return nlohmann::json{
+                                            {"error", "getblockhash withheld: height parameter '"
+                                                      + height_str + "' is not a number "
+                                                      "(threshold: decimal height)"},
+                                            {"code", "BAD_PARAMS"},
+                                            {"method", ep}};
+                                    }
+                                }
+                                return mining_interface_->call_coin_chain_query(ep, qp, chain);
+                            }();
+                        } else if (ep == "getblockchaininfo" && mining_interface_->has_explorer_chaininfo_fn()) {
+                            rest_result = mining_interface_->call_explorer_chaininfo(chain);
+                        } else if (ep == "getblockhash" && mining_interface_->has_explorer_blockhash_fn()) {
+                            std::string height_str = getQueryParam("height");
+                            uint32_t h = 0;
+                            try { h = static_cast<uint32_t>(std::stoul(height_str)); } catch (...) {}
+                            auto hash = mining_interface_->call_explorer_blockhash(h, chain);
+                            if (hash.empty()) {
+                                rest_result = nlohmann::json{{"error", "Block not found"}};
+                            } else {
+                                rest_result = nlohmann::json{{"result", hash}};
+                            }
+                        } else if (ep == "getblock" && mining_interface_->has_explorer_getblock_fn()) {
+                            std::string hash = getQueryParam("hash");
+                            // Also support height lookup
+                            if (hash.empty()) {
+                                std::string h_str = getQueryParam("height");
+                                if (!h_str.empty() && mining_interface_->has_explorer_blockhash_fn()) {
+                                    uint32_t h = 0;
+                                    try { h = static_cast<uint32_t>(std::stoul(h_str)); } catch (...) {}
+                                    hash = mining_interface_->call_explorer_blockhash(h, chain);
+                                }
+                            }
+                            if (hash.empty()) {
+                                rest_result = nlohmann::json{{"error", "Missing hash or height parameter"}};
+                            } else {
+                                rest_result = mining_interface_->call_explorer_getblock(hash, chain);
+                            }
+                        } else if (ep == "getmempoolinfo" && mining_interface_->has_explorer_mempoolinfo_fn()) {
+                            rest_result = mining_interface_->call_explorer_mempoolinfo(chain);
+                        } else if (ep == "getrawmempool" && mining_interface_->has_explorer_rawmempool_fn()) {
+                            bool verbose = getQueryParam("verbose") == "true";
+                            uint32_t limit = 500;
+                            try { auto ls = getQueryParam("limit"); if (!ls.empty()) limit = std::min(5000u, static_cast<uint32_t>(std::stoul(ls))); } catch (...) {}
+                            rest_result = mining_interface_->call_explorer_rawmempool(chain, verbose, limit);
+                        } else if (ep == "getmempoolentry" && mining_interface_->has_explorer_mempoolentry_fn()) {
+                            std::string txid_param = getQueryParam("txid");
+                            if (txid_param.empty()) {
+                                rest_result = nlohmann::json{{"error", "Missing txid parameter"}};
+                            } else {
+                                rest_result = mining_interface_->call_explorer_mempoolentry(txid_param, chain);
+                            }
+                        } else {
+                            rest_result = nlohmann::json{{"error", "Unknown explorer endpoint"}};
+                        }
+                    }
+                    else {
+                    // ── Static file serving (dashboard gate) ───────────────────
+                    const auto& dashboard_dir = mining_interface_->get_dashboard_dir();
+                    if (!dashboard_dir.empty()) {
+                        std::string file_path = target;
+                        if (file_path == "/" || file_path.empty())
+                            file_path = mining_interface_->is_node_ready()
+                                ? "/dashboard.html" : "/loading.html";
+
+                        // During startup, redirect all HTML pages to loading.html
+                        // (except loading.html itself). Only loading.html + sync_status
+                        // + currency_info work during early startup.
+                        if (file_path != "/loading.html" && file_path.find(".html") != std::string::npos) {
+                            bool node_ready = mining_interface_->is_node_ready();
+                            if (!node_ready) {
+                                response.result(http::status::temporary_redirect);
+                                response.set(http::field::location, "/loading.html");
+                                response.body() = "";
+                                response.prepare_payload();
+                                send_response(std::move(response));
+                                return;
+                            }
+                        }
+
+                        std::error_code fec;
+                        std::filesystem::path base = std::filesystem::weakly_canonical(dashboard_dir);
+                        std::filesystem::path requested = base / file_path.substr(1);
+                        auto resolved = std::filesystem::canonical(requested, fec);
+
+                        if (!fec && resolved.string().substr(0, base.string().size()) == base.string()
+                                 && std::filesystem::is_regular_file(resolved))
+                        {
+                            // MIME type detection
+                            std::string ext = resolved.extension().string();
+                            std::string mime = "application/octet-stream";
+                            if (ext == ".html" || ext == ".htm") mime = "text/html; charset=utf-8";
+                            else if (ext == ".js" || ext == ".mjs") mime = "application/javascript; charset=utf-8";
+                            else if (ext == ".css")  mime = "text/css; charset=utf-8";
+                            else if (ext == ".json") mime = "application/json; charset=utf-8";
+                            else if (ext == ".ico")  mime = "image/x-icon";
+                            else if (ext == ".png")  mime = "image/png";
+                            else if (ext == ".svg")  mime = "image/svg+xml";
+                            else if (ext == ".txt")  mime = "text/plain; charset=utf-8";
+                            else if (ext == ".woff2") mime = "font/woff2";
+                            else if (ext == ".woff") mime = "font/woff";
+                            else if (ext == ".map")  mime = "application/json";
+
+                            std::ifstream file(resolved, std::ios::binary);
+                            std::string contents((std::istreambuf_iterator<char>(file)),
+                                                 std::istreambuf_iterator<char>());
+
+                            // Analytics tag + consent bar (core/analytics_tag.hpp), when
+                            // --analytics-id / web.analytics_id is set: HTML only, never
+                            // under /control/, /api/, /web/log, /logs/ or with a token.
+                            const auto qmark = raw_target.find('?');
+                            const std::string tag_query = qmark == std::string::npos ? std::string()
+                                                                                     : raw_target.substr(qmark + 1);
+                            if ((ext == ".html" || ext == ".htm") && core::analytics_allowed_target(target, tag_query))
+                                core::inject_analytics_tag(contents, mining_interface_->get_analytics_id());
+
+                            // Per-coin payout-scheme label (empty on every coin but
+                            // c2pool-v37-xmr, whose scheme is WRS / PPR, never PPLNS).
+                            const auto& scheme_label = mining_interface_->get_payout_scheme_label();
+                            if (!scheme_label.empty() &&
+                                (ext == ".html" || ext == ".htm" || ext == ".js" || ext == ".mjs"))
+                                core::rewrite_payout_scheme_label(contents, scheme_label);
+
+                            // Explorer nav link injection removed — each HTML page has
+                            // client-side JS that checks currency_info.explorer_enabled
+                            // and injects the link dynamically. Server-side injection was
+                            // fragile (depended on exact ">Classic</a>" text) and caused
+                            // duplicate buttons on pages that had both mechanisms.
+
+                            response.set(http::field::content_type, mime);
+                            // HTML entry points must always revalidate. Caching the shell for an
+                            // hour meant a plain browser refresh kept serving a stale dashboard
+                            // after any update or redeploy. Static assets (js/css/img/map) keep
+                            // the long cache; only the .html/.htm shells get no-cache.
+                            if (ext == ".html" || ext == ".htm")
+                                response.set(http::field::cache_control, "no-cache");
+                            else
+                                response.set(http::field::cache_control, "public, max-age=3600");
+                            response.body() = std::move(contents);
+                            response.prepare_payload();
+                            send_response(std::move(response));
+                            return;
+                        }
+
+                        // Dashboard IS configured, the request matched no REST
+                        // endpoint above, and no such on-disk asset exists -> a real
+                        // 404. Previously this fell through to getinfo() below, so
+                        // unknown paths (explorer.html, blocks.html, typos, scanner
+                        // probes) leaked the node-info JSON instead of Not Found.
+                        response.result(http::status::not_found);
+                        response.set(http::field::content_type, "text/plain; charset=utf-8");
+                        response.body() = "404 Not Found";
                         response.prepare_payload();
                         send_response(std::move(response));
                         return;
                     }
-
-                    // Dashboard IS configured, the request matched no REST
-                    // endpoint above, and no such on-disk asset exists -> a real
-                    // 404. Previously this fell through to getinfo() below, so
-                    // unknown paths (explorer.html, blocks.html, typos, scanner
-                    // probes) leaked the node-info JSON instead of Not Found.
-                    response.result(http::status::not_found);
-                    response.set(http::field::content_type, "text/plain; charset=utf-8");
-                    response.body() = "404 Not Found";
-                    response.prepare_payload();
-                    send_response(std::move(response));
-                    return;
-                }
-                // Fallback to getinfo JSON (API-only mode: no --dashboard-dir set)
-                rest_result = mining_interface_->getinfo();
-                }  // end static file serving else
-            }  // end explorer/static dispatch
+                    // Fallback to getinfo JSON (API-only mode: no --dashboard-dir set)
+                    rest_result = mining_interface_->getinfo();
+                    }  // end static file serving else
+                }  // end explorer/static dispatch
+            }  // end fourth route chain
 
             if (!rest_result.is_null()) {
                 // ── CAPABILITY REFUSALS DO NOT SHIP AS 200 ────────────────────

@@ -144,12 +144,15 @@ inline uint256 desired_share_target(const core::CoinParams& params,
 // FrozenJobRegistry keeps every job served in the last 420 s, so a per-job copy
 // of a full template's hex would pin one copy of the same bodies per job (and
 // the registry counts a vector once per pointer). The memo keys on the template's
-// complete tx hash list (a txid is the hash of its body, so equal lists mean
-// equal bodies) and holds only weak_ptrs: it never extends a body vector's life
-// past the last frozen job that references it. Thread-safe (stratum sessions
-// build producer jobs concurrently). A template stored by the work source
-// brings its own encoded vector (DashWorkData::m_tx_hex_shared) and never
-// reaches the memo; see build_producer_job.
+// complete tx hash list, and on the bytes of every body whose txid does not
+// cover all of them: equal txids mean equal bodies except for a v24 version 2
+// asset unlock, whose re-signed instances share one txid
+// (bodies_match_under_equal_txids). It holds only weak_ptrs: it never extends
+// a body vector's life past the last frozen job that references it.
+// Thread-safe (stratum sessions build producer jobs concurrently). A template
+// stored by the work source brings its own encoded vector
+// (DashWorkData::m_tx_hex_shared) and never reaches the memo; see
+// build_producer_job.
 class TemplateBodiesMemo
 {
 public:
@@ -160,7 +163,8 @@ public:
         for (auto it = m_slots.begin(); it != m_slots.end();) {
             auto sp = it->bodies.lock();
             if (!sp) { it = m_slots.erase(it); continue; }
-            if (it->tx_hashes == wd.m_tx_hashes && sp->size() == wd.m_tx_data_hex.size())
+            if (it->tx_hashes == wd.m_tx_hashes
+                && dash::coin::bodies_match_under_equal_txids(*sp, wd.m_tx_data_hex))
                 return sp;
             ++it;
         }
@@ -1609,12 +1613,18 @@ frozen_job_for_mint(FrozenJobRegistry& registry, const uint256& ref_hash,
 // job's bytes unique, defeating the session's payload reuse and churning the
 // registry. A hit serves the SAME job (and re-puts its ref).
 //
-// A hit needs the same coin tip, height, payment amount and TX SET, and an
-// entry younger than 30 s. "Same coin template" MUST mean the same tx set, not
-// merely the same tip+height: the masternode payout inside the cached gentx is
-// fee-dependent, so a cached gentx over an older poll's fee total, frozen with
-// the CURRENT template's tx set, is a merkle-consistent but consensus-INVALID
-// block (bad-cb-payee; mainnet h2508929 and h2509044 were lost that way).
+// A hit needs the same coin tip, height, payment amount, TX SET and CbTx
+// payload, and an entry younger than 30 s. "Same coin template" MUST mean the
+// same tx set, not merely the same tip+height: the masternode payout inside the
+// cached gentx is fee-dependent, so a cached gentx over an older poll's fee
+// total, frozen with the CURRENT template's tx set, is a merkle-consistent but
+// consensus-INVALID block (bad-cb-payee; mainnet h2508929 and h2509044 were
+// lost that way). The same tx set is not enough either: a v24 version 2 asset
+// unlock re-signed at the same tip keeps its txid, so the hash list does not
+// move, but the CbTx merkleRootAssetUnlocks inside the cached gentx commits
+// the old instance while the job is frozen with the new bodies
+// (bad-cbtx-assetunlockmerkleroot). dashd swaps instances in place at the
+// same tip, so the CbTx payload is part of the hit rule.
 //
 // Every call first sweeps the entries older than 60 s, at any size (it used to
 // sweep only above 128 entries, so a small cache pinned its templates' hex
@@ -1635,8 +1645,8 @@ public:
     };
 
     /// Sweep, then look `key` up for template `wd`. A drift is a fresh entry on
-    /// the same tip and height whose tx set or payment amount moved; it is
-    /// dropped, like any other non-hit.
+    /// the same tip and height whose tx set, payment amount or CbTx payload
+    /// moved; it is dropped, like any other non-hit.
     Lookup find(const Key& key, const dash::coin::DashWorkData& wd, TimePoint now)
     {
         std::lock_guard<std::mutex> lk(m_mu);
@@ -1647,8 +1657,11 @@ public:
         const Entry& e = it->second;
         const bool same_tip = e.coin_tip == wd.m_previous_block && e.height == wd.m_height;
         const bool fresh    = now - e.at < kHitTtl;
+        const auto& cached_payload = e.build->frozen.coinbase_payload;
         if (same_tip && fresh && e.build->frozen.payment_amount == wd.m_payment_amount &&
-            e.build->frozen.desired_tx_hashes == wd.m_tx_hashes) {
+            e.build->frozen.desired_tx_hashes == wd.m_tx_hashes &&
+            std::equal(cached_payload.begin(), cached_payload.end(),
+                       wd.m_coinbase_payload.begin(), wd.m_coinbase_payload.end())) {
             r.outcome = Outcome::hit;
             r.build   = e.build;
             return r;

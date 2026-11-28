@@ -462,6 +462,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # from the cycle's epilogue (the #854 pending re-think, ported from DASH).
     # REAL NodeImpl with its compute thread and a test io_context, plus the
     # slot protocol under thread contention. Same folding rule.
+    #
+    # ltc_stratum_merkle_fold_test.cpp: core compute_merkle_branches over the
+    # embedded template's m_hashes folds back to the txid merkle root
+    # [coinbase, tx1..txN], N = 0..9 and 33. Same folding rule.
+    #
     # clean_drop_tails_test.cpp: clean_tracker's drop-tails step with a
     # per-pass head-height cache (clean_drop_tails.hpp, X1 A3): master's loop
     # verbatim against it over random forests, the safety net, the REAL
@@ -521,6 +526,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ltc_fd_plan_test.cpp
         ltc_full_view_prices_old_inputs_test.cpp
         ltc_gentx_golden_kat_test.cpp
+        ltc_stratum_merkle_fold_test.cpp
         ltc_template_time_test.cpp
         ltc_utxo_full_rerun_test.cpp
         ltc_utxo_lane_rerun_test.cpp
@@ -589,6 +595,22 @@ if (BUILD_TESTING AND GTest_FOUND)
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(share_test "" AUTO)
+
+    # ltc_walk_replay_test: differential replay of X1 stage A1 (get_chain's
+    # bounds check by has_depth) over a RECORDED LTC mainnet share chain, old
+    # and new code side by side, every output byte-compared: heights, lasts,
+    # chains, think(), PPLNS / merged payouts, and the drop-tails step.
+    # L1 runs the committed topology fixture (fixtures/); L2 the full store
+    # named by C2POOL_REPLAY_STORE_LTC (skipped when unset). Listed in
+    # build.yml's --target allowlists.
+    add_executable(ltc_walk_replay_test walk_replay_test.cpp)
+    target_link_libraries(ltc_walk_replay_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)
+    target_compile_definitions(ltc_walk_replay_test PRIVATE
+        LTC_REPLAY_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/ltc_sharechain_topology_mainnet_20261127.txt")
+    gtest_add_tests(ltc_walk_replay_test "" AUTO)
 endif()
 
 if (BUILD_TESTING)

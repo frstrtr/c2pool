@@ -133,7 +133,8 @@ struct Rig {
                                   bool, const std::string&, const uint256&,
                                   const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
                                   const std::vector<uint256>&,
-                                  const std::optional<uint16_t>&) {
+                                  const std::optional<uint16_t>&,
+                                  const std::optional<double>&) {
             share_infos = mi.get_last_merged_header_infos();
             MiningInterface::RefHashResult r;
             r.ref_hash.SetHex(std::string(64, '5'));

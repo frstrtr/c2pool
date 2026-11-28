@@ -19,6 +19,7 @@
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/dgb_arith256.hpp>  // compact_to_target (#179 MultiShield V4 served-bits window)
 #include <impl/dgb/coin/mempool.hpp>
+#include <impl/dgb/coin/scrypt_pow.hpp>  // scrypt_pow_hash (gate digest KAT)
 #include <impl/dgb/coin/connection_coinbase.hpp>  // build_connection_coinbase_from_pplns (SSOT under test)
 #include <impl/dgb/config_coin.hpp>   // dgb::CoinParams::subsidy (oracle SSOT)
 #include <impl/dgb/params.hpp>        // dgb::make_coin_params -- the LIVE production binding
@@ -29,6 +30,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdio>
+#include <string>
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -430,6 +435,161 @@ TEST(DgbWorkSource, MiningSubmitStubRejectsWithoutCallingBroadcaster)
     EXPECT_FALSE(result[0].get<bool>());
     // The 4a stub must NOT have reached the won-block broadcaster.
     EXPECT_FALSE(fx.submit_called);
+}
+
+// -- One scrypt per submission ------------------------------------------------
+// The stratum session's vardiff gate (compute_share_difficulty_pow) hands the
+// header it hashed and the digest to mining_submit (JobSnapshot::gate_pow);
+// mining_submit uses the digest for those exact 80 bytes only, so a submission
+// is hashed once. Counted with DGBWorkSource::header_scrypt_count().
+namespace {
+double gate(const dgb::stratum::DGBWorkSource& ws, const core::stratum::JobSnapshot& j,
+            const std::string& nonce, core::stratum::SharePow& pow)
+{
+    return ws.compute_share_difficulty_pow(j.coinb1, j.coinb2, kEN1, kEN2, kNT, nonce, j.version,
+                                           j.gbt_prevhash, j.nbits, j.merkle_branches, pow);
+}
+}  // namespace
+
+TEST(DgbWorkSource, MiningSubmitUsesTheGatePowOfItsHeader)
+{
+    using dgb::stratum::DGBWorkSource;
+    Fixture fx;
+    auto ws = fx.make();
+    std::vector<unsigned char> minted_header;
+    ws->set_mint_share_fn([&](const DGBWorkSource::MintShareInputs& in) -> uint256 {
+        minted_header = in.header_bytes;
+        return uint256();
+    });
+    auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
+
+    const uint64_t c0 = DGBWorkSource::header_scrypt_count();
+    core::stratum::SharePow pow;
+    const double d = gate(*ws, job, kNON, pow);
+    EXPECT_EQ(DGBWorkSource::header_scrypt_count() - c0, 1u);
+    ASSERT_TRUE(pow.valid);
+    EXPECT_GT(d, 0.0);
+    EXPECT_EQ(d, ws->compute_share_difficulty(job.coinb1, job.coinb2, kEN1, kEN2, kNT, kNON,
+                                              job.version, job.gbt_prevhash, job.nbits,
+                                              job.merkle_branches));
+    // The digest is scrypt of the header (the PoW SSOT).
+    dgb::coin::u256 direct = dgb::coin::scrypt_pow_hash(pow.header.data());
+    EXPECT_TRUE(direct == dgb::coin::u256::from_le_bytes(pow.digest.data()));
+
+    job.gate_pow = pow;
+    const uint64_t c1 = DGBWorkSource::header_scrypt_count();
+    auto result = ws->mining_submit("DGBaddr.worker1", "job-gate", kEN1, kEN2, kNT, kNON, "rid",
+                                    /*merged_addresses=*/{}, &job);
+    EXPECT_EQ(DGBWorkSource::header_scrypt_count() - c1, 0u)
+        << "mining_submit hashed the header the gate had hashed";
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    EXPECT_TRUE(fx.submit_called);
+    ASSERT_EQ(minted_header.size(), 80u);
+    EXPECT_TRUE(std::equal(minted_header.begin(), minted_header.end(), pow.header.begin()));
+}
+
+TEST(DgbWorkSource, MiningSubmitHashesWhenGatePowIsOfOtherBytes)
+{
+    using dgb::stratum::DGBWorkSource;
+    Fixture fx;
+    auto ws = fx.make();
+    auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
+    gate(*ws, job, "00000001", job.gate_pow);   // another nonce: other header bytes
+    ASSERT_TRUE(job.gate_pow.valid);
+    const uint64_t c0 = DGBWorkSource::header_scrypt_count();
+    auto result = ws->mining_submit("DGBaddr.worker1", "job-other", kEN1, kEN2, kNT, kNON, "rid",
+                                    /*merged_addresses=*/{}, &job);
+    EXPECT_EQ(DGBWorkSource::header_scrypt_count() - c0, 1u);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(fx.submit_called);
+}
+
+TEST(DgbWorkSource, MiningSubmitSameOutcomeWithAndWithoutGatePow)
+{
+    // share target 0x207fffff (~2^255): about half the digests meet it; never
+    // a block. The class of every submission is the same with the gate's
+    // digest, without it, and with the digest of another header.
+    Fixture fa, fb, fc;
+    auto with = fa.make();
+    auto without = fb.make();
+    auto wrong = fc.make();
+    int accepted = 0, rejected = 0;
+    for (uint32_t n = 0; n < 24; ++n) {
+        char nonce[9];
+        std::snprintf(nonce, sizeof(nonce), "%08x", n);
+        auto ja = make_job(/*share_bits=*/0x207fffffu, /*block_nbits=*/"03000001");
+        gate(*with, ja, nonce, ja.gate_pow);
+        auto jb = make_job(0x207fffffu, "03000001");
+        auto jc = make_job(0x207fffffu, "03000001");
+        char other[9];
+        std::snprintf(other, sizeof(other), "%08x", n + 1000);
+        gate(*wrong, jc, other, jc.gate_pow);
+
+        const auto ra = with->mining_submit("DGBaddr.w", "j", kEN1, kEN2, kNT, nonce, "rid", {}, &ja);
+        const auto rb = without->mining_submit("DGBaddr.w", "j", kEN1, kEN2, kNT, nonce, "rid", {}, &jb);
+        const auto rc = wrong->mining_submit("DGBaddr.w", "j", kEN1, kEN2, kNT, nonce, "rid", {}, &jc);
+        EXPECT_EQ(ra, rb) << "nonce " << nonce;
+        EXPECT_EQ(ra, rc) << "nonce " << nonce;
+        (ra.is_boolean() ? accepted : rejected)++;
+    }
+    EXPECT_GT(accepted, 0);
+    EXPECT_GT(rejected, 0);
+    EXPECT_FALSE(fa.submit_called);
+}
+
+// The gate hashed other bytes than the submission's header (another
+// extranonce2, a rolled version bit): mining_submit hashes again (exactly one
+// scrypt) and the outcome and the won blocks are the ones without a gate pow.
+// Block target 0x207fffff: about half the submissions are won blocks.
+TEST(DgbWorkSource, MiningSubmitHashesAgainWhenTheGateHashedAnotherExtranonce2OrVersion)
+{
+    using dgb::stratum::DGBWorkSource;
+    struct Recorder {
+        c2pool::dgb::HeaderChain chain;
+        dgb::coin::Mempool       mempool;
+        std::vector<std::vector<unsigned char>> blocks;
+        std::unique_ptr<DGBWorkSource> make()
+        {
+            auto fn = [this](const std::vector<unsigned char>& block, uint32_t) -> bool {
+                blocks.push_back(block);
+                return true;
+            };
+            return std::make_unique<DGBWorkSource>(chain, mempool, /*is_testnet=*/false, fn, kSubsidyFunc);
+        }
+    };
+    struct Case {
+        const char* name;
+        std::string en2;
+        uint32_t version_xor;
+    };
+    for (const Case& c : {Case{"extranonce2", "00000001", 0u}, Case{"rolled version bit", kEN2, 0x00002000u}}) {
+        SCOPED_TRACE(c.name);
+        Recorder rb, rg;
+        auto base = rb.make();
+        auto got = rg.make();
+        int won = 0;
+        for (uint32_t n = 0; n < 16; ++n) {
+            char nonce[9];
+            std::snprintf(nonce, sizeof(nonce), "%08x", n);
+            auto jb = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"207fffff");
+            const auto res_b = base->mining_submit("DGBaddr.w", "j", kEN1, kEN2, kNT, nonce, "rid", {}, &jb);
+
+            auto jg = make_job(0x2100ffffu, "207fffff");
+            got->compute_share_difficulty_pow(jg.coinb1, jg.coinb2, kEN1, c.en2, kNT, nonce,
+                                              jg.version ^ c.version_xor, jg.gbt_prevhash, jg.nbits,
+                                              jg.merkle_branches, jg.gate_pow);
+            ASSERT_TRUE(jg.gate_pow.valid);
+            const uint64_t c0 = DGBWorkSource::header_scrypt_count();
+            const auto res_g = got->mining_submit("DGBaddr.w", "j", kEN1, kEN2, kNT, nonce, "rid", {}, &jg);
+            EXPECT_EQ(DGBWorkSource::header_scrypt_count() - c0, 1u) << "nonce " << nonce;
+            EXPECT_EQ(res_g, res_b) << "nonce " << nonce;
+            won = static_cast<int>(rb.blocks.size());
+        }
+        EXPECT_GT(won, 0);
+        EXPECT_LT(won, 16);
+        EXPECT_EQ(rg.blocks, rb.blocks);
+    }
 }
 
 TEST(DgbWorkSource, ComputeShareDifficultyReturnsNotYetSentinel)
