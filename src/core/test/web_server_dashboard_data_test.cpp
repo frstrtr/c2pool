@@ -1939,7 +1939,7 @@ TEST(DashboardData, SharechainShareTargetsDoNotReachBestShare)
     EXPECT_EQ(bs["round"]["miner"].get<std::string>(), "w1");
     EXPECT_DOUBLE_EQ(bs["merged"]["round"]["difficulty"].get<double>(), 1.5e6);
 
-    // Default (DASH / bip110 callers) still raises the PRIMARY legs only.
+    // Default (the DASH stratum submit feed) raises the PRIMARY legs only.
     mi.record_share_difficulty(2.0e6, "dash", "ab");
     bs = mi.rest_best_share();
     EXPECT_DOUBLE_EQ(bs["round"]["difficulty"].get<double>(), 2.0e6);
@@ -2036,8 +2036,9 @@ TEST(DashboardData, BestPseudoshareHashIsItsHeadersPowHash)
 // A v1 sidecar (no "v") on LTC holds a sharechain share TARGET: the LTC card's
 // only feed was the verify hook, which reported every pool miner's share
 // target. It must not come back as this node's all-time record (field 2026-11:
-// a peer's 21631 on two unrelated nodes). DASH's feeds did not change, so its
-// v1 files keep loading.
+// a peer's 21631 on two unrelated nodes). DASH's v1/v2 primary leg was fed by
+// its share tracker hook too and is dropped below v3
+// (web_server_best_share_at_time_test.cpp).
 TEST(DashboardData, PreFixLtcBestShareSidecarIsDropped)
 {
     const std::string log_path = "/tmp/c2pool_test_bestshare_v1_statlog.json";
@@ -2058,14 +2059,15 @@ TEST(DashboardData, PreFixLtcBestShareSidecarIsDropped)
         EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 0.0)
             << "a peer's share target came back as this node's record";
         EXPECT_FALSE(bs["has_best_share"].get<bool>());
-        // The first local hash starts the record; the file is rewritten as v2.
+        // The first local hash starts the record; the file is rewritten as
+        // the current version (v3: v2 plus the at-share difficulty).
         best_pseudoshare(mi, 900.0, "w1");
         mi.save_stat_log();
     }
     {
         std::ifstream f(side);
         const auto j = nlohmann::json::parse(f);
-        EXPECT_EQ(j.value("v", 0), 2);
+        EXPECT_EQ(j.value("v", 0), 3);
         EXPECT_DOUBLE_EQ(j.value("difficulty", 0.0), 900.0);
     }
     {
@@ -2075,7 +2077,7 @@ TEST(DashboardData, PreFixLtcBestShareSidecarIsDropped)
         mi.load_stat_log();
         const auto bs = mi.rest_best_share();
         EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 900.0)
-            << "a v2 file is this node's own record";
+            << "a v3 file is this node's own record";
         EXPECT_EQ(bs["all_time"]["miner"].get<std::string>(), "w1");
     }
 
@@ -2085,8 +2087,8 @@ TEST(DashboardData, PreFixLtcBestShareSidecarIsDropped)
                            c2pool::address::Blockchain::DASH);
         mi.set_stat_log_path(log_path);
         mi.load_stat_log();
-        EXPECT_DOUBLE_EQ(mi.rest_best_share()["all_time"]["difficulty"].get<double>(), 21631.0)
-            << "DASH's feeds are unchanged; its v1 files load as before";
+        EXPECT_DOUBLE_EQ(mi.rest_best_share()["all_time"]["difficulty"].get<double>(), 0.0)
+            << "a DASH v1 primary leg was fed by the share tracker hook";
     }
     std::remove(log_path.c_str());
     std::remove(side.c_str());

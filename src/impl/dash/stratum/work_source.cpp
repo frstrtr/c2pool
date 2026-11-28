@@ -3277,7 +3277,7 @@ void DASHWorkSource::record_best_pseudoshare(
                       ? share_difficulty
                       : (pow_hash.IsNull() ? 0.0 : chain::target_to_difficulty(pow_hash));
     if (diff > 0.0)
-        fn(diff, miner, pow_hash);
+        fn(diff, miner, pow_hash, nbits_hex);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

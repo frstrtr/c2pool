@@ -1017,7 +1017,9 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                     version, prevhash_hex, merkle_root, ntime, nbits_hex, nonce);
                 if (header.size() == 80)
                     pow_hex = Hash(std::span<const unsigned char>(header.data(), header.size())).GetHex();
-                mi->update_best_difficulty(diff, miner, pow_hex, /*update_merged=*/false);
+                // The job's block bits: the target this hash was checked against.
+                mi->update_best_difficulty(diff, miner, pow_hex, /*update_merged=*/false,
+                    core::MiningInterface::bits_hex_to_difficulty(nbits_hex));
             });
 
         // ── Pool-wide "Current Payouts" (#1508 read-model wiring, #939 seam) ─

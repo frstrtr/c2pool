@@ -152,6 +152,18 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # coinbase value, txs, degraded mark), over JSON-RPC to a direct local
     # client only; the call without "chain" is unchanged. Same
     # fold-into-core_test reasoning as every TU here.
+    # web_server_best_share_at_time_test.cpp: /best_share pct_of_block is
+    # against the network difficulty in effect when the record's hash was
+    # found (job block bits / record-time difficulty; the current aux work
+    # for the merged legs), served as network_difficulty_at_share with
+    # pct_basis, per leg in /best_share and /local_stats; sidecar v3 round
+    # trip, v2 fallback to the live difficulty; a pre-v3 DASH / bip110
+    # primary leg is dropped; every main_*.cpp share tracker hook calls
+    # record_share_difficulty with update_best=false and the BTC / BCH / DASH
+    # stratum sinks pass the job's block bits (source scans under
+    # C2POOL_SRC_ROOT). Real
+    # MiningInterface + MergedMiningManager; same fold-into-core_test
+    # reasoning as every TU here.
     # web_server_block_budget_test.cpp: the LTC block weight (bad-blk-weight):
     # a REAL TemplateBuilder template over a mempool above 4 MWU, built within
     # the embedded node's budget over the web server's coinbase reserve,
@@ -366,6 +378,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         view_block_hashes_test.cpp
         version_gate_test.cpp
         web_server_aux_template_test.cpp
+        web_server_best_share_at_time_test.cpp
         web_server_block_budget_test.cpp
         web_server_block_rows_test.cpp
         web_server_config_endpoint_test.cpp

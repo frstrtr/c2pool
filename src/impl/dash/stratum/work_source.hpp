@@ -328,8 +328,9 @@ public:
         const std::vector<std::string>& merkle_branches) const override;
 
     /// IWorkSource best-share feed: recompute the exact X11 pow-hash for this
-    /// accepted pseudoshare and forward (difficulty, miner, pow_hash) to the
-    /// dashboard best-share tracker via on_share_difficulty_fn_. Every accepted
+    /// accepted pseudoshare and forward (difficulty, miner, pow_hash, the job's
+    /// block nbits) to the dashboard best-share tracker via
+    /// on_share_difficulty_fn_. Every accepted
     /// pseudoshare flows here (the stratum vardiff-accept path), so the "Best
     /// Share" card populates on the DASH solo path where shares seldom mint.
     void record_best_pseudoshare(
@@ -522,16 +523,18 @@ public:
     void set_best_share_hash_fn(std::function<uint256()> fn);
 
     /// Best-share (highest-difficulty pseudoshare) reporter. Fired from
-    /// mining_submit for EVERY accepted submission with the actual PoW
-    /// difficulty of the found hash (target_to_difficulty(pow_hash)), the
-    /// submitting miner (stratum username), and the pow-hash hex. main_dash.cpp
-    /// binds this to MiningInterface::record_share_difficulty so the dashboard
-    /// "Best Share" card shows how close DASH solo shares got to net difficulty
-    /// even when no share ever mints onto the sharechain. Display only — never
-    /// touches share/target/payout logic. While unbound this is a no-op.
+    /// record_best_pseudoshare for EVERY accepted submission with the actual
+    /// PoW difficulty of the found hash (target_to_difficulty(pow_hash)), the
+    /// submitting miner (stratum username), the pow-hash and the job's block
+    /// nbits (8-char BE hex, the header's nBits: the block target the hash was
+    /// checked against). main_dash.cpp binds this to
+    /// MiningInterface::record_share_difficulty so the dashboard "Best Share"
+    /// card shows how close DASH solo shares got to net difficulty even when
+    /// no share ever mints onto the sharechain. Display only — never touches
+    /// share/target/payout logic. While unbound this is a no-op.
     using ShareDifficultyFn =
         std::function<void(double difficulty, const std::string& miner,
-                           const uint256& pow_hash)>;
+                           const uint256& pow_hash, const std::string& nbits_hex)>;
     void set_on_share_difficulty_fn(ShareDifficultyFn fn);
 
     /// Found-block reporter for the dashboard "Recent Blocks" card. Fired from

@@ -1166,6 +1166,58 @@ TEST(WebGaugeParity, BestShareRecordIsRealNotSharechainAverage) {
     }
 }
 
+// /best_share shape: every leg keeps its fields and adds the network
+// difficulty in effect when its hash was found (network_difficulty_at_share,
+// 0 = unknown) and the basis of pct_of_block ("at_share" / "current");
+// network_difficulty stays the live value. Additive only: an older dashboard
+// reads the same keys as before.
+TEST(WebGaugeParity, BestShareLegsCarryTheDifficultyAtTheShare) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.update_network_difficulty(2000.0, "test");
+    mi.record_share_difficulty(500.0, "minerA", "aa");
+    mi.record_best_pseudoshare(400.0, "minerA", "", "", "", "", "", "", 0, "", "", {});
+    mi.update_network_difficulty(1000.0, "test");
+
+    const json b = mi.rest_best_share();
+    ASSERT_TRUE(b.contains("network_difficulty"));
+    EXPECT_DOUBLE_EQ(b["network_difficulty"].get<double>(), 1000.0);
+    for (const char* scope : {"all_time", "session", "round"}) {
+        ASSERT_TRUE(b.contains(scope)) << scope;
+        const auto& e = b[scope];
+        for (const char* key : {"difficulty", "pct_of_block", "miner", "timestamp", "hash",
+                                "network_difficulty_at_share", "pct_basis"})
+            EXPECT_TRUE(e.contains(key)) << scope << "." << key;
+        EXPECT_DOUBLE_EQ(e["network_difficulty_at_share"].get<double>(), 2000.0) << scope;
+        EXPECT_DOUBLE_EQ(e["pct_of_block"].get<double>(), 25.0) << scope;
+        EXPECT_EQ(e["pct_basis"].get<std::string>(), "at_share") << scope;
+    }
+    ASSERT_TRUE(b.contains("merged"));
+    for (const char* scope : {"all_time", "round"}) {
+        const auto& e = b["merged"][scope];
+        for (const char* key : {"difficulty", "pct_of_block", "miner", "timestamp",
+                                "network_difficulty_at_share", "pct_basis"})
+            EXPECT_TRUE(e.contains(key)) << "merged." << scope << "." << key;
+        // No aux chain: nothing to measure against, and it says so.
+        EXPECT_DOUBLE_EQ(e["network_difficulty_at_share"].get<double>(), 0.0) << scope;
+        EXPECT_EQ(e["pct_basis"].get<std::string>(), "current") << scope;
+    }
+    EXPECT_TRUE(b["merged"].contains("network_difficulty"));
+
+    // /local_stats best_share serves the same legs with the same math.
+    const json ls = mi.rest_local_stats()["best_share"];
+    EXPECT_DOUBLE_EQ(ls["network_difficulty"].get<double>(), 1000.0);
+    for (const char* scope : {"all_time", "session", "round"}) {
+        ASSERT_TRUE(ls.contains(scope)) << "local_stats." << scope;
+        const auto& e = ls[scope];
+        for (const char* key : {"difficulty", "pct_of_block", "miner", "timestamp", "hash",
+                                "network_difficulty_at_share", "pct_basis"})
+            EXPECT_TRUE(e.contains(key)) << "local_stats." << scope << "." << key;
+        EXPECT_EQ(e["network_difficulty_at_share"], b[scope]["network_difficulty_at_share"]) << scope;
+        EXPECT_EQ(e["pct_of_block"], b[scope]["pct_of_block"]) << scope;
+        EXPECT_EQ(e["pct_basis"], b[scope]["pct_basis"]) << scope;
+    }
+}
+
 // (c) aps IS the non-stale rate; the gross rate is that grossed UP.
 TEST(WebGaugeParity, StaleRelationshipMatchesP2poolNotItsInverse) {
     MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
@@ -1750,6 +1802,33 @@ TEST(DashboardBestShare, RecordGatesOnHasBestNotAverage) {
     EXPECT_NE(fn.find("has_best_share"), std::string::npos)
         << "renderBestShare must gate the record on bs.has_best_share; without "
            "it a syncing node renders the sharechain average as a 'Best Share'.";
+}
+
+// renderBestShare shows "best / difficulty" with the network difficulty in
+// effect when the share was found, for the parent and the merged row, and
+// marks a pct measured against the live difficulty (pct_basis "current" or
+// absent).
+TEST(DashboardBestShare, ShowsTheDifficultyAtTheShareAndMarksTheLiveBasis) {
+    const auto html = read_dashboard();
+    auto start = html.find("function renderBestShare(bs)");
+    ASSERT_NE(start, std::string::npos) << "renderBestShare not found";
+    auto end = html.find("\n        function ", start + 1);
+    ASSERT_NE(end, std::string::npos);
+    const std::string fn = html.substr(start, end - start);
+
+    EXPECT_NE(fn.find("network_difficulty_at_share"), std::string::npos)
+        << "the card must show the difficulty the share was measured against";
+    EXPECT_NE(fn.find("pct_basis === 'at_share'"), std::string::npos)
+        << "the card must tell an at-share pct from a live-difficulty one";
+    EXPECT_NE(fn.find("vs current difficulty"), std::string::npos)
+        << "a pct against the live difficulty must be marked";
+    EXPECT_NE(fn.find("shareNetDiff(bs.round, bs.network_difficulty)"), std::string::npos)
+        << "the parent row's divisor must be the round leg's at-share difficulty";
+    EXPECT_NE(fn.find("shareNetDiff(mr, bs.merged.network_difficulty)"), std::string::npos)
+        << "the merged row's divisor must be the merged round leg's at-share difficulty";
+    // The divisor is no longer the bare live value.
+    EXPECT_EQ(fn.find("format_difficulty(bs.network_difficulty))"), std::string::npos);
+    EXPECT_EQ(fn.find("format_difficulty(bs.merged.network_difficulty))"), std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

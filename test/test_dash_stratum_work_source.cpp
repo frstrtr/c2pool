@@ -4693,3 +4693,46 @@ TEST(DashBlsModeGuard, StratumObjectsShareTheBuildsBlsMode)
     EXPECT_EQ(bls_modes(), kBlsModeStub);
 #endif
 }
+
+// The Best Share feed carries the job's block nbits: record_best_pseudoshare
+// forwards the nbits the stratum session passed (the header's nBits, the
+// block target the hash was checked against), so the dashboard measures the
+// record against the difficulty of that job, not the node's difficulty when
+// the submit is processed (one retarget off for a share of an older job).
+TEST(DashStratumWorkSource, BestPseudoshareForwardsTheJobsBlockBits)
+{
+    Fixture f;
+    auto ws = f.make();
+    int calls = 0;
+    double got_diff = 0.0;
+    std::string got_miner, got_bits;
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::DASH);
+    ws->set_on_share_difficulty_fn(
+        [&](double diff, const std::string& miner, const uint256& pow_hash,
+            const std::string& nbits_hex) {
+            ++calls;
+            got_diff = diff;
+            got_miner = miner;
+            got_bits = nbits_hex;
+            // As main_dash.cpp binds it.
+            mi.record_share_difficulty(diff, miner, pow_hash.GetHex(), /*update_best=*/true,
+                                       core::MiningInterface::bits_hex_to_difficulty(nbits_hex));
+        });
+    const std::string job_bits = "1b0404cb";
+    const double job_diff = chain::target_to_difficulty(chain::bits_to_target(0x1b0404cbu));
+    ASSERT_GT(job_diff, 0.0);
+    mi.update_network_difficulty(job_diff * 2.0, "test");   // the template moved on
+
+    ws->record_best_pseudoshare(1234.5, "Xminer", "", "", "", "", "", "", 0, "", job_bits, {});
+    ASSERT_EQ(calls, 1);
+    EXPECT_DOUBLE_EQ(got_diff, 1234.5);
+    EXPECT_EQ(got_miner, "Xminer");
+    EXPECT_EQ(got_bits, job_bits);
+
+    const auto bs = mi.rest_best_share();
+    EXPECT_DOUBLE_EQ(bs["round"]["network_difficulty_at_share"].get<double>(), job_diff);
+    EXPECT_DOUBLE_EQ(bs["round"]["pct_of_block"].get<double>(), 1234.5 / job_diff * 100.0);
+    EXPECT_EQ(bs["round"]["pct_basis"].get<std::string>(), "at_share");
+    EXPECT_DOUBLE_EQ(bs["network_difficulty"].get<double>(), job_diff * 2.0);
+}
