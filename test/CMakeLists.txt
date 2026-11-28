@@ -652,7 +652,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_frozen_registry_cap.cpp
         test_dash_share_download.cpp
         test_dash_v36_share.cpp
-        test_dash_known_txs_retention.cpp)
+        test_dash_known_txs_retention.cpp
+        test_dash_gbt_stable_txid.cpp)
     target_link_libraries(test_dash_share_hash_link PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -662,6 +663,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_share_hash_link PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_share_hash_link "" AUTO)
 
+    # test_dash_gbt_stable_txid.cpp: the txids a dashd getblocktemplate reply is
+    # read with (coin/gbt_transactions.hpp: the v24 stable txid of a version 2
+    # asset unlock, cross-checked against dashd's "hash") and the body memo of
+    # build_producer_job, on two real testnet blocks with v2 unlocks
+    # (test/data/dash_block_testnet_15999*.inc). Folded into the allowlisted
+    # target above (the #769 rule), next to the mint_runloop TU whose memo it pins.
     # test_dash_known_txs_retention.cpp: pure retention/eviction semantics of the
     # known-tx pool that backs share broadcast (register_template_txs) — rolling
     # window, evict-only-after-a-tx-falls-out-of-ALL-retained-sets, the F1

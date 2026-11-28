@@ -5046,7 +5046,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // both found blocks lost). desired_tx_hashes equality pins the
                 // cached coinbase to the exact tx set (and therefore the exact
                 // fee total) it was computed for; payment_amount equality is the
-                // cheap belt for any same-height payment-array drift.
+                // cheap belt for any same-height payment-array drift. The CbTx
+                // payload must match too: a v24 version 2 asset unlock re-signed
+                // at the same tip keeps its txid (so the tx set is "equal") while
+                // the cached gentx's merkleRootAssetUnlocks commits the old
+                // instance -- served with the new bodies, a found block would be
+                // bad-cbtx-assetunlockmerkleroot (ProducerJobCache::find).
                 const auto hit = job_cache->find(key, wd, now);
                 if (hit.outcome == dash::mint::ProducerJobCache::Outcome::hit) {
                     mint_registry->put(hit.build->job.ref_hash, hit.build->frozen,
