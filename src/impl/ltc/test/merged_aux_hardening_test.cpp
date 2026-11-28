@@ -2400,6 +2400,13 @@ struct LineClient {
         const std::string line = j.dump() + "\n";
         (void)::send(fd, line.data(), line.size(), MSG_NOSIGNAL);
     }
+    // Reads (up to tries x the 50 ms receive timeout) until a mining.notify
+    // has set last_job to something other than `prev`; true when it has.
+    bool wait_new_job(const std::string& prev, int tries = 200)
+    {
+        for (int t = 0; t < tries && last_job == prev; ++t) wait_id(-1, 1);
+        return last_job != prev;
+    }
     // Reads until the response with `id` (also tracking mining.notify job ids).
     std::optional<nlohmann::json> wait_id(int id, int tries = 60)
     {
@@ -2544,6 +2551,7 @@ TEST(MergedAuxStratumSession, SubmitCarriesWhatTheJobCommittedTo)
     LineClient c(rig.port);
     rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
     ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {ltc, "x"}));
+    c.wait_new_job("");
     ASSERT_FALSE(c.last_job.empty());
     const std::string job1 = c.last_job;
     c.send({{"id", 3}, {"method", "mining.set_merged_addresses"}, {"params", {{{"98", doge2}}}}});
@@ -2710,6 +2718,7 @@ TEST(NodeFeeStratumSession, SubmitIsJudgedByItsJobsShareBits)
     LineClient c(rig.port);
     rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
     ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {b58(48, 0x01), "x"}));
+    c.wait_new_job("");
     ASSERT_FALSE(c.last_job.empty());
     c.send({{"id", 3}, {"method", "mining.submit"}, {"params", {"w", c.last_job, "00000000", "6ae2a090", "00000000"}}});
     c.wait_id(3);
@@ -2743,6 +2752,7 @@ TEST(StratumBestShare, EveryAcceptedSubmitFeedsItOnceAtItsAchievedDifficulty)
     LineClient c(rig.port);
     rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
     ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {b58(48, 0x01), "x"}));
+    c.wait_new_job("");
     ASSERT_FALSE(c.last_job.empty());
     const std::string job = c.last_job;   // one job: its issued difficulty bounds the vardiff gate
     const auto submit = [&](int id, const char* nonce) {
@@ -3171,6 +3181,7 @@ TEST(MergedAuxStratumSession, AJobBuiltBeforeTheLoginKeepsItsSplitThroughTheAuth
     LineClient c(rig.port);
     ASSERT_GE(c.fd, 0);
     rig.step(c, 1, "mining.subscribe", nlohmann::json::array());
+    c.wait_new_job("");
     ASSERT_FALSE(c.last_job.empty()) << "a job is sent right after subscribe";
     const std::string before_login = c.last_job;
     {
@@ -3181,6 +3192,7 @@ TEST(MergedAuxStratumSession, AJobBuiltBeforeTheLoginKeepsItsSplitThroughTheAuth
         EXPECT_EQ(*rig.ws->build_donations.back(), 32768) << "the build commits to the split donation";
     }
     ASSERT_TRUE(rig.step(c, 2, "mining.authorize", {ltc, "x"}));
+    c.wait_new_job(before_login);
     ASSERT_NE(c.last_job, before_login) << "the authorize sends a new job";
     const std::string after_login = c.last_job;
     {
