@@ -462,6 +462,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # from the cycle's epilogue (the #854 pending re-think, ported from DASH).
     # REAL NodeImpl with its compute thread and a test io_context, plus the
     # slot protocol under thread contention. Same folding rule.
+    # clean_drop_tails_test.cpp: clean_tracker's drop-tails step with a
+    # per-pass head-height cache (clean_drop_tails.hpp, X1 A3): master's loop
+    # verbatim against it over random forests, the safety net, the REAL
+    # NodeImpl::clean_tracker pass, and (C2POOL_REPLAY_STORE_LTC set) a
+    # recorded store. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -474,6 +479,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         build_stops_test.cpp
         chain_topology_endpoints_kat_test.cpp
         chain_walk_window_test.cpp
+        clean_drop_tails_test.cpp
         cmpct_litecoind_vector_test.cpp
         cmpct_v3_mweb_state_test.cpp
         compact_block_merkle_test.cpp
