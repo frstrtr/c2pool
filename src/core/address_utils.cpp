@@ -81,8 +81,10 @@ std::string address_to_hash160(const std::string& address, std::string& addr_typ
 {
     addr_type.clear();
 
-    // Try Bech32 first
-    static const std::vector<std::string> bech32_hrps = {"tltc", "ltc", "bc", "tb"};
+    // Try Bech32 first. "bcrt" (BTC/BIP-110 regtest) is appended: the separator
+    // is part of the prefix match, so "bcrt1" can never shadow "bc1" or vice
+    // versa, and every pre-existing HRP decodes exactly as before.
+    static const std::vector<std::string> bech32_hrps = {"tltc", "ltc", "bc", "tb", "bcrt"};
     for (const auto& hrp : bech32_hrps) {
         std::string prefix = hrp + "1";
         if (address.size() > prefix.size() &&
@@ -362,8 +364,11 @@ std::string script_to_address(const std::vector<unsigned char>& script,
 
 std::vector<unsigned char> address_to_script(const std::string& address)
 {
-    // Try Bech32 first
-    static const std::vector<std::string> bech32_hrps = {"tltc", "ltc", "bc", "tb"};
+    // Try Bech32 first. "bcrt" (BTC/BIP-110 regtest) is appended — additive:
+    // without it a bcrt1 payout decoded to an EMPTY script, so the stratum job
+    // coinbase dropped the finder output while the share committed the real
+    // address (verify_share GENTX mismatch at sharechain h2 on regtest).
+    static const std::vector<std::string> bech32_hrps = {"tltc", "ltc", "bc", "tb", "bcrt"};
     for (const auto& hrp : bech32_hrps) {
         std::string prefix = hrp + "1";
         if (address.size() > prefix.size() &&
