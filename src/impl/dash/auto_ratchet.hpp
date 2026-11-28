@@ -27,13 +27,73 @@
 // concrete target value is a wire-up-time decision and is intentionally NOT baked in
 // here — every function takes current_floor / target_floor as parameters.
 
+#include <core/netaddress.hpp>  // NetService (share peer_addr = reception origin)
 #include <core/uint256.hpp>  // uint288
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <vector>
 
 namespace dash {
+
+// Distinct-origin precondition (#920; DASH port of the LTC guard, #930 + #1362).
+// A 95% supermajority is necessary but NOT sufficient to lift the floor: the YES-
+// votes in the ratchet window must trace to at least MIN_DISTINCT_ORIGINS distinct
+// origins. An "origin" is the self node (every locally minted YES-vote collapses to
+// ONE origin) plus each distinct non-self peer_addr among the received YES-votes.
+//
+// Without it, any node alone on its sharechain -- a fresh chain, a testnet, a
+// partitioned segment, a node whose peers all dropped -- is trivially 100% of its
+// own window and ratchets itself 1700 -> 3600, partitioning from every legacy 1700
+// peer: the #774 outcome (absence read as assent) reached by the opposite route
+// (a real but SELF-AUTHORED supermajority). Counting self as one origin and
+// requiring >= 2 also closes the relayed shape: a supermajority authored by one
+// entity and injected through ONE peer connection.
+//
+// LEGITIMATE SMALL POOLS: a 2-operator crossing still fires -- each node sees its
+// own YES-votes (self) plus the other's relayed YES-votes (one non-self origin)
+// = 2. A pool that is genuinely ONE node never auto-ratchets; the floor stays at
+// the legacy 1700, which admits every peer, so the guard can only DELAY our own
+// floor lift, never change any share's validity or work (peer_addr is transient
+// reception metadata, never serialized into the share hash).
+//
+// LIMITATION (same as LTC): origins are counted by reception address, so one
+// operator holding N addresses can still simulate N origins. This raises the floor
+// from 1 to 2; it is not a sybil-proof identity check.
+inline constexpr int MIN_DISTINCT_ORIGINS = 2;
+
+// A single share's vote and reception origin, as read off the ratchet window.
+struct VoteOrigin {
+    int64_t    desired_version;
+    NetService peer_addr;
+};
+
+// Canonical "locally minted" test, identical to LTC's: a local share carries the
+// default NetService{} or 0.0.0.0:0; a network share carries the relaying peer.
+// Shares restored from LevelDB also load with NetService{} and so count as self --
+// conservative (it can only reduce the distinct count, i.e. delay, never lift).
+inline bool is_self_origin(const NetService& peer_addr)
+{
+    return peer_addr == NetService{} || peer_addr == NetService{"0.0.0.0", 0};
+}
+
+// Distinct origins among the shares voting desired_version >= yes_version. Pure.
+inline int count_distinct_yes_origins(const std::vector<VoteOrigin>& window,
+                                      int64_t yes_version)
+{
+    bool self_yes = false;
+    std::set<NetService> nonself;
+    for (const auto& v : window) {
+        if (v.desired_version < yes_version)
+            continue;
+        if (is_self_origin(v.peer_addr))
+            self_yes = true;
+        else
+            nonself.insert(v.peer_addr);
+    }
+    return static_cast<int>(nonself.size()) + (self_yes ? 1 : 0);
+}
 
 // A single share's contribution to a desired-version tally: the version it desires
 // and its work weight (target_to_average_attempts of its target, == ShareIndex::work,
@@ -119,18 +179,25 @@ inline uint32_t ratchet_min_protocol_version(
 // spuriously lift the floor and reject every legitimate peer. This function is that
 // guard: no lift until a FULL window exists behind the best share's parent, then
 // delegate to the pure ratchet over the window the caller sampled.
+//
+// distinct_origins is count_distinct_yes_origins over that SAME window. It is a
+// required argument (no default) so no call site can skip the #920 precondition.
+// c2pool-native: the oracle has no origin rule (it ratchets on weight alone).
 inline uint32_t apply_min_protocol_ratchet_decision(
     int32_t  parent_height,
     int32_t  chain_length,
     const std::map<uint64_t, uint288>& window_weights,
     int64_t  best_version,
     uint32_t current_floor,
-    uint32_t target_floor)
+    uint32_t target_floor,
+    int      distinct_origins)
 {
     if (current_floor >= target_floor)      // oracle guard: minpver < newminpver
         return current_floor;
     if (parent_height < chain_length)       // oracle: len(shares) > CHAIN_LENGTH
         return current_floor;               // no full window yet -> never lift
+    if (distinct_origins < MIN_DISTINCT_ORIGINS)  // #920: single origin -> never lift
+        return current_floor;
     return ratchet_min_protocol_version(
         window_weights, best_version, current_floor, target_floor);
 }
