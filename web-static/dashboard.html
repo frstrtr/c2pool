@@ -3655,7 +3655,13 @@
                 // Use configured external_ip, or fall back to browser hostname
                 var host = (nodeInfo.external_ip && nodeInfo.external_ip !== '0.0.0.0')
                     ? nodeInfo.external_ip : window.location.hostname;
-                var minerUrl = 'stratum+tcp://' + host + ':' + (nodeInfo.worker_port || 9327);
+                // worker_port 0/absent = this node has no stratum listener
+                // (e.g. c2pool-dash without --stratum): say so, never show
+                // another coin's default port.
+                var wp = Number(nodeInfo.worker_port);
+                var minerUrl = (wp > 0 && wp < 65536)
+                    ? 'stratum+tcp://' + host + ':' + wp
+                    : 'stratum off on this node (start it with --stratum PORT)';
                 document.getElementById('miner-url').textContent = minerUrl;
             } else {
                 document.getElementById('miner-url').textContent = 'unavailable';
