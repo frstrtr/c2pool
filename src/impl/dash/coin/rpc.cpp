@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "rpc.hpp"
 
+#include <impl/dash/coin/gbt_transactions.hpp>
 #include <impl/dash/coin/rpc_request.hpp>
 
 #include <core/log.hpp>
@@ -10,6 +11,8 @@
 #include <util/strencodings.h>   // ParseHex / HexStr
 
 #include <algorithm>             // std::min (sync-reconnect backoff)
+#include <mutex>
+#include <set>
 
 #ifndef _WIN32
 #include <sys/socket.h>          // setsockopt SO_SND/RCVTIMEO (Send() deadline)
@@ -26,6 +29,30 @@ namespace coin
 // make_gbt_request: see impl/dash/coin/rpc_request.hpp (oracle/identity SSOT).
 // check() probes getblockheader(dash_genesis_hash(IS_TESTNET)) to confirm the
 // daemon is a real dashd on the selected network.
+
+namespace
+{
+
+// A getblocktemplate entry whose "hash" differs from the dash_txid of its own
+// bytes means the node and dashd disagree on the id the block's merkle root
+// commits to: every job over that template would carry a header dashd
+// rejects. Logged as an error once per txid (the template is re-read every few
+// seconds); the remembered set is bounded.
+void log_gbt_txid_disagreement_once(const uint256& txid, const uint256& gbt_hash, uint32_t height)
+{
+    static std::mutex mu;
+    static std::set<uint256> logged;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (logged.size() >= 4096) logged.clear();
+        if (!logged.insert(txid).second) return;
+    }
+    LOG_ERROR << "[GBT-TXID] getblocktemplate h=" << height << " lists hash=" << gbt_hash.GetHex()
+              << " for a tx whose dash_txid is " << txid.GetHex()
+              << " -- serving dash_txid; a block over this template may be rejected (bad-txnmrklroot)";
+}
+
+} // namespace
 
 NodeRPC::NodeRPC(io::io_context* context, dash::interfaces::Node* coin, bool testnet)
     : IS_TESTNET(testnet), m_coin(coin), m_context(context), m_stream(*context),
@@ -412,51 +439,18 @@ DashWorkData NodeRPC::getwork()
         w.m_height = getblock(w.m_previous_block)["height"].get<uint32_t>() + 1;
 
     // ----- Transactions (full parse + raw hex + txid + fees) -----
+    // The txid of each entry is the one the block's merkle root commits to
+    // (dash_txid: the v24 stable txid for a version 2 asset unlock, not the
+    // SHA256d of its bytes); see coin/gbt_transactions.hpp for the rule.
     if (work.contains("transactions"))
     {
-        for (auto& packed_tx : work["transactions"])
-        {
-            std::string data_hex;
-            if (packed_tx.is_object() && packed_tx.contains("data"))
-                data_hex = packed_tx["data"].get<std::string>();
-            else if (packed_tx.is_string())
-                data_hex = packed_tx.get<std::string>();
-            if (data_hex.empty())
-                continue;
-
-            w.m_tx_data_hex.push_back(data_hex);
-
-            // Deserialize into a full MutableTransaction (DASH tx codec handles
-            // the version|(type<<16) field + DIP3/DIP4 special-tx payload).
-            MutableTransaction mtx;
-            try
-            {
-                PackStream ps_tx(ParseHex(data_hex));
-                ps_tx >> mtx;
-            }
-            catch (const std::exception& ex)
-            {
-                LOG_WARNING << "getwork: tx deserialize failed: " << ex.what();
-            }
-            w.m_txs.emplace_back(mtx);   // Transaction(MutableTransaction) is explicit
-
-            // txid: prefer GBT's "txid" field, else recompute (DASH non-witness
-            // canonical serialization == dash_txid).
-            uint256 txid;
-            if (packed_tx.is_object() && packed_tx.contains("txid"))
-                txid = uint256S(packed_tx["txid"].get<std::string>());
-            else
-            {
-                PackStream ps_id(ParseHex(data_hex));
-                txid = Hash(ps_id.get_span());
-            }
-            w.m_tx_hashes.push_back(txid);
-
-            uint64_t fee = 0;
-            if (packed_tx.is_object() && packed_tx.contains("fee"))
-                fee = packed_tx["fee"].get<uint64_t>();
-            w.m_tx_fees.push_back(fee);
-        }
+        const GbtTxReadReport rep = append_gbt_transactions(work["transactions"], w);
+        for (const auto& f : rep.parse_failures)
+            LOG_WARNING << "getwork: tx deserialize failed at index " << f.index << ": " << f.what
+                        << (f.used_gbt_hash ? " -- using dashd's \"hash\" as its txid"
+                                            : " -- no \"hash\" either: txid = SHA256d of its bytes");
+        for (const auto& d : rep.disagreements)
+            log_gbt_txid_disagreement_once(d.txid, d.gbt_hash, w.m_height);
     }
 
     // ----- DASH masternode + superblock + platform payments -----
