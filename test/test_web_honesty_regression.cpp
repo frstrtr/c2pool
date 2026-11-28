@@ -20,6 +20,7 @@
 #include <core/web_server.hpp>
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig SHARE_PERIOD / TARGET_LOOKBEHIND
 #include <impl/ltc/config_pool.hpp>    // ltc::PoolConfig  SHARE_PERIOD / TARGET_LOOKBEHIND
+#include <c2pool/ltc/doge_topology_sync_state.hpp>
 
 #include <chrono>
 #include <cmath>
@@ -2108,4 +2109,36 @@ TEST(DashboardSessionStates, FailbackReadsStandbyHashingElsewhere) {
         << "the standby chip does not say the rigs hash on another node";
     // The stalled warning still lists stalled only (failback rows are standby).
     EXPECT_NE(html.find("return sw.state === 'stalled';"), std::string::npos);
+}
+
+// D-DOGE tip row: the DOGE row of /api/node_topology carries the embedded DOGE
+// header-chain tip, and a chain with no tip yet writes no height.
+TEST(DogeTopologySyncState, ReportsHeaderTipAndSynced) {
+    const auto r = c2pool::topology::doge_topology_sync_state(
+        /*blocks_connected=*/120, /*gate_depth=*/100, /*header_tip=*/5432100u);
+    EXPECT_TRUE(r.at("synced").get<bool>());
+    EXPECT_EQ(r.at("height").get<int>(), 5432100);
+}
+
+TEST(DogeTopologySyncState, NoTipWritesNoHeight) {
+    const auto r = c2pool::topology::doge_topology_sync_state(0, 100, 0u);
+    EXPECT_FALSE(r.at("synced").get<bool>());
+    EXPECT_FALSE(r.contains("height"));
+}
+
+// The DOGE hook is a lambda inside main(), so pin that it feeds the header tip.
+TEST(DogeTopologySyncState, MainLtcDogeHookFeedsHeaderTip) {
+    std::ifstream f(std::string(WEB_STATIC_DIR) + "/../src/c2pool/main_ltc.cpp");
+    ASSERT_TRUE(f.is_open());
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string src = ss.str();
+    const auto hook = src.find("if (msym == \"DOGE\") {");
+    ASSERT_NE(hook, std::string::npos);
+    const auto end = src.find("merged_broadcasters[cfg.chain_id]", hook);
+    ASSERT_NE(end, std::string::npos);
+    const std::string body = src.substr(hook, end - hook);
+    EXPECT_NE(body.find("doge_topology_sync_state("), std::string::npos);
+    EXPECT_NE(body.find("doge_chain ? doge_chain->height() : 0u"), std::string::npos)
+        << "/api/node_topology DOGE row no longer reports the header tip";
 }
