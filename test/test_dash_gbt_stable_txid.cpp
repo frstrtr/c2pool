@@ -19,7 +19,8 @@
 //     (SHA256d of the bytes) must give the instance-hash root instead;
 //   * with "hash" omitted, the reader still derives the stable txid itself;
 //   * when the bytes do not deserialize, dashd's "hash" is the txid;
-//   * a "hash" that disagrees with the bytes is reported, not silently used;
+//   * a "hash" that disagrees with the dash_txid of the bytes is served (it is
+//     Core's GetHash of those bytes) and the disagreement is reported;
 //   * the embedded build's ids (dash_txid of the same txs) fold to the same
 //     body root as the reader's, so the embedded-vs-dashd tx-root xcheck
 //     compares like with like;
@@ -307,20 +308,40 @@ TEST(DashGbtStableTxid, UnparsableBytesUseDashdHash)
     EXPECT_EQ(r.source, GbtEntryTxid::Source::GbtHash);
 }
 
-TEST(DashGbtStableTxid, DisagreeingHashIsReportedAndTheBytesDecide)
+// dashd's "hash" is Core's GetHash of the very bytes the body carries: on a
+// disagreement it is served, and the node's own derivation is only reported.
+TEST(DashGbtStableTxid, DisagreeingHashIsReportedAndDashdHashDecides)
 {
     const auto& rb = block_1599900();
-    // dashd's "hash" set to the instance hash (what the old rule produced).
-    const uint256 instance = sha256d_bytes(ParseHex(rb.tx_hex[5]));
+    // A "hash" other than dash_txid of the bytes (here: the instance hash).
+    const uint256 other = sha256d_bytes(ParseHex(rb.tx_hex[5]));
+    ASSERT_NE(other, rb.dashd_txids[5]);
     DashWorkData w;
-    nlohmann::json txs = nlohmann::json::array({{{"data", rb.tx_hex[5]}, {"hash", instance.GetHex()}}});
+    nlohmann::json txs = nlohmann::json::array({
+        {{"data", rb.tx_hex[1]}, {"hash", rb.dashd_txids[1].GetHex()}},   // agrees
+        {{"data", rb.tx_hex[5]}, {"hash", other.GetHex()}}});             // disagrees
     const auto rep = dash::coin::append_gbt_transactions(txs, w);
-    ASSERT_EQ(w.m_tx_hashes.size(), 1u);
-    EXPECT_EQ(w.m_tx_hashes[0], rb.dashd_txids[5]);
+    ASSERT_EQ(w.m_tx_hashes.size(), 2u);
+    EXPECT_EQ(w.m_tx_hashes[0], rb.dashd_txids[1]);
+    EXPECT_EQ(w.m_tx_hashes[1], other);
     ASSERT_EQ(rep.disagreements.size(), 1u);
-    EXPECT_EQ(rep.disagreements[0].index, 0u);
-    EXPECT_EQ(rep.disagreements[0].txid, rb.dashd_txids[5]);
-    EXPECT_EQ(rep.disagreements[0].gbt_hash, instance);
+    EXPECT_EQ(rep.disagreements[0].index, 1u);
+    EXPECT_EQ(rep.disagreements[0].gbt_hash, other);
+    EXPECT_EQ(rep.disagreements[0].derived_txid, rb.dashd_txids[5]);
+    EXPECT_TRUE(rep.parse_failures.empty());
+
+    const auto raw = ParseHex(rb.tx_hex[5]);
+    const auto& tx = rb.block.m_txs[5];
+    const auto r = dash::coin::gbt_entry_txid(&tx, other, std::span<const unsigned char>(raw));
+    EXPECT_EQ(r.txid, other);
+    EXPECT_EQ(r.source, GbtEntryTxid::Source::GbtHash);
+    EXPECT_EQ(r.derived, rb.dashd_txids[5]);
+    EXPECT_TRUE(r.hash_disagrees);
+    // No "hash": the bytes decide.
+    const auto r2 = dash::coin::gbt_entry_txid(&tx, std::nullopt, std::span<const unsigned char>(raw));
+    EXPECT_EQ(r2.txid, rb.dashd_txids[5]);
+    EXPECT_EQ(r2.source, GbtEntryTxid::Source::ParsedTx);
+    EXPECT_FALSE(r2.hash_disagrees);
 }
 
 TEST(DashGbtStableTxid, BareStringEntriesAndEmptyDataAreHandled)

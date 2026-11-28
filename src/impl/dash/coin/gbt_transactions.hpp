@@ -14,11 +14,14 @@
 /// (rpc/mining.cpp getblocktemplate); it sends no "txid" key.
 ///
 /// gbt_entry_txid is the per-entry rule, pure:
-///   * the bytes deserialized completely (no trailing bytes): dash_txid of the
-///     parsed tx, the same derivation every other tx-hash site of the node
-///     uses. dashd's "hash", when present, is cross-checked against it and a
-///     disagreement is reported to the caller;
-///   * the bytes did not deserialize: dashd's "hash";
+///   * the entry has a "hash": dashd's "hash". It is Core's own GetHash of the
+///     very bytes the block body carries, so it is the id the validator
+///     recomputes. When the bytes also deserialize completely, dash_txid of the
+///     parsed tx is cross-checked against it; a disagreement can only mean a
+///     defect in dash_txid, and is reported to the caller;
+///   * no "hash", the bytes deserialized completely (no trailing bytes):
+///     dash_txid of the parsed tx, the same derivation every other tx-hash
+///     site of the node uses;
 ///   * neither: the SHA256d of the bytes, which is right only for a tx whose
 ///     txid covers all of its bytes (reported to the caller).
 
@@ -44,9 +47,10 @@ namespace coin {
 
 struct GbtEntryTxid {
     enum class Source { ParsedTx, GbtHash, RawBytes };
-    uint256 txid;
+    uint256 txid;                    // the id served
     Source  source{Source::ParsedTx};
-    bool    hash_disagrees{false};   // ParsedTx only: dashd's "hash" differs from txid
+    uint256 derived;                 // dash_txid of the parsed tx (null when it did not parse)
+    bool    hash_disagrees{false};   // dashd's "hash" differs from `derived`
 };
 
 /// The txid of one getblocktemplate entry. `parsed` is the entry's tx when its
@@ -57,15 +61,17 @@ inline GbtEntryTxid gbt_entry_txid(const MutableTransaction* parsed,
                                    std::span<const unsigned char> raw)
 {
     GbtEntryTxid r;
-    if (parsed != nullptr) {
-        r.txid = dash_txid(*parsed);
-        r.source = GbtEntryTxid::Source::ParsedTx;
-        r.hash_disagrees = gbt_hash.has_value() && *gbt_hash != r.txid;
-        return r;
-    }
+    if (parsed != nullptr)
+        r.derived = dash_txid(*parsed);
     if (gbt_hash.has_value()) {
         r.txid = *gbt_hash;
         r.source = GbtEntryTxid::Source::GbtHash;
+        r.hash_disagrees = parsed != nullptr && r.derived != *gbt_hash;
+        return r;
+    }
+    if (parsed != nullptr) {
+        r.txid = r.derived;
+        r.source = GbtEntryTxid::Source::ParsedTx;
         return r;
     }
     r.txid = dash_sha256d(raw);
@@ -77,8 +83,8 @@ inline GbtEntryTxid gbt_entry_txid(const MutableTransaction* parsed,
 struct GbtTxReadReport {
     struct Disagreement {
         size_t  index;
-        uint256 txid;       // dash_txid of the parsed tx (the one used)
-        uint256 gbt_hash;   // dashd's "hash"
+        uint256 gbt_hash;       // dashd's "hash" (the id served)
+        uint256 derived_txid;   // dash_txid of the parsed tx (not served)
     };
     struct ParseFailure {
         size_t      index;
@@ -133,7 +139,7 @@ inline GbtTxReadReport append_gbt_transactions(const nlohmann::json& txs, DashWo
                                                std::span<const unsigned char>(raw));
         w.m_tx_hashes.push_back(id.txid);
         if (id.hash_disagrees)
-            rep.disagreements.push_back({index, id.txid, *gbt_hash});
+            rep.disagreements.push_back({index, *gbt_hash, id.derived});
         if (!parsed)
             rep.parse_failures.push_back(
                 {index, parse_error, id.source == GbtEntryTxid::Source::GbtHash});

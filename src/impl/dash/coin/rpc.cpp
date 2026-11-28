@@ -11,6 +11,7 @@
 #include <util/strencodings.h>   // ParseHex / HexStr
 
 #include <algorithm>             // std::min (sync-reconnect backoff)
+#include <atomic>
 #include <mutex>
 #include <set>
 
@@ -34,22 +35,26 @@ namespace
 {
 
 // A getblocktemplate entry whose "hash" differs from the dash_txid of its own
-// bytes means the node and dashd disagree on the id the block's merkle root
-// commits to: every job over that template would carry a header dashd
-// rejects. Logged as an error once per txid (the template is re-read every few
-// seconds); the remembered set is bounded.
-void log_gbt_txid_disagreement_once(const uint256& txid, const uint256& gbt_hash, uint32_t height)
+// bytes: dashd's "hash" is served (Core's GetHash of those bytes, the id the
+// validator recomputes), so the disagreement means a defect in dash_txid --
+// the embedded build and every other hash site of the node derive ids with it.
+// Logged as an error once per dashd txid (the template is re-read every few
+// seconds; the remembered set is bounded), with the running count of
+// disagreeing entries read since start.
+void log_gbt_txid_disagreement_once(const uint256& gbt_hash, const uint256& derived,
+                                    uint32_t height, uint64_t total)
 {
     static std::mutex mu;
     static std::set<uint256> logged;
     {
         std::lock_guard<std::mutex> lk(mu);
         if (logged.size() >= 4096) logged.clear();
-        if (!logged.insert(txid).second) return;
+        if (!logged.insert(gbt_hash).second) return;
     }
-    LOG_ERROR << "[GBT-TXID] getblocktemplate h=" << height << " lists hash=" << gbt_hash.GetHex()
-              << " for a tx whose dash_txid is " << txid.GetHex()
-              << " -- serving dash_txid; a block over this template may be rejected (bad-txnmrklroot)";
+    LOG_ERROR << "[GBT-TXID] getblocktemplate h=" << height << " hash=" << gbt_hash.GetHex()
+              << " but dash_txid of its bytes=" << derived.GetHex()
+              << " -- serving dashd's hash; dash_txid is wrong for this tx (disagreements so far: "
+              << total << ")";
 }
 
 } // namespace
@@ -439,9 +444,10 @@ DashWorkData NodeRPC::getwork()
         w.m_height = getblock(w.m_previous_block)["height"].get<uint32_t>() + 1;
 
     // ----- Transactions (full parse + raw hex + txid + fees) -----
-    // The txid of each entry is the one the block's merkle root commits to
-    // (dash_txid: the v24 stable txid for a version 2 asset unlock, not the
-    // SHA256d of its bytes); see coin/gbt_transactions.hpp for the rule.
+    // The txid of each entry is the one the block's merkle root commits to:
+    // dashd's "hash", else dash_txid of the parsed bytes (the v24 stable txid
+    // for a version 2 asset unlock, not the SHA256d of its bytes); see
+    // coin/gbt_transactions.hpp for the rule.
     if (work.contains("transactions"))
     {
         const GbtTxReadReport rep = append_gbt_transactions(work["transactions"], w);
@@ -449,8 +455,10 @@ DashWorkData NodeRPC::getwork()
             LOG_WARNING << "getwork: tx deserialize failed at index " << f.index << ": " << f.what
                         << (f.used_gbt_hash ? " -- using dashd's \"hash\" as its txid"
                                             : " -- no \"hash\" either: txid = SHA256d of its bytes");
+        static std::atomic<uint64_t> disagreements_total{0};
         for (const auto& d : rep.disagreements)
-            log_gbt_txid_disagreement_once(d.txid, d.gbt_hash, w.m_height);
+            log_gbt_txid_disagreement_once(d.gbt_hash, d.derived_txid, w.m_height,
+                                           disagreements_total.fetch_add(1, std::memory_order_relaxed) + 1);
     }
 
     // ----- DASH masternode + superblock + platform payments -----
