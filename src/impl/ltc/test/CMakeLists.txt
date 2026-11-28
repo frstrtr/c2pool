@@ -588,6 +588,22 @@ if (BUILD_TESTING AND GTest_FOUND)
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(share_test "" AUTO)
+
+    # ltc_walk_replay_test: differential replay of X1 stage A1 (get_chain's
+    # bounds check by has_depth) over a RECORDED LTC mainnet share chain, old
+    # and new code side by side, every output byte-compared: heights, lasts,
+    # chains, think(), PPLNS / merged payouts, and the drop-tails step.
+    # L1 runs the committed topology fixture (fixtures/); L2 the full store
+    # named by C2POOL_REPLAY_STORE_LTC (skipped when unset). Listed in
+    # build.yml's --target allowlists.
+    add_executable(ltc_walk_replay_test walk_replay_test.cpp)
+    target_link_libraries(ltc_walk_replay_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)
+    target_compile_definitions(ltc_walk_replay_test PRIVATE
+        LTC_REPLAY_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/ltc_sharechain_topology_mainnet_20261127.txt")
+    gtest_add_tests(ltc_walk_replay_test "" AUTO)
 endif()
 
 if (BUILD_TESTING)

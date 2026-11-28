@@ -359,6 +359,8 @@ c2pool is an independent C++ implementation of the P2Pool sharechain concept ori
 
 Development is supported by Anthropic's [Claude for Open Source](https://claude.com/contact-sales/claude-for-oss) program (2026). The design, the consensus rules, and responsibility for every byte shipped remain with the maintainers.
 
+> **Two Dash blocks in a row from the daemonless pool, a third time** (2026-11-27 11:42:07 and 11:43:12 UTC) — [#2579253](https://blockchair.com/dash/block/2579253) and [#2579254](https://blockchair.com/dash/block/2579254), 65 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
+>
 > **Two Dash blocks in a row from the daemonless pool, again** (2026-11-23 02:37:02 and 02:37:35 UTC) — [#2576844](https://blockchair.com/dash/block/2576844) and [#2576845](https://blockchair.com/dash/block/2576845), 33 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
 >
 > **Two Dash blocks in a row from the daemonless pool** (2026-11-15 03:40:39 and 03:42:26 UTC) — [#2572489](https://blockchair.com/dash/block/2572489) and [#2572490](https://blockchair.com/dash/block/2572490), 107 seconds apart. Both were built from embedded coin-state with no Dash Core node on the serve path, and both are confirmed.
@@ -403,7 +405,7 @@ Pre-built binaries are available on the [Releases page](https://github.com/frstr
 
 | Platform | Package | Notes |
 |----------|---------|-------|
-| Linux x86_64 | `.tar.gz` | Extract and run `./c2pool-<coin>` (or `./start.sh`) |
+| Linux x86_64 | `.tar.gz` | Extract and run `./c2pool-<coin>` (or `./start.sh`); requires glibc 2.38 and libstdc++ from GCC 13 or later (Ubuntu 24.04+, Debian 13+). The packages do not start on older distributions (Ubuntu 22.04, Debian 11/12); build from source there (see doc/build-unix.md; tested on Ubuntu 24.04). |
 | macOS (universal) | `.dmg` or `.zip` | One universal binary for Apple Silicon and Intel Macs; requires macOS 26.0 or later; no Homebrew needed |
 | Windows x86_64 | `.zip` or `setup.exe` | Installer bundles VC++ Runtime + firewall rules |
 
@@ -1508,6 +1510,7 @@ dashd-attached default OFF)
 | `--embedded-ingest-isdlock[=false]` | `MSG_ISDLOCK` feed (InstantSend conflict locks, BLS-gated). |
 | `--embedded-ingest-dstx[=false]` | CoinJoin DSTX lane. |
 | `--embedded-include-mn-special-txs[=false]` | DIP special-tx superset (types 1–4). |
+| `--embedded-include-v24-provider-txs[=false]` | Dash Core v24 provider types 10–12 (ProDisTx, ProUpShareTx, ProUpSharedRegTx) and v3 (ExtAddr) ProTx payloads of types 1–4, including shared registrations, with the superset, from v24 activation. Default ON in both postures; `=false` keeps them out, v1/v2 ProTx unaffected. |
 | `--embedded-accrue-asset-locks[=false]` / `--embedded-accrue-asset-unlocks[=false]` | Type-8 / type-9 asset-lock/unlock fold. |
 | `--embedded-utxo-immature-serve-empty` | Serve coinbase-only until the UTXO view is mature. |
 | `--embedded-creditpool-publish-at-serve-tip` | Publish the derived credit pool at the serve tip (money path, default OFF). |

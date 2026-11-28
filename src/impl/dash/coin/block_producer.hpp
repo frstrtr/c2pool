@@ -210,7 +210,8 @@ inline void append_compact_size(std::vector<unsigned char>& out, uint64_t n)
 }
 
 // Coinbase txid: sha256d of the raw coinbase bytes (DASH non-witness canonical
-// serialization == the txid preimage; matches NodeRPC::getwork()'s recompute).
+// serialization == the txid preimage; a coinbase is never an asset unlock, so
+// the v24 stable-txid rule of dash_txid does not apply to it).
 inline uint256 coinbase_txid(const std::vector<unsigned char>& coinbase_bytes)
 {
     return bp_sha256d(std::span<const unsigned char>(

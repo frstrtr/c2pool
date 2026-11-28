@@ -155,12 +155,19 @@ struct LoginResolution {
 /// address: its parent payout is case 4's (case4_parent: a merged address the
 /// login named), else its shares are redistributed by the work source, merged
 /// chains included, as p2pool does (its "Case 3").
+///
+/// `second_may_swap` false (the comma form's first address had a worker
+/// suffix, stratum_username::Login::first_had_worker): p2pool-merged-v36
+/// tests the swapped order on the first address with its suffix, which is
+/// never an address, so the second address is a merged chain's or ignored;
+/// no swap, no replacement of the first address, no one-chain fallback.
 inline LoginResolution resolve_merged_login(std::string primary, const std::string& merged_raw,
                                             std::map<uint32_t, std::string> explicit_addrs,
                                             const std::vector<ChainAddrInfo>& table,
                                             const std::function<bool(uint32_t)>& configured,
                                             const std::vector<uint8_t>& parent_versions_now,
-                                            const std::vector<std::string>& parent_hrps)
+                                            const std::vector<std::string>& parent_hrps,
+                                            bool second_may_swap = true)
 {
     LoginResolution r;
     // An address that pays something on `chain` (chain-agnostic when null).
@@ -203,8 +210,8 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
     // A first address that is not an address at all before a parent address
     // (a mistyped merged address in a swapped pair): the parent address is
     // the primary, as the pre-change server paid it; the first one is ignored.
-    if (!merged.empty() && is_parent(merged) && chains_taking(primary).empty() && !pays(nullptr, primary)
-        && !is_parent(primary)) {
+    if (second_may_swap && !merged.empty() && is_parent(merged) && chains_taking(primary).empty()
+        && !pays(nullptr, primary) && !is_parent(primary)) {
         r.warnings.push_back("first address " + primary + " is not a valid address: ignored, the parent address "
                              + merged + " is paid");
         primary = merged;
@@ -225,6 +232,11 @@ inline LoginResolution resolve_merged_login(std::string primary, const std::stri
         } else if (m.size() > 1) {
             r.warnings.push_back("merged address " + merged + " is an address of merged chains " + ids(m)
                                  + ": ignored, they get the primary's key" + name_it);
+        } else if (!second_may_swap) {
+            if (!conf.empty())
+                r.warnings.push_back("merged address " + merged
+                                     + " is not an address of any configured merged chain (" + ids(conf)
+                                     + "): ignored" + name_it);
         } else {
             // Swapped order: the first address is a merged chain's, the second the parent's.
             const auto u = chains_taking(primary);

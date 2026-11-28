@@ -91,6 +91,50 @@
 namespace dash {
 namespace coin {
 
+/// The ProTx version of a type 1-4 tx (ProRegTx, ProUpServTx, ProUpRegTx,
+/// ProUpRevTx) when its payload parses (parse_protx_payload: the exact layout
+/// of a version this code knows, 1..3); nullopt for any other type and for a
+/// payload that does not parse.
+template <typename Tx>
+inline std::optional<uint16_t> protx_payload_version(const Tx& tx)
+{
+    if (!tx_has_extra_payload(tx.version, tx.type)) return std::nullopt;
+    const auto version_of = [&tx](auto p) -> std::optional<uint16_t> {
+        if (!vendor::parse_protx_payload(tx.extra_payload, p)) return std::nullopt;
+        return p.nVersion;
+    };
+    switch (tx.type) {
+    case vendor::CProRegTx::SPECIALTX_TYPE:    return version_of(vendor::CProRegTx{});
+    case vendor::CProUpServTx::SPECIALTX_TYPE: return version_of(vendor::CProUpServTx{});
+    case vendor::CProUpRegTx::SPECIALTX_TYPE:  return version_of(vendor::CProUpRegTx{});
+    case vendor::CProUpRevTx::SPECIALTX_TYPE:  return version_of(vendor::CProUpRevTx{});
+    default:                                   return std::nullopt;
+    }
+}
+
+/// A ProTx payload format valid before Dash Core v24: a type 1-4 tx whose
+/// payload parses with ProTx version 1 or 2 (<= ProTxVersion::BASIC_BLS).
+template <typename Tx>
+inline bool is_legacy_format_protx(const Tx& tx)
+{
+    const auto v = protx_payload_version(tx);
+    return v.has_value() && *v <= vendor::ProTxVersion::BASIC_BLS;
+}
+
+/// What the v24 provider opt-out (--embedded-include-v24-provider-txs=false)
+/// holds among types 1-4, together with types 10-12: every type 1-4 tx that
+/// is not in a legacy format. That is version 3 (ExtAddr; shared
+/// registrations included), which Dash Core accepts only with v24 active
+/// (specialtxman.cpp: nVersion > ProTxVersion::GetMax is bad-protx-version,
+/// and GetMax is ExtAddr only with v24; protx_check.hpp max_version), and,
+/// failing closed, any payload that does not parse.
+template <typename Tx>
+inline bool is_v24_opt_out_protx(const Tx& tx)
+{
+    return tx.type >= tx_type::PROVIDER_REGISTER && tx.type <= tx_type::PROVIDER_UPDATE_REVOKE
+        && !is_legacy_format_protx(tx);
+}
+
 struct MempoolEntry {
     MutableTransaction tx;
     uint256  txid;
@@ -2732,10 +2776,17 @@ public:
     //
     // Dash Core v24 (the embedded builder sets these from its own inputs):
     //   * types 10-12 (ProDisTx/ProUpShareTx/ProUpSharedRegTx) — admitted when
-    //     allow_v24_provider (DEPLOYMENT_V24 active for the block and the v24
-    //     fold armed: the template folds them, sml_special_fold.hpp); a
+    //     allow_v24_provider (DEPLOYMENT_V24 active for the block, the v24
+    //     fold armed and no --embedded-include-v24-provider-txs=false opt-out:
+    //     the template folds them, sml_special_fold.hpp); a
     //     ProDisTx may then spend its shared masternode's template-script
     //     collateral, the only spend Core allows of that coin;
+    //   * hold_non_legacy_protx — a type 1-4 tx is never selected unless its
+    //     payload parses with ProTx version 1 or 2 (is_v24_opt_out_protx:
+    //     version 3, shared registrations included, and any payload that does
+    //     not parse are held); set only by the
+    //     --embedded-include-v24-provider-txs=false opt-out under v24, so
+    //     every other mask leaves it as before;
     //   * type 7 (MNHF signal) — admitted when allow_mnhf (the builder runs
     //     Dash Core's CheckMNHFTx and the duplicate rule, mnhf_check.hpp);
     //   * v24_rules — the block's ContextualCheckTransaction type list is Core
@@ -2745,6 +2796,7 @@ public:
         bool allow_mn_types;      // types 1-4
         bool allow_locks;         // type 8
         bool allow_v24_provider;  // types 10-12 (only with v24_rules)
+        bool hold_non_legacy_protx;  // types 1-4 held unless parsed version 1/2
         bool allow_mnhf;          // type 7
         bool v24_rules;           // DEPLOYMENT_V24 active for the block
         // A single user-provided constructor (default exclude_special=false =>
@@ -2758,6 +2810,7 @@ public:
               allow_mn_types(false),
               allow_locks(false),
               allow_v24_provider(false),
+              hold_non_legacy_protx(false),
               allow_mnhf(false),
               v24_rules(false) {}
         constexpr bool admits(uint16_t tx_type) const {
@@ -3062,6 +3115,14 @@ public:
                 // for every type!=0; the partial embedded mask admits types
                 // 1-4, 7, 8 and (v24) 10-12, and 5/6/9 are never selected.
                 if (!special_mask.admits(e->tx.type)) { ok = false; break; }
+                // The v24 provider opt-out also holds every type 1-4 tx that is
+                // not in a legacy (version 1/2) ProTx format: version 3, shared
+                // registrations included, and any payload that does not parse
+                // (is_v24_opt_out_protx, fail closed). Dropping the member drops
+                // its package, so a child spending one of its outputs never
+                // rides either.
+                if (special_mask.hold_non_legacy_protx
+                    && is_v24_opt_out_protx(e->tx)) { ok = false; break; }
                 // An MNHF signal rides only in the shape Dash Core's signer
                 // builds: no inputs and no outputs (MNHFTxPayload::PrepareTx,
                 // evo/mnhftx.cpp:37-45). CheckTransaction lets a type-7 tx
@@ -3096,7 +3157,7 @@ public:
                 // Dash Core v24 shared-collateral template (04445348437551):
                 // a tx paying it never rides (shared_collateral.hpp), except
                 // a shared registration whose collateral output it is, under
-                // v24 with the provider fold armed
+                // v24 with the provider fold armed and no v24 provider opt-out
                 // (CheckSharedCollateralTemplateOutputs). A tx spending it is
                 // caught where the stale-input guard resolves each input's
                 // coin below.
@@ -3106,6 +3167,7 @@ public:
                         if (is_shared_collateral_script(out.scriptPubKey.m_data)) { pays_template = true; break; }
                     if (pays_template
                         && !(special_mask.v24_rules && special_mask.allow_mn_types
+                             && !special_mask.hold_non_legacy_protx
                              && is_shared_registration_collateral_only(e->tx))) {
                         ok = false;
                         break;
