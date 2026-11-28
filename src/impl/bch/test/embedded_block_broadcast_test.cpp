@@ -78,6 +78,8 @@ int run_self_connection_ban_checks();
 int run_v35_address_kat_checks();
 int run_v35_gentx_kat_checks();
 int run_pool_dialer_redial_checks();
+// #925 part (b): skip addrme when the listener is not bound (listen_port_guard_test.cpp).
+int run_listen_port_guard_checks();
 
 int main() {
     boost::asio::io_context ioc;
@@ -191,6 +193,9 @@ int main() {
 
     // Sharechain dialer: connect_failed + pinned addnode redial.
     failures += run_pool_dialer_redial_checks();
+
+    // #925 part (b): a failed listen() must not drop every handshake.
+    failures += run_listen_port_guard_checks();
 
     if (failures == 0) {
         std::cout << "embedded_block_broadcast_test: ALL PASS\n";

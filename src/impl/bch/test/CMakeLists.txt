@@ -297,6 +297,12 @@ if(BUILD_TESTING)
     # handle_version, which this target already compiles (node.cpp). Invoked
     # from main() via run_self_connection_ban_checks(); no new executable.
     target_sources(bch_embedded_block_broadcast_test PRIVATE self_connection_ban_test.cpp)
+    # #925 part (b) addrme listen-port guard KAT (listen_port_guard_test.cpp)
+    # rides the same EXISTING allowlisted target. It builds a real bch::Node and
+    # drives the real NodeImpl::handle_version after a failed core::Server
+    # listen(); it needs the two config TUs the dialer KAT already adds below.
+    # Invoked from main() via run_listen_port_guard_checks(); no new executable.
+    target_sources(bch_embedded_block_broadcast_test PRIVATE listen_port_guard_test.cpp)
     # v35 CashAddr gentx fix KATs ride the same EXISTING allowlisted target (no
     # new executable, no build.yml change):
     #   v35_address_kat_test.cpp  address -> script vectors from the python rule,
