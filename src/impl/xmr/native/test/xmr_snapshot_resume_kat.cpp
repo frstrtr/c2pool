@@ -81,6 +81,13 @@
 //                    overlay of another image) is not resumed: the boot
 //                    re-walks from its root, and two later starts never resume
 //                    with ring resolution off.
+//   G  LATE REFUSAL -- an image refused by the row, evaluation or connection
+//                    test leaves the index as it was (its rows, state, output
+//                    counter, booking tail and seed table), with no event and
+//                    no row-sink call, at the index, on the anchor row and at
+//                    the node (whose refusal line names the image's sha256);
+//                    a good image resumes with one seeded row-sink call plus
+//                    one per tail block, also under a set clock.
 //
 // No sockets are dialled (the node is configured with no peers and no seeds),
 // no daemon is contacted, and no RandomX is linked: the PoW gate is driven by a
@@ -90,7 +97,10 @@
 // 8 (the #1539 lesson).
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1195,6 +1205,513 @@ void test_node_resumes_the_output_set() {
     std::remove((path + ".outset").c_str());
 }
 
+// ===========================================================================
+// G. LATE REFUSAL: an image refused by the row, evaluation or connection test
+//    leaves the index as it was: no reset, no event, no row-sink call
+// ===========================================================================
+namespace {
+
+constexpr std::size_t kNpos = static_cast<std::size_t>(-1);
+
+// The image header: magic, version, network, anchor height, anchor id, base height, depth.
+constexpr std::size_t kImageBaseOff  = 8 + 8 + 8 + 8 + 32;
+constexpr std::size_t kImageDepthOff = kImageBaseOff + 8;
+
+constexpr std::uint64_t kClock    = 1;
+constexpr std::uint64_t kClockLen = 61;
+
+std::vector<std::uint8_t> le64(std::uint64_t v) {
+    std::vector<std::uint8_t> o;
+    for (int i = 0; i < 8; ++i) o.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xff));
+    return o;
+}
+
+std::uint64_t image_u64(const std::vector<std::uint8_t>& img, std::size_t off) {
+    std::uint64_t v = 0;
+    if (off + 8 > img.size()) return v;
+    for (int i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(img[off + static_cast<std::size_t>(i)]) << (8 * i);
+    return v;
+}
+
+// The offset of the one occurrence of `pat` in hay[0, len); kNpos when it occurs zero times or more than once.
+std::size_t find_once(const std::vector<std::uint8_t>& hay, std::size_t len, const std::vector<std::uint8_t>& pat) {
+    if (pat.empty() || len > hay.size()) return kNpos;
+    const auto end = hay.begin() + static_cast<std::ptrdiff_t>(len);
+    std::size_t at = kNpos;
+    for (auto it = std::search(hay.begin(), end, pat.begin(), pat.end()); it != end;
+         it = std::search(it + 1, end, pat.begin(), pat.end())) {
+        if (at != kNpos) return kNpos;
+        at = static_cast<std::size_t>(it - hay.begin());
+    }
+    return at;
+}
+
+// In an image body (the trailing digest excluded).
+std::size_t find_in_image(const std::vector<std::uint8_t>& img, const std::vector<std::uint8_t>& pat) {
+    return img.size() < 32 ? kNpos : find_once(img, img.size() - 32, pat);
+}
+
+void redigest(std::vector<std::uint8_t>& img) {
+    const std::size_t n = img.size() - 32;
+    native::anchor_hash::Sha256 h;
+    h.update(img.data(), n);
+    const std::array<std::uint8_t, 32> d = h.finish();
+    std::copy(d.begin(), d.end(), img.begin() + static_cast<std::ptrdiff_t>(n));
+}
+
+std::string sha256_hex(const std::vector<std::uint8_t>& b) {
+    native::anchor_hash::Sha256 h;
+    h.update(b.data(), b.size());
+    return native::anchor_codec::to_hex(h.finish());
+}
+
+std::vector<std::uint8_t> row_pattern(std::uint64_t height, const Hash& id, const Hash& prev) {
+    std::vector<std::uint8_t> p = le64(height);
+    p.insert(p.end(), id.begin(), id.end());
+    p.insert(p.end(), prev.begin(), prev.end());
+    return p;
+}
+
+std::vector<std::uint8_t> blob_pattern(const BlockEntry& e) {
+    std::vector<std::uint8_t> p = le64(e.block_blob.size());
+    p.insert(p.end(), e.block_blob.begin(), e.block_blob.end());
+    return p;
+}
+
+struct IndexPrint {
+    bool          has_tip = false;
+    std::uint64_t tip_h   = 0;
+    Hash          tip_id{};
+    std::uint64_t header_frontier = 0, verified_frontier = 0, anchor_height = 0, rows = 0, alt_rows = 0;
+    std::uint64_t best_lo = 0, best_hi = 0;
+    bool          synced = false;
+    std::uint64_t rct = 0;
+    std::uint64_t state_rows = 0, state_anchor = 0, state_epoch = 0, state_agc = 0;
+    std::uint64_t tail_kept = 0, tail_dropped = 0, tail_lowest = 0;
+    bool          has_seed = false;
+    Hash          seed{};
+    std::vector<std::pair<std::uint64_t, Hash>> held;
+};
+
+IndexPrint print_of(const native::ChainIndex& idx) {
+    IndexPrint p;
+    const auto t = idx.tip();
+    p.has_tip = t.has_value();
+    if (t) {
+        p.tip_h  = t->height;
+        p.tip_id = t->id;
+    }
+    const native::SyncState s = idx.sync_state();
+    p.header_frontier   = s.header_frontier;
+    p.verified_frontier = s.verified_frontier;
+    p.anchor_height     = s.anchor_height;
+    p.rows              = s.rows;
+    p.alt_rows          = s.alt_rows;
+    p.best_lo           = s.best_cumulative_difficulty.lo;
+    p.best_hi           = s.best_cumulative_difficulty.hi;
+    p.synced            = s.synced;
+    p.rct               = idx.view().rct_output_count();
+    const native::ConsensusState& st = idx.view().state();
+    p.state_rows   = st.rows().size();
+    p.state_anchor = st.anchor_height();
+    p.state_epoch  = st.epoch_seq();
+    p.state_agc    = st.already_generated_coins();
+    const auto bt = idx.booking_tail_stats();
+    p.tail_kept    = bt.kept;
+    p.tail_dropped = bt.dropped;
+    p.tail_lowest  = bt.lowest;
+    const auto sd = idx.seed_hash_for_height(p.tip_h + 1);
+    p.has_seed = sd.has_value();
+    if (sd) p.seed = *sd;
+    if (p.has_tip) {
+        const std::uint64_t lo = s.rows > p.tip_h ? 0 : p.tip_h + 1 - s.rows;
+        for (std::uint64_t h = lo; h <= p.tip_h; ++h)
+            if (const auto r = idx.by_height(h)) p.held.emplace_back(h, r->id);
+    }
+    return p;
+}
+
+// The fields that differ, comma-separated; empty when none does.
+std::string print_diff(const IndexPrint& a, const IndexPrint& b) {
+    std::string d;
+    const auto f = [&d](bool same, const char* name) {
+        if (same) return;
+        if (!d.empty()) d += ", ";
+        d += name;
+    };
+    f(a.has_tip == b.has_tip && a.tip_h == b.tip_h && a.tip_id == b.tip_id, "tip");
+    f(a.header_frontier == b.header_frontier, "header_frontier");
+    f(a.verified_frontier == b.verified_frontier, "verified_frontier");
+    f(a.anchor_height == b.anchor_height, "anchor_height");
+    f(a.rows == b.rows, "rows");
+    f(a.alt_rows == b.alt_rows, "alt_rows");
+    f(a.best_lo == b.best_lo && a.best_hi == b.best_hi, "best_cumulative_difficulty");
+    f(a.synced == b.synced, "synced");
+    f(a.rct == b.rct, "rct_output_count");
+    f(a.state_rows == b.state_rows, "state.rows");
+    f(a.state_anchor == b.state_anchor, "state.anchor_height");
+    f(a.state_epoch == b.state_epoch, "state.epoch_seq");
+    f(a.state_agc == b.state_agc, "state.already_generated_coins");
+    f(a.tail_kept == b.tail_kept && a.tail_dropped == b.tail_dropped && a.tail_lowest == b.tail_lowest,
+      "booking_tail_stats");
+    f(a.has_seed == b.has_seed && a.seed == b.seed, "seed_hash_for_height(tip + 1)");
+    f(a.held == b.held, "by_height");
+    return d;
+}
+
+struct Seen {
+    std::uint64_t events = 0, tx_events = 0, row_calls = 0, seeded = 0;
+};
+
+void watch(native::ChainIndex& idx, Seen& s) {
+    idx.subscribe([&s](const auto&) { ++s.events; });
+    idx.subscribe_txs([&s](const auto&) { ++s.tx_events; });
+    idx.subscribe_rows([&s](const auto&, const auto&, bool seeded) {
+        ++s.row_calls;
+        if (seeded) ++s.seeded;
+    });
+}
+
+bool starts_with(const std::string& s, const std::string& prefix) { return s.rfind(prefix, 0) == 0; }
+
+// Source: GenesisChain(snapshot_depth + 1). Row 0 (below the base) takes the base's height.
+bool image_rows_broken(GenesisChain& src, std::vector<std::uint8_t>& img) {
+    std::string why;
+    if (!src.idx.save_snapshot(img, why)) {
+        kat::checkf(false, "late-rows: the source could not be snapshotted (%s)", why.c_str());
+        return false;
+    }
+    const std::uint64_t base_h = image_u64(img, kImageBaseOff);
+    kat::checkf(base_h == 1 && image_u64(img, kImageDepthOff) == regtest_options().snapshot_depth,
+                "late-rows: the source image is based at 1 with row 0 below (base %llu, depth %llu)",
+                (unsigned long long)base_h, (unsigned long long)image_u64(img, kImageDepthOff));
+    const auto r0 = src.idx.by_height(0);
+    const std::size_t at = r0 ? find_in_image(img, row_pattern(0, r0->id, r0->prev_id)) : kNpos;
+    kat::check(at != kNpos, "late-rows: row 0 occurs exactly once in the image");
+    if (at == kNpos) return false;
+    const std::vector<std::uint8_t> h = le64(base_h);
+    std::copy(h.begin(), h.end(), img.begin() + static_cast<std::ptrdiff_t>(at));
+    redigest(img);
+    return true;
+}
+
+// Source: GenesisChain(). The last tail block's major version := the first one this build does not implement.
+bool image_eval_broken(GenesisChain& src, std::vector<std::uint8_t>& img) {
+    std::string why;
+    if (!src.idx.save_snapshot(img, why)) {
+        kat::checkf(false, "late-eval: the source could not be snapshotted (%s)", why.c_str());
+        return false;
+    }
+    kat::checkf(image_u64(img, kImageDepthOff) == kChainHeight,
+                "late-eval: the image carries the whole chain as its tail (depth %llu)",
+                (unsigned long long)image_u64(img, kImageDepthOff));
+    const std::size_t at = find_in_image(img, blob_pattern(src.blocks.back()));
+    kat::check(at != kNpos && img[at + 8] == kRegMajor,
+               "late-eval: the last tail block occurs exactly once, its first byte the major version");
+    if (at == kNpos) return false;
+    const unsigned next_major = static_cast<unsigned>(native::MAX_IMPLEMENTED_HF_VERSION) + 1;
+    kat::check(next_major < 0x80, "late-eval: the next major version still encodes in one varint byte");
+    img[at + 8] = static_cast<std::uint8_t>(next_major);
+    redigest(img);
+    return true;
+}
+
+// Source: GenesisChain(). One bit of the last tail block's prev id flipped.
+bool image_connect_broken(GenesisChain& src, std::vector<std::uint8_t>& img) {
+    std::string why;
+    if (!src.idx.save_snapshot(img, why)) {
+        kat::checkf(false, "late-connect: the source could not be snapshotted (%s)", why.c_str());
+        return false;
+    }
+    kat::checkf(image_u64(img, kImageDepthOff) == kChainHeight,
+                "late-connect: the image carries the whole chain as its tail (depth %llu)",
+                (unsigned long long)image_u64(img, kImageDepthOff));
+    const BlockEntry& last = src.blocks.back();
+    const Hash&       prev = src.ids[src.ids.size() - 2];
+    const std::size_t at   = find_in_image(img, blob_pattern(last));
+    const std::size_t in   = find_once(last.block_blob, last.block_blob.size(),
+                                       std::vector<std::uint8_t>(prev.begin(), prev.end()));
+    kat::check(at != kNpos && in != kNpos,
+               "late-connect: the last tail block occurs exactly once, and its prev id once inside it");
+    if (at == kNpos || in == kNpos) return false;
+    img[at + 8 + in] ^= 0x01;
+    redigest(img);
+    return true;
+}
+
+// The target holds row zero, as an anchor or local-genesis node does at the moment of the load.
+void expect_refused_as_it_was(const char* what, const std::vector<std::uint8_t>& img, const std::string& text,
+                              bool exact) {
+    Seen         seen;
+    GenesisChain tgt(0);
+    watch(tgt.idx, seen);
+    const IndexPrint before        = print_of(tgt.idx);
+    const bool       booted_before = tgt.boot.booted();
+
+    std::string why;
+    const bool  ok = tgt.boot.resume_from_snapshot(img, why);
+    kat::checkf(!ok, "%s: refused", what);
+    kat::checkf(exact ? why == text : starts_with(why, text), "%s: the refusal text is the pre-check's (%s)", what,
+                why.c_str());
+    const std::string d = print_diff(before, print_of(tgt.idx));
+    kat::checkf(d.empty(), "%s: the index is as it was (changed: %s)", what, d.c_str());
+    kat::checkf(seen.events == 0 && seen.tx_events == 0 && seen.row_calls == 0,
+                "%s: no event (%llu), tx event (%llu) or row-sink call (%llu)", what,
+                (unsigned long long)seen.events, (unsigned long long)seen.tx_events,
+                (unsigned long long)seen.row_calls);
+    kat::checkf(tgt.boot.booted() == booted_before, "%s: booted() unchanged", what);
+}
+
+void test_late_refusal_rows() {
+    GenesisChain              src(regtest_options().snapshot_depth + 1);
+    std::vector<std::uint8_t> img;
+    if (!image_rows_broken(src, img)) return;
+    expect_refused_as_it_was("late-rows", img, "snapshot rows are not contiguous", true);
+}
+
+void test_late_refusal_eval() {
+    GenesisChain              src;
+    std::vector<std::uint8_t> img;
+    if (!image_eval_broken(src, img)) return;
+    expect_refused_as_it_was("late-eval", img, "a snapshotted block no longer evaluates", false);
+}
+
+void test_late_refusal_connect() {
+    GenesisChain              src;
+    std::vector<std::uint8_t> img;
+    if (!image_connect_broken(src, img)) return;
+    expect_refused_as_it_was("late-connect", img, "a snapshotted block no longer connects", false);
+}
+
+// The node: the image and its overlay (bound to the refused image) on disk, a genesis boot.
+void node_late_refusal(const char* what, GenesisChain& src, const std::vector<std::uint8_t>& img,
+                       const std::string& text) {
+    const std::string path = std::string("snapres_kat_late_") + what + ".snap";
+    if (!write_pair(path, src, img)) {
+        kat::checkf(false, "node-late %s: the KAT writes the image and its overlay", what);
+        return;
+    }
+    std::atomic<std::uint64_t> row_calls{0};
+    rt::NativeNodeConfig c = node_cfg(path);
+    c.row_sink = [&row_calls](const native::ConsensusState&, const ChainRow&, bool) { ++row_calls; };
+    {
+        rt::NativeNode node(c);
+        std::string    start_why;
+        const bool     started = node.start(start_why);
+        kat::checkf(started, "node-late %s: the node starts (%s)", what, start_why.c_str());
+        if (started) {
+            const std::vector<std::string> log  = node.take_log();
+            const std::string              head = "[snapshot] REFUSED: " + text;
+            const std::string tail = "; image sha256 " + sha256_hex(img) + "; starting from the genesis";
+            bool found = false;
+            for (const std::string& l : log)
+                if (l.find(head) != std::string::npos && l.find(tail) != std::string::npos) found = true;
+            kat::checkf(found, "node-late %s: the log has \"%s ...%s\"", what, head.c_str(), tail.c_str());
+            const rt::NodeStatus st = node.status();
+            kat::checkf(st.sync.header_frontier == 0 && !st.boot.booted && !node.index().tip().has_value(),
+                        "node-late %s: the node is on its genesis boot path, as the log says (frontier %llu, "
+                        "booted %d, tip %d)",
+                        what, (unsigned long long)st.sync.header_frontier, st.boot.booted ? 1 : 0,
+                        node.index().tip().has_value() ? 1 : 0);
+            kat::checkf(node.mainchain_events_seen() == 0, "node-late %s: no mainchain event (%llu)", what,
+                        (unsigned long long)node.mainchain_events_seen());
+            kat::checkf(row_calls.load() == 0, "node-late %s: no row-sink call (%llu)", what,
+                        (unsigned long long)row_calls.load());
+            node.stop();
+        }
+    }
+    std::remove(path.c_str());
+    std::remove((path + ".outset").c_str());
+}
+
+void test_node_late_refusals() {
+    {
+        GenesisChain              src(regtest_options().snapshot_depth + 1);
+        std::vector<std::uint8_t> img;
+        if (image_rows_broken(src, img)) node_late_refusal("rows", src, img, "snapshot rows are not contiguous");
+    }
+    {
+        GenesisChain              src;
+        std::vector<std::uint8_t> img;
+        if (image_eval_broken(src, img))
+            node_late_refusal("eval", src, img, "a snapshotted block no longer evaluates");
+    }
+    {
+        GenesisChain              src;
+        std::vector<std::uint8_t> img;
+        if (image_connect_broken(src, img))
+            node_late_refusal("connect", src, img, "a snapshotted block no longer connects");
+    }
+}
+
+// The anchor shape: the image of a session that booted on the anchor and connected one block above it (base = the
+// anchor + 1, the anchor row below it); the anchor row takes the base's height. Read after the confirm.
+void test_anchor_late_refusal() {
+    AnchorBlockSpec spec;
+    const std::vector<std::uint8_t> anchor_blob = build_anchor_blob(spec);
+    native::ParsedBlock pb;
+    if (native::parse_block(anchor_blob, pb) != native::BlockParseStatus::Ok) {
+        kat::check(false, "anchor-late: the fixture blob parses");
+        return;
+    }
+    const Hash anchor_id = native::block_identity(anchor_blob.data(), pb).id;
+
+    const std::string path = "snapres_kat_late_anchor.inc";
+    if (!write_bundle(path, make_bundle(kAnchorHeight, anchor_id))) {
+        kat::check(false, "anchor-late: the KAT can write its bundle");
+        return;
+    }
+
+    std::vector<std::uint8_t> image;
+    {
+        native::NoPowSource pow;
+        native::ChainIndex  idx(stagenet_options(), pow);
+        rt::ChainBoot       boot(idx, rt::BootMode::Anchor,
+                                 native::p2p::genesis_id(native::p2p::XmrNet::Stagenet), native::XmrNet::Stagenet);
+        std::string why;
+        if (!boot.boot_from_anchor(path, native::XmrNet::Stagenet, {}, why)) {
+            kat::checkf(false, "anchor-late: gates 1..3 accept the bundle (%s)", why.c_str());
+            std::remove(path.c_str());
+            return;
+        }
+        std::vector<BlockEntry> blocks;
+        BlockEntry              e;
+        e.block_blob = anchor_blob;
+        blocks.push_back(std::move(e));
+        boot.on_objects(peer("198.51.100.1:38080", 1001), std::move(blocks), {}, kAnchorHeight + 1);
+
+        AnchorBlockSpec child;
+        child.height    = kAnchorHeight + 1;
+        child.pin_prev  = true;
+        child.prev      = anchor_id;
+        child.timestamp = spec.timestamp + 120;
+        child.flavour   = 0x33;
+        BlockEntry ce;
+        ce.block_blob = build_anchor_blob(child);
+        const OfferResult r = idx.offer_block(nullptr, ce, /*own_mined=*/false);
+        kat::checkf(r.outcome == OfferOutcome::Connected, "anchor-late: the writing session extended past its "
+                    "anchor (got %s: %s)", native::to_string(r.outcome), r.why.c_str());
+        if (!idx.save_snapshot(image, why)) {
+            kat::checkf(false, "anchor-late: the writing session could not snapshot (%s)", why.c_str());
+            std::remove(path.c_str());
+            return;
+        }
+        const std::uint64_t base_h = image_u64(image, kImageBaseOff);
+        kat::checkf(base_h == kAnchorHeight + 1 && image_u64(image, kImageDepthOff) == 0,
+                    "anchor-late: the image is based at the anchor + 1 with no tail (base %llu, depth %llu)",
+                    (unsigned long long)base_h, (unsigned long long)image_u64(image, kImageDepthOff));
+        const auto ar = idx.by_height(kAnchorHeight);
+        const std::size_t at = ar ? find_in_image(image, row_pattern(kAnchorHeight, ar->id, ar->prev_id)) : kNpos;
+        kat::check(at != kNpos && ar && ar->id == anchor_id,
+                   "anchor-late: the anchor row occurs exactly once in the image");
+        if (at == kNpos) {
+            std::remove(path.c_str());
+            return;
+        }
+        const std::vector<std::uint8_t> h = le64(base_h);
+        std::copy(h.begin(), h.end(), image.begin() + static_cast<std::ptrdiff_t>(at));
+        redigest(image);
+    }
+
+    Seen                seen;
+    native::NoPowSource pow;
+    native::ChainIndex  idx(stagenet_options(), pow);
+    rt::ChainBoot       boot(idx, rt::BootMode::Anchor, native::p2p::genesis_id(native::p2p::XmrNet::Stagenet),
+                             native::XmrNet::Stagenet);
+    std::string why;
+    const bool  installed = boot.boot_from_anchor(path, native::XmrNet::Stagenet, {}, why);
+    std::remove(path.c_str());
+    kat::checkf(installed, "anchor-late: gates 1..3 accept the bundle (%s)", why.c_str());
+    if (!installed) return;
+    {
+        std::vector<BlockEntry> blocks;
+        BlockEntry              e;
+        e.block_blob = anchor_blob;
+        blocks.push_back(std::move(e));
+        boot.on_objects(peer("198.51.100.2:38080", 1002), std::move(blocks), {}, kAnchorHeight + 1);
+    }
+    kat::check(boot.serving_ready(), "anchor-late: the network confirms the anchor");
+
+    watch(idx, seen);
+    const IndexPrint before = print_of(idx);
+    std::string      resume_why;
+    kat::check(!boot.resume_from_snapshot(image, resume_why), "anchor-late: refused");
+    kat::checkf(resume_why == "snapshot rows are not contiguous", "anchor-late: the refusal text is the pre-check's (%s)",
+                resume_why.c_str());
+    kat::checkf(idx.tip() && idx.tip()->height == kAnchorHeight && idx.tip()->id == anchor_id,
+                "anchor-late: the index is on the confirmed anchor row (height %llu)",
+                (unsigned long long)(idx.tip() ? idx.tip()->height : 0));
+    const std::string d = print_diff(before, print_of(idx));
+    kat::checkf(d.empty(), "anchor-late: the index is as it was (changed: %s)", d.c_str());
+    kat::checkf(seen.events == 0 && seen.tx_events == 0 && seen.row_calls == 0,
+                "anchor-late: no event (%llu), tx event (%llu) or row-sink call (%llu)",
+                (unsigned long long)seen.events, (unsigned long long)seen.tx_events,
+                (unsigned long long)seen.row_calls);
+    kat::check(boot.booted() && boot.serving_ready(), "anchor-late: booted and serving, as before the load");
+}
+
+// A good image into a target holding row zero: one seeded row-sink call, then one per tail block; no event.
+void good_image_into_root(const char* what, std::uint64_t n, std::uint64_t want_base, std::uint64_t want_k) {
+    GenesisChain              src(n);
+    std::vector<std::uint8_t> img;
+    std::string               why;
+    if (!src.idx.save_snapshot(img, why)) {
+        kat::checkf(false, "%s: the source could not be snapshotted (%s)", what, why.c_str());
+        return;
+    }
+    const std::uint64_t base_h = image_u64(img, kImageBaseOff);
+    const std::uint64_t k      = image_u64(img, kImageDepthOff);
+    kat::checkf(base_h == want_base && k == want_k, "%s: the image is based at %llu with a tail of %llu (got %llu, %llu)",
+                what, (unsigned long long)want_base, (unsigned long long)want_k, (unsigned long long)base_h,
+                (unsigned long long)k);
+
+    Seen         seen;
+    GenesisChain tgt(0);
+    watch(tgt.idx, seen);
+    const bool ok = tgt.boot.resume_from_snapshot(img, why);
+    kat::checkf(ok, "%s: resumes (%s)", what, why.c_str());
+    kat::checkf(tgt.idx.tip() && tgt.idx.tip()->height == src.tip_height() && tgt.idx.tip()->id == src.tip_id(),
+                "%s: at the image's tip", what);
+    kat::checkf(seen.row_calls == 1 + k && seen.seeded == 1,
+                "%s: row sinks called 1 + k = %llu times, one seeded (got %llu, %llu seeded)", what,
+                (unsigned long long)(1 + k), (unsigned long long)seen.row_calls, (unsigned long long)seen.seeded);
+    kat::checkf(seen.events == 0 && seen.tx_events == 0, "%s: no event (%llu) or tx event (%llu)", what,
+                (unsigned long long)seen.events, (unsigned long long)seen.tx_events);
+}
+
+void test_good_image_sinks() {
+    good_image_into_root("good-image", kChainHeight, 0, kChainHeight);
+    good_image_into_root("good-image (row below the base)", regtest_options().snapshot_depth + 1, 1,
+                         regtest_options().snapshot_depth);
+}
+
+// A good image whose last tail block is stamped beyond the future limit of the target's clock.
+void test_clock_not_judged() {
+    GenesisChain              src(kClockLen);
+    std::vector<std::uint8_t> img;
+    std::string               why;
+    if (!src.idx.save_snapshot(img, why)) {
+        kat::checkf(false, "clock: the source could not be snapshotted (%s)", why.c_str());
+        return;
+    }
+    const std::uint64_t last_stamp = src.idx.tip() ? src.idx.tip()->timestamp : 0;
+    kat::checkf(last_stamp > kClock + native::CRYPTONOTE_BLOCK_FUTURE_TIME_LIMIT,
+                "clock: the last tail block (stamp %llu) is beyond clock %llu + the future limit",
+                (unsigned long long)last_stamp, (unsigned long long)kClock);
+    kat::checkf(image_u64(img, kImageDepthOff) == kClockLen && find_in_image(img, blob_pattern(src.blocks.back())) != kNpos,
+                "clock: the last block is in the image's tail (depth %llu)",
+                (unsigned long long)image_u64(img, kImageDepthOff));
+
+    GenesisChain tgt(0);
+    tgt.idx.set_clock([] { return kClock; });
+    const bool ok = tgt.boot.resume_from_snapshot(img, why);
+    kat::checkf(ok, "clock: resumes under a set clock (%s)", why.c_str());
+    kat::checkf(tgt.idx.tip() && tgt.idx.tip()->height == src.tip_height() && tgt.idx.tip()->id == src.tip_id(),
+                "clock: at the image's tip");
+}
+
+} // namespace
+
 int main() {
     test_fixture();
     test_genesis_resume();
@@ -1205,5 +1722,12 @@ int main() {
     test_node_falls_back_when_the_snapshot_is_unusable();
     test_refused_gate4_writes_nothing();
     test_node_resumes_the_output_set();
+    test_late_refusal_rows();
+    test_late_refusal_eval();
+    test_late_refusal_connect();
+    test_node_late_refusals();
+    test_anchor_late_refusal();
+    test_good_image_sinks();
+    test_clock_not_judged();
     return kat::report("xmr_native_snapshot_resume_kat");
 }
