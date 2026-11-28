@@ -2,9 +2,11 @@
 #pragma once
 
 #include "config_pool.hpp"
+#include "store_rules_epoch.hpp"   // reverify_store_if_rules_changed
 #include "config_coin.hpp"
 
 #include <core/config.hpp>
+#include <core/filesystem.hpp>
 #include <core/tx_advertiser.hpp>
 #include "params.hpp"
 #include "share.hpp"
@@ -92,6 +94,9 @@ protected:
     uint32_t m_last_monitor_ts{0};
     static constexpr uint32_t MONITOR_INTERVAL_S = 30;
     std::unique_ptr<c2pool::storage::SharechainStorage> m_storage;
+    // False when the store's verified flags could not be cleared after a share
+    // rules change (store_rules_epoch.hpp): every loaded share verifies again.
+    bool m_trust_stored_verified = true;
 
     // Global pool of known transactions, populated by remember_tx and coin daemon.
     // Protocol handlers look up tx hashes here when processing shares.
@@ -230,6 +235,12 @@ public:
         // sharechain DB with c2pool-ltc on a shared host. Bucket-1 isolation primitive.
         std::string net_name = config->m_testnet ? "digibyte_testnet" : "digibyte";
         m_storage = std::make_unique<c2pool::storage::SharechainStorage>(net_name);
+        // A store written under older DGB share rules has its verified flags
+        // cleared once first (store_rules_epoch.hpp): the shares are kept and
+        // verified again; on a failure no stored flag is trusted this run.
+        if (m_storage && m_storage->is_available())
+            m_trust_stored_verified = reverify_store_if_rules_changed(
+                *m_storage, core::filesystem::config_path() / net_name / "dgb_share_rules_epoch");
         load_persisted_shares();
 
         // Wire up verified-hash persistence callback (p2pool known_verified pattern)

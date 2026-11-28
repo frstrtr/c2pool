@@ -105,10 +105,19 @@ public:
     }
 
     // A payout address the coin accepts but whose shares the node cannot
-    // build (e.g. BCH v35 shares carry only a legacy P2PKH/P2SH address):
-    // non-empty = the reason mining.authorize is refused, so the miner is
-    // told instead of hashing for shares that are never minted. Default: none.
+    // build (e.g. BCH v35 shares carry only a legacy P2PKH/P2SH address), or
+    // an empty login (`username` empty) on a work source that does not
+    // redistribute one (DGB): non-empty = the reason mining.authorize is
+    // refused, so the miner is told instead of hashing for shares that are
+    // never minted. Default: none.
     virtual std::string authorize_refusal(const std::string& /*username*/) const { return {}; }
+
+    // The difficulty (INTERNAL units, as "+N" and the difficulty hint) a
+    // session starts at when its login names none: no "+N", no password
+    // "d=N", no mining.suggest_difficulty before the first authorize.
+    // Applied once, as the difficulty hint (bounded by [min, max] and the
+    // pool-share ceiling). 0 (default): the vardiff floor, as before.
+    virtual double start_difficulty(const PayoutKey& /*login_key*/) const { return 0.0; }
 
     // ── Per-connection bookkeeping ───────────────────────────────────────
     // Lifecycle: register on authorize, update each share, unregister on

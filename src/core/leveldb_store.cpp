@@ -1273,6 +1273,60 @@ bool SharechainLevelDBStore::mark_shares_verified(const std::vector<uint256>& ha
     }
 }
 
+bool SharechainLevelDBStore::mark_shares_unverified(const std::vector<uint256>& hashes)
+{
+    if (!m_store || !m_store->is_open())
+        return false;
+    try {
+        auto batch = m_store->create_batch();
+        int updated = 0;
+        for (const auto& hash : hashes) {
+            // The index record itself, so a record whose share data is gone
+            // (load_share fails on it) is cleared too.
+            std::vector<uint8_t> raw;
+            if (!m_store->get(make_index_key(hash), raw))
+                continue;
+            ShareMetadata metadata;
+            uint8_t orphan = 0, verified = 0;
+            PackStream in(std::span<const std::byte>(reinterpret_cast<const std::byte*>(raw.data()), raw.size()));
+            try {
+                in >> metadata.prev_hash >> metadata.height >> metadata.timestamp >> metadata.work
+                   >> metadata.target >> orphan;
+            } catch (...) {
+                continue;   // not a record this store wrote
+            }
+            try { in >> verified; } catch (...) {}
+            if (!verified)
+                continue;
+            try { in >> metadata.pow_hash; } catch (...) {}
+            PackStream ms;
+            ms << metadata.prev_hash;
+            ms << metadata.height;
+            ms << metadata.timestamp;
+            ms << metadata.work;
+            ms << metadata.target;
+            ms << orphan;
+            ms << static_cast<uint8_t>(0); // is_verified = false
+            ms << metadata.pow_hash;
+            auto span = ms.get_span();
+            std::vector<uint8_t> md(
+                reinterpret_cast<const uint8_t*>(span.data()),
+                reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+            batch.put(make_index_key(hash), md);
+            ++updated;
+        }
+        // Synced: the caller writes its marker after this returns.
+        if (updated > 0 && !batch.commit_sync()) {
+            LOG_ERROR << "mark_shares_unverified: batch commit failed";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR << "mark_shares_unverified failed: " << e.what();
+        return false;
+    }
+}
+
 bool SharechainLevelDBStore::mark_shares_verified_with_pow(
     const std::vector<std::pair<uint256, uint256>>& hash_pow_pairs)
 {

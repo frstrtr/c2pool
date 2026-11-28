@@ -1370,7 +1370,7 @@ void NodeImpl::load_persisted_shares()
 
     const size_t to_load = total_in_db - skip;
     LOG_INFO << "[Pool] Loading shares from LevelDB: " << to_load << " shares to process...";
-    int loaded = 0, skipped_contains = 0, skipped_load = 0, skipped_small = 0;
+    int loaded = 0, skipped_contains = 0, skipped_load = 0, skipped_small = 0, skipped_v36 = 0;
     std::vector<uint256> verified_hashes; // shares to pre-populate into verified
     for (size_t i = skip; i < total_in_db; ++i)
     {
@@ -1391,6 +1391,13 @@ void NodeImpl::load_persisted_shares()
             // First 8 bytes = version (uint64_t LE), rest = packed share
             uint64_t ver;
             std::memcpy(&ver, data.data(), 8);
+            // While DGB shares are held at V35, a stored V36 share (from a
+            // --v36-ratchet run) is not loaded: the python V35 network cannot
+            // load it, and share_init_verify refuses it from peers too.
+            if (ver >= 36 && !dgb::v36_shares_accepted()) {
+                ++skipped_v36;
+                continue;
+            }
 
             std::vector<unsigned char> share_bytes(data.begin() + 8, data.end());
             PackStream ps(share_bytes);
@@ -1437,7 +1444,7 @@ void NodeImpl::load_persisted_shares()
                 // Not verified again, so its block flag comes from its PoW hash and header
                 // bits here, with no found-block event (the block was recorded when the
                 // share was first verified; the found-block store survives the restart).
-                if (meta.is_verified) {
+                if (meta.is_verified && m_trust_stored_verified) {
                     if (auto* idx = m_tracker.chain.get_index(share.hash()))
                         share.ACTION({ core::restore_block_flag(*idx, *obj, idx->pow_hash); });
                     verified_hashes.push_back(share.hash());
@@ -1477,7 +1484,7 @@ void NodeImpl::load_persisted_shares()
     LOG_INFO << "[Pool] Loaded " << loaded << " shares from LevelDB storage"
              << " (DB total: " << total_in_db << ", limit: " << keep_per_head
              << ", skipped: load=" << skipped_load << " small=" << skipped_small
-             << " dup=" << skipped_contains << ")";
+             << " dup=" << skipped_contains << " v36-held=" << skipped_v36 << ")";
 
     // Prune old shares from LevelDB that we skipped
     if (skip > 0)

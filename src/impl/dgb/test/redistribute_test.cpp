@@ -362,9 +362,10 @@ TEST(DgbRedistribute, Issue1312ForeignOrWitnessAddressNeverArms)
     }
 }
 
-// --redistribute split is the LTC and DASH default, not available on DGB yet.
-// A DGB spec naming it (a settings file or the CLI saying "split", alone or
-// as a hybrid term) binds no Redistributor and is warned about (main_dgb.cpp):
+// --redistribute split, the default on DGB as on LTC and DASH, is decided
+// when the job is built (DGBWorkSource::decide_job_payout, armed by main_dgb
+// with the node owner's script). A DGB spec naming it (a settings file or the
+// CLI saying "split", alone or as a hybrid term) binds no Redistributor:
 // never read as pplns, which parse_single_mode makes of an unknown mode.
 // Every other spec binds as before; no spec binds nothing, as before.
 TEST(DgbRedistribute, ASplitSpecBindsNoPolicyAndIsNeverReadAsPplns)

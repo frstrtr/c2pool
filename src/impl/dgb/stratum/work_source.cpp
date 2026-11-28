@@ -15,6 +15,7 @@
 // accept-by-continuity / V37 and never reach this work source.
 
 #include <impl/dgb/stratum/work_source.hpp>
+#include <impl/dgb/stratum_start_difficulty.hpp>   // dgb_start_difficulty (VARDIFF item 2)
 
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/mempool.hpp>
@@ -33,25 +34,34 @@
 #include <impl/dgb/coin/won_block_serialize.hpp>   // serialize_won_block SSOT (won-block framing)
 #include <impl/dgb/coin/header_sample_build.hpp>// compact_to_target (compact bits -> u256)
 
+#include <core/author_fee.hpp>                     // kSplitShareDonation (--redistribute split)
 #include <core/log.hpp>
 #include <core/hash.hpp>                        // Hash (sha256d) for coinbase txid + merkle pair
 #include <core/target_utils.hpp>            // chain::target_to_difficulty (vardiff/pool unit parity)
 #include <core/address_utils.hpp>              // address_to_script (share payout from username)
 
+#include <btclibs/base58.h>                      // DecodeBase58Check
 #include <btclibs/util/strencodings.h>          // ParseHex, HexStr
 #include <btclibs/span.h>                       // Span (HexStr arg)
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <ctime>
 #include <span>
 #include <string>
 #include <limits>
 
 namespace dgb::stratum {
+
+namespace {
+constexpr uint32_t kDogeChainId = 98;   // the DOGE AuxPoW chain id (--merged DOGE:98)
+constexpr uint64_t kDustThreshold = 100000;   // DUST_THRESHOLD 0.001 DGB (params.hpp p.dust_threshold)
+} // namespace
 
 namespace {
 
@@ -178,6 +188,20 @@ DGBWorkSource::DGBWorkSource(c2pool::dgb::HeaderChain&     chain,
     // reasonable client watchdog -- so idle DGB sessions stay stable backups.
     // Transport/liveness only; ZERO wire-byte and consensus change.
     config_.keepalive_notify_sec = 25;
+    // A repeated submit of the same header on a job is refused with error 22
+    // (p2pool / kr1z1s work.py received_header_hashes).
+    config_.reject_duplicate_submits = true;
+    // Session hygiene, the LTC / BTC / DASH profile (ltc/stratum_defaults.hpp):
+    // a NAT-dropped rig's half-open socket and a client that connects and
+    // never authorizes would each hold a slot forever, until the node refuses
+    // every real miner at max_stratum_connections. Transport/liveness only.
+    config_.tcp_keepalive_enabled      = true;   // kernel probes dead NAT paths
+    config_.tcp_keepalive_idle_sec     = 60;
+    config_.tcp_keepalive_interval_sec = 10;
+    config_.tcp_keepalive_count        = 3;
+    config_.handshake_timeout_sec      = 30;     // drop a connection that never authorizes
+    config_.session_idle_timeout_sec   = 1800;   // backstop; never reaps an authorized session with keepalive on
+    config_.max_write_queue_depth      = 256;    // drop a peer that stopped reading
     LOG_INFO << "[DGB-STRATUM] DGBWorkSource constructed"
              << " (testnet=" << is_testnet_
              << " min_diff=" << config_.min_difficulty
@@ -220,6 +244,46 @@ std::function<uint256()> DGBWorkSource::get_best_share_hash_fn() const
     return best_share_hash_fn_;  // empty function until set_best_share_hash_fn() called
 }
 
+int64_t DGBWorkSource::tip_age() const
+{
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+    {
+        std::lock_guard<std::mutex> lk(tip_clock_mutex_);
+        if (tip_clock_)
+            now = tip_clock_();
+    }
+    return now - chain_.median_time_past();
+}
+
+bool DGBWorkSource::embedded_chain_serves() const
+{
+    // The one template-source choice, read by the template, the prevhash
+    // getter and the work gate: the embedded header chain while it has a tip whose median time
+    // is at most tip_recent_sec old. While it syncs, or once its tip is that
+    // stale (no header for an hour on a 15 s chain), its template is for an
+    // old height and prevhash: digibyted's template when bound, else no work
+    // (no latch).
+    if (!chain_.tip_hash())
+        return false;
+    const uint32_t recent = tip_recent_sec_.load();
+    if (recent == 0)
+        return true;
+    const int64_t age = tip_age();
+    if (age > static_cast<int64_t>(recent))
+        return false;
+    if (tip_state_.exchange(1) != 1)
+        LOG_INFO << "[DGB-STRATUM] header chain at its tip (median time " << age << " s old): serving work from it";
+    return true;
+}
+
+bool DGBWorkSource::template_servable() const
+{
+    if (embedded_chain_serves())
+        return true;
+    const auto tip = resolve_gbt_tip_fallback();
+    return tip && tip->height != 0;
+}
+
 std::string DGBWorkSource::get_current_gbt_prevhash() const
 {
     // The tip block id as GBT-conventional big-endian display hex, drawn from
@@ -230,9 +294,13 @@ std::string DGBWorkSource::get_current_gbt_prevhash() const
     // string when the chain carries no real tip hash (tip_hash() == nullopt:
     // an empty chain, or the block_hash==0 sentinel from the not-yet-wired
     // embedded P2P header ingest) -- a truthful absence, never a fabricated id.
-    if (auto th = chain_.tip_hash())
-        return u256_be_display_hex(*th);
-    // Embedded chain unfed -> external-daemon GBT fallback (the mining.notify
+    // The same source choice as the template (embedded_chain_serves): while
+    // the embedded chain is behind its tip, the job push follows digibyted's
+    // tip, not the syncing chain's.
+    if (embedded_chain_serves())
+        if (auto th = chain_.tip_hash())
+            return u256_be_display_hex(*th);
+    // Embedded chain unfed (or behind) -> external-daemon GBT fallback (the mining.notify
     // prevhash path: stratum_server.cpp get_current_gbt_prevhash caller). Drawn
     // from the SAME single GBT source as get_current_work_template()'s
     // previousblockhash, so the dedicated getter and the assembled template can
@@ -248,12 +316,15 @@ uint64_t DGBWorkSource::get_work_generation() const
     return work_generation_.load(std::memory_order_relaxed);
 }
 
-bool DGBWorkSource::has_merged_chain(uint32_t /*chain_id*/) const
+bool DGBWorkSource::has_merged_chain(uint32_t chain_id) const
 {
-    // DGB V36 default build: standalone Scrypt parent, no merged mining.
-    // The DGB-as-DOGE-parent dual-parent path (-DAUX_DOGE=ON) is a V36
-    // STRETCH, parked behind the shared DOGE-aux settle — not wired here.
-    return false;
+    // The merged-mining manager main_dgb binds for --merged DOGE decides (as
+    // btc work_source.cpp has_merged_chain). No manager (standalone DGB, or
+    // no --merged) or a chain it does not mine => false. True arms the core
+    // stratum login resolution for that chain: the "DGB,DOGE" login form, the
+    // DOGE address auto-derived from the primary's key, and the #961 door
+    // accepting the chain's addresses (stratum_server.cpp, merged_chain_addr.hpp).
+    return mm_manager_ != nullptr && mm_manager_->has_chain(chain_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -305,8 +376,30 @@ void DGBWorkSource::update_stratum_worker(const std::string& session_id,
 // IWorkSource: work generation — Stage 4c will fill these in.
 // ─────────────────────────────────────────────────────────────────────────────
 
+void DGBWorkSource::set_work_hold(const std::string& reason)
+{
+    std::lock_guard<std::mutex> lk(work_hold_mutex_);
+    if (reason == work_hold_)
+        return;
+    if (!reason.empty())
+        LOG_WARNING << "[DGB-STRATUM] work held, miners refused: " << reason;
+    else
+        LOG_INFO << "[DGB-STRATUM] work hold over (" << work_hold_ << "): serving work";
+    work_hold_ = reason;
+}
+
+std::string DGBWorkSource::work_hold() const
+{
+    std::lock_guard<std::mutex> lk(work_hold_mutex_);
+    return work_hold_;
+}
+
 nlohmann::json DGBWorkSource::get_current_work_template() const
 {
+    // The work gate (no sharechain peers, lost contact with digibyted): no
+    // template, so the stratum layer sends no job.
+    if (!work_hold().empty())
+        return nlohmann::json::object();
     // Stage 4c (coinbasevalue wire): the full GBT-shaped template
     // (previousblockhash, bits, version, curtime, mintime, transactions[])
     // is assembled by the embedded dgb::coin::TemplateBuilder in a following
@@ -391,9 +484,12 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     in.median_time_past  = chain_.median_time_past();
     in.curtime           = static_cast<int64_t>(std::time(nullptr));
     in.transactions      = tx_sel.transactions;
+    // The template's block: the embedded header chain's tip, or digibyted's
+    // getblocktemplate (the GBT fallback) when the chain is unfed or, during
+    // its initial sync, behind its tip.
+    bool from_gbt = false;
+    bool embedded_behind = false;
     if (auto th = chain_.tip_hash()) {
-        // Embedded chain carries a real tip -> source previousblockhash from it.
-        in.previousblockhash = u256_be_display_hex(*th);
         // #179: derive the block-template bits from the synced header chain via
         // DigiByte-Core MultiShield V4 (chain_.next_scrypt_bits()), replacing the
         // fabricated diff-1 (0x1d00ffff) that made every won block INVALID and
@@ -407,19 +503,63 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
         auto nb = chain_.next_scrypt_bits();
         if (!nb)
             return nlohmann::json::object();  // hold work until the window fills.
-        char bits_buf[9];
-        std::snprintf(bits_buf, sizeof(bits_buf), "%08x", *nb);
-        in.bits = std::string(bits_buf);
-    } else if (auto tip = resolve_gbt_tip_fallback()) {
-        // Embedded HeaderChain unfed -> external-daemon GBT fallback (persist per
-        // V36). Sources BOTH previousblockhash and the daemon-authoritative bits
-        // from ONE getblocktemplate snapshot (consistent height). Unbound / no
-        // creds / RPC failure -> both stay absent, byte-identical to before.
-        in.previousblockhash = tip->previousblockhash;
-        in.bits              = tip->bits;
+        // Work from the embedded chain only once it is at its tip
+        // (embedded_chain_serves); behind: digibyted's template when the GBT
+        // fallback is bound, else no work.
+        embedded_behind = !embedded_chain_serves();
+        if (!embedded_behind) {
+            // Embedded chain carries a real tip -> source previousblockhash from it.
+            in.previousblockhash = u256_be_display_hex(*th);
+            char bits_buf[9];
+            std::snprintf(bits_buf, sizeof(bits_buf), "%08x", *nb);
+            in.bits = std::string(bits_buf);
+        }
     }
+    if (!in.previousblockhash) {
+        // Embedded HeaderChain unfed (or behind) -> external-daemon GBT fallback
+        // (persist per V36). Sources previousblockhash, the daemon-authoritative
+        // bits AND the height from ONE getblocktemplate snapshot; the empty
+        // header chain has no height (next_block_height() would be its base, 0).
+        // No height: no work. Unbound / no creds / RPC failure -> all absent.
+        auto tip = resolve_gbt_tip_fallback();
+        if (tip && tip->height != 0) {
+            in.previousblockhash = tip->previousblockhash;
+            in.bits              = tip->bits;
+            in.next_height       = tip->height;
+            in.coinbasevalue     = coinbase_value(tip->height, tx_sel.total_fees, std::nullopt);
+            from_gbt = true;
+        } else if (tip || embedded_behind) {
+            if (embedded_behind && tip_state_.exchange(0) != 0)
+                LOG_WARNING << "[DGB-STRATUM] header chain behind its tip (median time " << tip_age()
+                            << " s old > " << tip_recent_sec_.load() << " s) and no digibyted template:"
+                               " work held until it syncs";
+            return nlohmann::json::object();
+        }
+    }
+    if (embedded_behind && from_gbt && tip_state_.exchange(2) != 2)
+        LOG_WARNING << "[DGB-STRATUM] header chain behind its tip: serving digibyted's template until it syncs";
 
-    return dgb::coin::build_work_template(in);
+    nlohmann::json t = dgb::coin::build_work_template(in);
+    // The dashboard's summary of the template served (last_template_summary).
+    // Display only: never lets the work path fail.
+    try {
+        if (t.contains("bits") && t["bits"].is_string() && t.contains("height")) {
+            TemplateSummary sum;
+            sum.height = t["height"].get<uint32_t>();
+            sum.bits = static_cast<uint32_t>(std::stoul(t["bits"].get<std::string>(), nullptr, 16));
+            sum.coinbase_value = t.value("coinbasevalue", uint64_t(0));
+            std::lock_guard<std::mutex> lk(summary_mutex_);
+            summary_ = sum;
+        }
+    } catch (...) {
+    }
+    return t;
+}
+
+std::optional<DGBWorkSource::TemplateSummary> DGBWorkSource::last_template_summary() const
+{
+    std::lock_guard<std::mutex> lk(summary_mutex_);
+    return summary_;
 }
 
 std::vector<std::string> DGBWorkSource::get_stratum_merkle_branches() const
@@ -434,11 +574,155 @@ std::pair<std::string, std::string> DGBWorkSource::get_coinbase_parts() const
     return { {}, {} };
 }
 
+// core resolve_merged_login gives every configured merged
+// chain the primary's hash160 when the miner names no address for it. A DGB
+// P2SH primary ("S...", version 63) is not in core address_to_hash160's P2SH
+// list, so it is typed P2PKH and its DOGE script becomes P2PKH(redeem-script
+// hash): an output no key can spend, and as the share's Tier-1 merged address
+// it also hid the P2SH rule below. On DGB a P2SH login without a DOGE address
+// of its own takes the operator's P2SH split instead (its DOGE share goes to
+// the node owner and the donation, doge_merged_payouts), so the job drops the
+// chain-98 entry that is the P2PKH of the P2SH payout's own hash. A DOGE
+// address the miner gave (any other key, or a P2SH of the same redeem script)
+// is kept.
+std::optional<uint16_t> DGBWorkSource::decide_job_payout(
+    std::vector<unsigned char>& payout_script,
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const
+{
+    if (payout_script.empty()) {
+        // Case 4 (p2pool work.py; core::merged_addr::case4_parent): a login
+        // with no DGB payout that names a DOGE address in a legacy form pays
+        // its DGB parent to that address's own script (P2PKH stays P2PKH,
+        // P2SH stays P2SH), with the node's donation, the named entry kept.
+        // Split applies only when nothing usable is named (#2347).
+        for (const auto& [chain_id, script] : merged) {
+            if (chain_id != kDogeChainId)
+                continue;
+            const bool legacy = (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14
+                                 && script[23] == 0x88 && script[24] == 0xac)
+                                || (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87);
+            if (legacy) {
+                payout_script = script;
+                return std::nullopt;
+            }
+        }
+        // --redistribute split (the master default, #2347; dd049e9f1 on this
+        // mint): a job with no payout pays the node owner with half its
+        // weight to the donation. Its DOGE share follows the owner's DGB key
+        // (a P2SH owner: the P2SH-owner rule, aux_doge_payout_provider.hpp).
+        std::vector<unsigned char> owner;
+        {
+            std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
+            owner = split_owner_script_;
+        }
+        if (owner.empty())
+            return std::nullopt;
+        payout_script = std::move(owner);
+        merged.clear();
+        return core::kSplitShareDonation;
+    }
+    if (!(payout_script.size() == 23 && payout_script[0] == 0xa9 && payout_script[1] == 0x14
+          && payout_script[22] == 0x87))
+        return std::nullopt;
+    std::vector<unsigned char> derived{0x76, 0xa9, 0x14};
+    derived.insert(derived.end(), payout_script.begin() + 2, payout_script.begin() + 22);
+    derived.push_back(0x88);
+    derived.push_back(0xac);
+    merged.erase(std::remove_if(merged.begin(), merged.end(),
+                                [&](const auto& e) { return e.first == kDogeChainId && e.second == derived; }),
+                 merged.end());
+    return std::nullopt;
+}
+
+void DGBWorkSource::set_split_owner(std::vector<unsigned char> script)
+{
+    std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
+    split_owner_script_ = std::move(script);
+}
+
+namespace {
+// The payouts a DGB share carries: a P2PKH, P2SH or 20-byte P2WPKH script (a
+// V35 share's address, a V36 share's 20-byte payout hash).
+bool payout_carried(const std::vector<unsigned char>& s)
+{
+    return (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14)
+           || (s.size() == 23 && s[0] == 0xa9 && s[1] == 0x14)
+           || (s.size() == 22 && s[0] == 0x00 && s[1] == 0x14);
+}
+} // namespace
+
+// An empty login has no payout a share can carry
+// and DGB does not redistribute one (the DGB split comes with the
+// --redistribute split re-apply), and a V35 DGB share carries only a P2PKH,
+// P2SH or 20-byte P2WPKH address: a dgb1 P2WSH/P2TR login was paid to a P2PKH
+// of the first 20 bytes of its program (burned). Both are refused at
+// authorize, with the reason. Other logins (a DOGE address as the primary, a
+// foreign or undecodable one) are left to the core door.
+std::string DGBWorkSource::authorize_refusal(const std::string& username) const
+{
+    // The work gate first, as python's preprocess_request runs before the
+    // login is read.
+    if (std::string hold = work_hold(); !hold.empty())
+        return hold;
+    if (username.empty()) {
+        // --redistribute split armed: an empty login's work pays the node
+        // owner and the donation half and half (decide_job_payout), as
+        // p2pool pays its node address for one.
+        {
+            std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
+            if (!split_owner_script_.empty())
+                return {};
+        }
+        return "a DGB payout address is required (DGB_ADDRESS, or DGB_ADDRESS,DOGE_ADDRESS to name the "
+               "DOGE payout)";
+    }
+    // An UPPERCASE bech32 login: the python network keys V35 weights by the
+    // address string as typed, so the same key typed in both cases would be
+    // two outputs there and one here. The lowercase form is the same address.
+    // (A base58 P2PKH may itself start "DGB1": only a string that is not a
+    // valid base58check is read as an uppercase bech32 one.)
+    std::vector<unsigned char> b58;
+    const bool is_base58 = DecodeBase58Check(username, b58, 21);
+    for (const char* hrp : {"DGB1", "DGBT1", "DGBRT1"})
+        if (!is_base58 && username.rfind(hrp, 0) == 0) {
+            std::string lower = username;
+            for (auto& c : lower)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return "use the lowercase form of this bech32 address (" + lower + ")";
+        }
+    std::vector<unsigned char> script;
+    if (core::classify_address_for_coin(username, dgb::address_acceptance(is_testnet_, is_regtest_), script)
+        != core::AddressCoinMatch::Own)
+        return {};
+    if (payout_carried(script))
+        return {};
+    return "DGB shares carry only a P2PKH (D...), P2SH (S...) or P2WPKH (dgb1q..., 20-byte) address; "
+           "a P2WSH or P2TR address cannot be paid (use one of those)";
+}
+
 void DGBWorkSource::set_node_owner_fee(double pct, std::vector<unsigned char> script)
 {
     std::lock_guard<std::mutex> lk(node_owner_fee_mutex_);
     node_owner_fee_pct_ = pct;
     node_owner_script_  = std::move(script);
+}
+
+void DGBWorkSource::set_owner_merged_scripts(
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> scripts)
+{
+    std::lock_guard<std::mutex> lk(node_owner_fee_mutex_);
+    owner_merged_scripts_ = std::move(scripts);
+}
+
+std::vector<std::pair<uint32_t, std::vector<unsigned char>>> DGBWorkSource::effective_merged_addrs(
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& miner_merged,
+    const std::vector<unsigned char>& miner_script,
+    const std::vector<unsigned char>& effective_script) const
+{
+    if (effective_script == miner_script)
+        return miner_merged;
+    std::lock_guard<std::mutex> lk(node_owner_fee_mutex_);
+    return owner_merged_scripts_;
 }
 
 // Deterministic per-(tip, connection) node-fee roll — ported verbatim from
@@ -490,6 +774,72 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
 {
+    return build_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, /*local_hash_rate=*/0.0,
+                          std::nullopt);
+}
+
+core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase_for(
+    const core::stratum::PayoutKey& login_key,
+    const uint256& prev_share_hash,
+    const std::string& extranonce1_hex,
+    const std::vector<unsigned char>& payout_script,
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+    const std::optional<uint16_t>& share_donation,
+    const std::optional<double>& /*desired_share_difficulty*/) const
+{
+    LocalRateFn fn;
+    {
+        std::lock_guard<std::mutex> lk(local_rate_mutex_);
+        fn = local_rate_fn_;
+    }
+    const double rate = fn ? fn(login_key) : 0.0;
+    return build_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, rate, share_donation);
+}
+
+void DGBWorkSource::set_local_rate_fn(LocalRateFn fn)
+{
+    std::lock_guard<std::mutex> lk(local_rate_mutex_);
+    local_rate_fn_ = std::move(fn);
+}
+
+void DGBWorkSource::set_node_rate_fn(std::function<double()> fn)
+{
+    std::lock_guard<std::mutex> lk(local_rate_mutex_);
+    node_rate_fn_ = std::move(fn);
+}
+
+double DGBWorkSource::start_difficulty(const core::stratum::PayoutKey&) const
+{
+    std::function<double()> fn;
+    {
+        std::lock_guard<std::mutex> lk(local_rate_mutex_);
+        fn = node_rate_fn_;
+    }
+    const double node_rate = fn ? fn() : 0.0;
+    uint32_t bits = 0;
+    uint64_t value = 0;
+    if (!(node_rate > 0.0)) {
+        // No node rate yet: the current template's block.
+        try {
+            const nlohmann::json tmpl = get_current_work_template();
+            if (tmpl.is_object() && tmpl.contains("bits") && tmpl.contains("height")) {
+                bits = static_cast<uint32_t>(std::stoul(tmpl["bits"].get<std::string>(), nullptr, 16));
+                value = coinbase_value(tmpl["height"].get<uint32_t>(), 0, std::nullopt);
+            }
+        } catch (const std::exception&) {
+            return 0.0;
+        }
+    }
+    return dgb::dgb_start_difficulty(node_rate, bits, value, dgb::PoolConfig::SPREAD, kDustThreshold);
+}
+
+core::stratum::CoinbaseResult DGBWorkSource::build_coinbase(
+    const uint256& prev_share_hash,
+    const std::string& extranonce1_hex,
+    const std::vector<unsigned char>& payout_script,
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+    double local_hash_rate, const std::optional<uint16_t>& share_donation) const
+{
     // Phase B live-wire: delegate to the PPLNS->coinbase SSOT
     // (build_connection_coinbase_from_pplns), which itself routes through the
     // single compute_pplns_payout_split() the verifier uses -- so the coinbase a
@@ -499,16 +849,28 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     // The PPLNS inputs (weight map walked from the ShareTracker, ref_hash,
     // subsidy, donation script) are produced by the seam bound in main_dgb.cpp
     // -- the tracker walk lives there, not in the work source. While the seam is
-    // UNBOUND (or returns nullopt) this is byte-identical to the pre-wire stub:
-    // an empty result, so the session pushes no work (safe, non-functional).
+    // UNBOUND (or returns nullopt) the result is HELD (no coinbase, no job).
     PplnsInputsFn fn;
     {
         std::lock_guard<std::mutex> lk(pplns_inputs_mutex_);
         fn = pplns_inputs_fn_;  // copy under lock; a concurrent set_*_fn() cannot
                                 // tear it out mid-call.
     }
+    // No coinbase its shares could carry (unbound producer, or the producer
+    // declined below): HELD, never an empty result. An empty result made the
+    // core stratum server fall back to the global coinbase (empty on DGB) and
+    // then to its hard-coded stub (stratum_server.cpp send_notify_work: no
+    // BIP34 height, 50 coins to hash160 0x00..00), so a miner hashed a coinbase
+    // no share or block could ever be credited for. Held, the session sends no
+    // job (the miner keeps its last real one) and retries, bounded by
+    // StratumConfig::job_hold_limit_sec (CoinbaseResult::held).
+    auto held = []() {
+        core::stratum::CoinbaseResult r;
+        r.held = true;
+        return r;
+    };
     if (!fn)
-        return {};  // unbound: pre-wire behavior (empty job).
+        return held();  // unbound producer: no job.
 
     // Node-owner fee (p2pool -f/--fee): resolve the payout IDENTITY that receives
     // this share's finder value (and, via the committed share, its future PPLNS
@@ -518,55 +880,145 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     // verify. Default (fee 0 / no owner) => eff == payout_script, byte-identical.
     const std::vector<unsigned char> eff_payout_script =
         effective_payout_script(payout_script, prev_share_hash, extranonce1_hex);
+    // No payout a share can carry (an empty login, a P2WSH/P2TR one: both
+    // refused at authorize; this is the defence in depth, as the stratum
+    // session may still build for a refused login): no job. A share minted
+    // from an empty payout would carry one the submit path redistributes, so
+    // its fields would differ from the ref the coinbase committed to; a
+    // P2WSH/P2TR payout would be paid to a P2PKH of its program's first bytes.
+    if (!payout_carried(eff_payout_script))
+        return held();
 
-    std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs =
-        fn(prev_share_hash, extranonce1_hex, eff_payout_script, merged_addrs);
-    if (!inputs)
-        return {};  // producer declined (e.g. tip not yet known) -> safe empty job.
-
-    // ── DGB-as-DOGE-parent merged-mining commitment snapshot ──────────────────
-    // Runtime-armed (no -DAUX_DOGE compile fence): when a --merged DOGE spec has
-    // stood up the embedded aux backend, splice the cached 44-byte AuxPoW
-    // commitment into the coinbase scriptSig so a won DGB block carries the DOGE
-    // merged-mining tag a Dogecoin node decodes. Mirrors the live-proven BTC->NMC
-    // parent lane (btc work_source.cpp:450-497): ONE lock-free read of the
-    // pre-built commitment (built per work cycle in rebuild_cached_blocks with a
-    // payout provider), gated so a merged-off / pre-sync node leaves the coinbase
-    // BYTE-IDENTICAL to standalone DGB.
-    //
-    // Layout matches the parent lane exactly: [push opcode 0x2c][44-byte blob],
-    // where the blob is the cross-coin SSOT c2pool::merged::build_auxpow_commitment
-    // output (fabe6d6d || aux_root32 BE || size4 LE || nonce4 LE). connection_
-    // coinbase.hpp appends aux_mm_commitment to the scriptSig AFTER the BIP34
-    // height + pool tag; DOGE's AuxPoW check searches the whole scriptSig for the
-    // fabe6d6d magic and only requires it be contiguous, single, and immediately
-    // followed by the aux root — all of which this framing satisfies.
-    //
-    // DGB divergence from BTC (deliberate, single-parent deployment): the DGB
-    // share does NOT freeze a per-chain merged_coinbase_info blob. The DGB
-    // verifier verify_merged_coinbase_commitment (share_check.hpp:1429) skips when
-    // m_merged_coinbase_info is empty, and the mint reads the scriptSig back off
-    // the actually-hashed coinbase (extract_coinbase_scriptsig), so the spliced
-    // bytes are self-consistent through gentx-txid / ref_hash with no split-brain
-    // reject. The DOGE block itself is assembled+relayed by the manager from its
-    // own cached aux work (try_submit_merged_blocks), not from the share blob.
+    // ── DGB-as-DOGE-parent merged-mining commitment ───────────────────────────
+    // Runtime-armed (--merged DOGE): the cached 44-byte AuxPoW commitment, as
+    // [push 0x2c][fabe6d6d || aux_root32 BE || size4 LE || nonce4 LE] (the
+    // cross-coin SSOT c2pool::merged::build_auxpow_commitment), read ONCE here
+    // (rebuilt first when the payouts are dirty; no tracker lock is held yet,
+    // the payout provider takes its own) and handed to the producer, which puts
+    // it in the coinbase scriptSig BEFORE the ref preimage and the coinbase are
+    // built (conn_job_producer.hpp). DOGE's AuxPoW check searches the whole
+    // scriptSig for the magic. Before, it was appended to the scriptSig after
+    // the producer had computed the ref: the share minted from that coinbase
+    // committed to a scriptSig the OP_RETURN ref did not, so every local share
+    // was declined once DOGE was on. Empty (merged off / no commitment yet):
+    // the coinbase is byte-identical to standalone DGB.
+    std::vector<unsigned char> aux_mm_scriptsig;
     if (mm_manager_ && mm_manager_->has_chains()) {
-        if (mm_manager_->is_pplns_dirty())
-            mm_manager_->rebuild_cached_blocks();
+        // Rebuilt inline at most once a second:
+        // while the tracker is busy the provider declines and re-marks the
+        // payouts dirty, and every session's job build retried the rebuild;
+        // the manager's own poll rebuilds a dirty cache too.
+        if (mm_manager_->is_pplns_dirty()) {
+            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            int64_t last = last_inline_rebuild_ns_.load(std::memory_order_relaxed);
+            if (now_ns - last >= 1000000000LL
+                && last_inline_rebuild_ns_.compare_exchange_strong(last, now_ns))
+                mm_manager_->rebuild_cached_blocks();
+        }
         auto mm_snap = mm_manager_->get_cached_header_infos_and_commitment();
         const std::vector<uint8_t>& mm_commitment = mm_snap.second;
         // Push opcode == length for a 1..75-byte push; the commitment is 44 B => 0x2c.
         if (mm_commitment.size() == dgb::coin::AUX_MM_COMMITMENT_SIZE) {
-            std::vector<unsigned char> tagged;
-            tagged.reserve(1 + mm_commitment.size());
-            tagged.push_back(static_cast<unsigned char>(mm_commitment.size()));
-            tagged.insert(tagged.end(), mm_commitment.begin(), mm_commitment.end());
-            inputs->aux_mm_commitment = std::move(tagged);
+            aux_mm_scriptsig.reserve(1 + mm_commitment.size());
+            aux_mm_scriptsig.push_back(static_cast<unsigned char>(mm_commitment.size()));
+            aux_mm_scriptsig.insert(aux_mm_scriptsig.end(), mm_commitment.begin(), mm_commitment.end());
         }
     }
 
-    dgb::coin::ConnCoinbaseParts parts =
-        dgb::coin::build_connection_coinbase_from_pplns(*inputs);
+    // The merged addresses the share commits to (V36 merged_addresses, in its
+    // ref): the miner's, or the owner's on a node-fee job.
+    const auto eff_merged_addrs = effective_merged_addrs(merged_addrs, payout_script, eff_payout_script);
+
+    // The operator's P2SH rule, told to the miner once per payout script: a
+    // P2SH login with DOGE configured and no DOGE address of its own gets no
+    // DOGE (its DOGE share is split node owner / donation).
+    // (Not for the node owner's own P2SH, the split jobs' payout: the
+    // P2SH-owner rule pays its DOGE wholly to the owner's DOGE address, else
+    // to the donation.)
+    bool owner_payout = false;
+    {
+        std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
+        owner_payout = !split_owner_script_.empty() && payout_script == split_owner_script_;
+    }
+    // A V35 share carries no merged address: a P2SH
+    // login's DOGE share is split so under V35 even when it names a DOGE
+    // address; told once the job's share version is known (below).
+    const bool p2sh_doge_rule = mm_manager_ && !owner_payout && payout_script.size() == 23
+                                && payout_script[0] == 0xa9 && payout_script[1] == 0x14 && payout_script[22] == 0x87
+                                && mm_manager_->has_chain(kDogeChainId);
+    bool names_doge = false;
+    for (const auto& [cid, _] : eff_merged_addrs)
+        names_doge = names_doge || cid == kDogeChainId;
+
+    // The block this job is for, from ONE template: the producer builds the
+    // coinbase for its height, bits and value, and the job carries that
+    // template's header (snapshot.has_header), so the share's header bits, the
+    // PPLNS walk's block target and the coinbase value all belong to the block
+    // the miner hashes. Before, the producer took the block bits from the PREV
+    // share's header and the value from subsidy(share absheight): every
+    // coinbase claimed the subsidy of a block height ~20M lower (a won block
+    // was bad-cb-amount), and the walk's cap differed from the verifier's.
+    // A DGB job carries no transactions (no merkle branches, no tx_data), so
+    // its coinbase may claim the subsidy alone: fees of transactions the block
+    // does not include are never claimed.
+    const nlohmann::json tmpl = get_current_work_template();
+    JobBlock block;
+    std::string tmpl_prev, tmpl_bits;
+    try {
+        if (!tmpl.is_object() || !tmpl.contains("height") || !tmpl.contains("bits")
+            || !tmpl.contains("previousblockhash"))
+            return held();  // no template (window not filled / no tip): no job.
+        block.height = tmpl["height"].get<uint32_t>();
+        tmpl_bits    = tmpl["bits"].get<std::string>();
+        tmpl_prev    = tmpl["previousblockhash"].get<std::string>();
+        if (tmpl_bits.size() != 8 || tmpl_prev.size() != 64)
+            return held();
+        block.bits = static_cast<uint32_t>(std::stoul(tmpl_bits, nullptr, 16));
+    } catch (const std::exception&) {
+        return held();
+    }
+    if (block.bits == 0)
+        return held();
+    block.value = coinbase_value(block.height, /*total_fees=*/0, /*gbt_coinbasevalue=*/std::nullopt);
+    block.local_hash_rate = local_hash_rate;
+    block.share_donation = share_donation;
+
+    // The producer and the PPLNS->coinbase build may throw (a V35 key the
+    // split cannot turn into a script). The core session
+    // has no try around its job build, so an escaping throw would leave the
+    // io handler: no job instead, logged at most once a minute.
+    std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs;
+    dgb::coin::ConnCoinbaseParts parts;
+    try {
+        inputs = fn(prev_share_hash, extranonce1_hex, eff_payout_script, eff_merged_addrs, aux_mm_scriptsig, block);
+        if (!inputs)
+            return held();  // producer declined (no or unknown prev share, tracker busy): no job.
+        parts = dgb::coin::build_connection_coinbase_from_pplns(*inputs);
+    } catch (const std::exception& e) {
+        static std::atomic<int64_t> s_last_log{0};
+        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+        int64_t last = s_last_log.load();
+        if (now - last >= 60 && s_last_log.compare_exchange_strong(last, now))
+            LOG_ERROR << "[DGB-STRATUM] job coinbase build failed (" << e.what() << "): no job";
+        return held();
+    }
+
+    if (p2sh_doge_rule && (!names_doge || inputs->share_version < 36)) {
+        std::lock_guard<std::mutex> lk(p2sh_warned_mutex_);
+        if (p2sh_warned_.size() < 4096 && p2sh_warned_.insert(payout_script).second) {
+            const std::string hex = HexStr(Span<const uint8_t>(payout_script.data(), payout_script.size()));
+            if (!names_doge)
+                LOG_WARNING << "[DGB-MM] a P2SH login (" << hex
+                            << ") gives no DOGE address: its DOGE share is split between the node owner"
+                               " and the donation. Add ,DOGEADDR or /98:DOGEADDR to the login to receive DOGE.";
+            else
+                LOG_WARNING << "[DGB-MM] a P2SH login (" << hex
+                            << ") names a DOGE address, but V35 shares carry no DOGE address: its DOGE share"
+                               " is split between the node owner and the donation while shares are V35. A"
+                               " P2PKH login receives DOGE at the same key.";
+        }
+    }
 
     core::stratum::CoinbaseResult out;
     out.coinb1 = std::move(parts.coinb1);
@@ -575,12 +1027,32 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     // re-derives the won-block reconstruct from; the remaining snapshot fields
     // (merkle_branches / segwit) are populated by the template-cache follow-on.
     out.snapshot.subsidy                   = inputs->subsidy;
+    // A coinbase carrying the P2Pool witness commitment (V35) is a segwit
+    // coinbase: its won block is serialized in witness form.
+    out.snapshot.segwit_active             = inputs->segwit_commitment_script.has_value();
     out.snapshot.frozen_ref.ref_hash       = inputs->ref_hash;
     out.snapshot.frozen_ref.last_txout_nonce = inputs->last_txout_nonce;
     // #884: freeze the ratchet-selected version pair the coinbase was built at,
     // so the stratum server carries it on the job back to mining_submit's mint.
     out.snapshot.frozen_ref.share_version   = inputs->share_version;
     out.snapshot.frozen_ref.desired_version = inputs->desired_version;
+    // The share fields the ref commits to (the mint stamps them, has_frozen) and
+    // the job's share target: core stratum classifies with frozen_ref.bits
+    // (pool_share_bits), never a fallback diff-1.
+    out.snapshot.frozen_ref.absheight          = inputs->frozen_absheight;
+    out.snapshot.frozen_ref.abswork            = inputs->frozen_abswork;
+    out.snapshot.frozen_ref.far_share_hash     = inputs->frozen_far_share_hash;
+    out.snapshot.frozen_ref.max_bits           = inputs->frozen_max_bits;
+    out.snapshot.frozen_ref.bits               = inputs->frozen_bits;
+    out.snapshot.frozen_ref.timestamp          = inputs->frozen_timestamp;
+    out.snapshot.frozen_ref.merged_payout_hash = inputs->frozen_merged_payout_hash;
+    // The job's header is the template the coinbase was built for.
+    out.snapshot.has_header      = true;
+    out.snapshot.gbt_prevhash    = tmpl_prev;
+    out.snapshot.header_version  = static_cast<uint32_t>(tmpl.value("version", 0x20000000));
+    out.snapshot.block_nbits_hex = tmpl_bits;
+    out.snapshot.curtime         = static_cast<uint32_t>(tmpl.value("curtime", 0));
+    out.snapshot.height          = block.height;
     return out;
 }
 
@@ -593,7 +1065,7 @@ nlohmann::json DGBWorkSource::mining_submit(
     const std::string& extranonce1, const std::string& extranonce2,
     const std::string& ntime, const std::string& nonce,
     const std::string& /*request_id*/,
-    const std::map<uint32_t, std::vector<unsigned char>>& /*merged_addresses*/,
+    const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses,
     const core::stratum::JobSnapshot* job)
 {
     // Stage 4d -- the hot path. Reconstruct the 80-byte block header from the
@@ -617,6 +1089,14 @@ nlohmann::json DGBWorkSource::mining_submit(
                     << " job=" << job_id;
         return reject(21, "Job not found");
     }
+
+    // Every coinbase this work source builds carries the producer's frozen ref
+    // (build_connection_coinbase sets frozen_ref.ref_hash; the stratum server
+    // carries it with the job to this snapshot). A job without one was not
+    // built here: no share minted from it can be credited, so its share path
+    // is refused below. A won block is NEVER refused: it is dispatched first,
+    // whatever the job, and only its share is skipped.
+    const bool built_here = !job->frozen_ref.ref_hash.IsNull();
 
     // 1. coinbase = coinb1 || extranonce1 || extranonce2 || coinb2
     auto coinb1_bytes = ParseHex(job->coinb1);
@@ -746,14 +1226,24 @@ nlohmann::json DGBWorkSource::mining_submit(
         // → empty → the existing redistribute/empty fallback below; never a
         // wrong-coin payment.
         {
+            // The payout the job's coinbase was built for (the stratum server's
+            // decision, JobSnapshot::payout_script), so the share commits to
+            // the same script the producer did: also for a login whose primary
+            // is a configured merged chain's address (Case 5), which DGB's own
+            // classification below would reject. Jobs that carry no payout
+            // derive it from the username as before.
             std::vector<unsigned char> payout_script;
-            auto amatch = core::classify_address_for_coin(
-                username, dgb::address_acceptance(is_testnet_, is_regtest_),
-                payout_script);
-            if (amatch == core::AddressCoinMatch::Foreign)
-                LOG_WARNING << "[DGB-STRATUM] REJECTED foreign-coin payout address "
-                               "(user=" << username << ") — not a DGB address; "
-                               "refusing to misdirect funds";
+            if (job->has_payout) {
+                payout_script = job->payout_script;
+            } else {
+                auto amatch = core::classify_address_for_coin(
+                    username, dgb::address_acceptance(is_testnet_, is_regtest_),
+                    payout_script);
+                if (amatch == core::AddressCoinMatch::Foreign)
+                    LOG_WARNING << "[DGB-STRATUM] REJECTED foreign-coin payout address "
+                                   "(user=" << username << ") — not a DGB address; "
+                                   "refusing to misdirect funds";
+            }
             // Node-owner fee (p2pool -f/--fee): substitute the owner's payout
             // identity for ~fee% of shares, deterministically on (prev_share,
             // extranonce1, miner_script) so this matches build_connection_coinbase
@@ -764,6 +1254,11 @@ nlohmann::json DGBWorkSource::mining_submit(
             // is untouched. Default (fee 0) => byte-identical to before.
             in.payout_script =
                 effective_payout_script(payout_script, job->prev_share_hash, extranonce1);
+            // The merged scripts the job committed to (the map is ordered by
+            // chain id, as the producer received them), after the node-fee rule.
+            const std::vector<std::pair<uint32_t, std::vector<unsigned char>>> job_merged(
+                merged_addresses.begin(), merged_addresses.end());
+            in.merged_addrs = effective_merged_addrs(job_merged, payout_script, in.payout_script);
         }
         // Redistribute V2 (#307): a miner with empty/broken stratum creds
         // yields no payout script. When the operator opted into a
@@ -782,9 +1277,25 @@ nlohmann::json DGBWorkSource::mining_submit(
             }
         }
         in.segwit_active   = job->segwit_active;
+        // A split job's donation (the core kept decide_job_payout's with the
+        // job): the share carries the donation its ref_hash committed to.
+        in.donation        = job->share_donation;
         // #884: mint at the version pair frozen when this job's coinbase was built.
         in.share_version   = job->frozen_ref.share_version;
         in.desired_version = job->frozen_ref.desired_version;
+        // The coinbase the miner hashed and the share fields its OP_RETURN ref
+        // commits to: the mint records exactly this work (the BTC lane's
+        // has_frozen path). Without them the mint rebuilt the gentx with no
+        // extranonce and a submit-time timestamp, so the share never matched.
+        in.actual_coinbase.assign(coinbase.begin(), coinbase.end());
+        in.has_frozen                = !job->frozen_ref.ref_hash.IsNull();
+        in.frozen_absheight          = job->frozen_ref.absheight;
+        in.frozen_abswork            = job->frozen_ref.abswork;
+        in.frozen_far_share_hash     = job->frozen_ref.far_share_hash;
+        in.frozen_max_bits           = job->frozen_ref.max_bits;
+        in.frozen_bits               = job->frozen_ref.bits;
+        in.frozen_timestamp          = job->frozen_ref.timestamp;
+        in.frozen_merged_payout_hash = job->frozen_ref.merged_payout_hash;
 
         uint256 share_hash;
         try {
@@ -929,9 +1440,12 @@ nlohmann::json DGBWorkSource::mining_submit(
 
         // #887: the won block is a SHARE too. The dispatch above has already
         // happened, so nothing here can delay, gate or endanger the block
-        // submit -- the mint is strictly downstream of it. Pre-wiring on DGB
-        // until #884 binds set_mint_share_fn in main_dgb.cpp.
-        mint_solved_share(/*won_block=*/true);
+        // submit -- the mint is strictly downstream of it.
+        if (built_here)
+            mint_solved_share(/*won_block=*/true);
+        else
+            LOG_WARNING << "[DGB-STRATUM] won block dispatched; its job carries no frozen ref, so no share"
+                           " is minted: user=" << username << " job=" << job_id;
 
         bump_accepted();
         return nlohmann::json(true);
@@ -940,6 +1454,11 @@ nlohmann::json DGBWorkSource::mining_submit(
     case dgb::coin::SubmitClass::ShareAccept: {
         // share_target >= pow_hash > block_target -> meets sharechain difficulty
         // but not the full block.
+        if (!built_here) {
+            LOG_WARNING << "[DGB-STRATUM] submit reject (job carries no frozen ref): user=" << username
+                        << " job=" << job_id;
+            return reject(21, "Job not found");
+        }
         mint_solved_share(/*won_block=*/false);
 
         bump_accepted();
@@ -1082,6 +1601,7 @@ void DGBWorkSource::set_gbt_tip_fn(GbtTipFn fn)
     gbt_tip_fn_ = std::move(fn);
     gbt_tip_cache_.reset();     // drop any stale cache when the seam is (re)bound
     gbt_tip_cache_time_ = 0;
+    gbt_tip_fail_time_ = 0;
 }
 
 std::optional<DGBWorkSource::GbtTip> DGBWorkSource::resolve_gbt_tip_fallback() const
@@ -1091,21 +1611,41 @@ std::optional<DGBWorkSource::GbtTip> DGBWorkSource::resolve_gbt_tip_fallback() c
     // hold a lock across network IO). TTL-bound so per-heartbeat template/prevhash
     // polls do not each trigger a getblocktemplate round-trip.
     GbtTipFn fn;
-    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    std::function<int64_t()> clock;
+    {
+        std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
+        clock = gbt_clock_;
+    }
+    auto now_sec = [&clock]() { return clock ? clock() : static_cast<int64_t>(std::time(nullptr)); };
+    const int64_t now = now_sec();
     {
         std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
         if (gbt_tip_cache_ && (now - gbt_tip_cache_time_) < GBT_TIP_TTL_SECONDS)
             return gbt_tip_cache_;
+        // A failure is cached as long: while digibyted
+        // fails, each session's 1 s template retry would otherwise run its own
+        // blocking getblocktemplate on the IO thread.
+        if (gbt_tip_fail_time_ != 0 && (now - gbt_tip_fail_time_) < GBT_TIP_TTL_SECONDS)
+            return std::nullopt;
         fn = gbt_tip_fn_;  // copy so a concurrent set_gbt_tip_fn() cannot tear it out
     }
     if (!fn)
         return std::nullopt;   // unbound (no digibyted creds armed) -> truthful absence
 
     std::optional<GbtTip> tip = fn();   // blocking getblocktemplate; nullopt on RPC failure
-    if (tip) {
+    // Stamped when the call returns: an RPC to an
+    // unreachable host can block ~2 min, longer than the TTL, and a stamp
+    // from before the call would have expired already.
+    const int64_t done = now_sec();
+    {
         std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
-        gbt_tip_cache_      = tip;
-        gbt_tip_cache_time_ = now;
+        if (tip) {
+            gbt_tip_cache_      = tip;
+            gbt_tip_cache_time_ = done;
+            gbt_tip_fail_time_  = 0;
+        } else {
+            gbt_tip_fail_time_  = done;
+        }
     }
     return tip;
 }

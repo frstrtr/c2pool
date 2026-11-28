@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#include <cctype>
 #include <algorithm>
 #include "stratum_server.hpp"
 #include "web_server.hpp"       // MiningInterface
@@ -1768,7 +1769,7 @@ nlohmann::json StratumSession::handle_subscribe(const nlohmann::json& params, co
             nlohmann::json::array({"mining.notify", subscription_id_})
         }),
         extranonce1_,
-        4  // extranonce2_size = 4 bytes
+        EXTRANONCE2_SIZE  // 4 bytes
     });
     response["error"] = nullptr;
     
@@ -1972,10 +1973,14 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             }
         }
 
-        if (!username_.empty()) {
+        // Asked for an empty login too: a work source that cannot build shares
+        // for one (DGB) tells the miner why. The default and BCH have no
+        // reason for an empty login, so every other lane is unchanged.
+        if (mining_interface_) {
             const std::string why = mining_interface_->authorize_refusal(username_);
             if (!why.empty()) {
-                LOG_WARNING << "[Stratum] REJECTED mining.authorize: " << username_ << ": " << why;
+                LOG_WARNING << "[Stratum] REJECTED mining.authorize: "
+                            << (username_.empty() ? std::string("(empty login)") : username_) << ": " << why;
                 authorized_ = false;
                 nlohmann::json response;
                 response["id"] = request_id;
@@ -2073,6 +2078,25 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                                       "(p2pool case 4)"
                                     : "with no merged address given, the work source decides its payout "
                                       "(the LTC pool redistributes it by --redistribute)");
+            }
+        }
+
+        // Seeded start difficulty (IWorkSource::start_difficulty): a login
+        // that names no difficulty (no "+N", no password "d=N", no
+        // mining.suggest_difficulty) starts where the work source suggests,
+        // on the first authorize only. 0 (the default): unchanged.
+        if (mining_interface_ && !start_difficulty_applied_) {
+            start_difficulty_applied_ = true;
+            if (!fixed_diff && !password_diff_applied_ && !(suggested_difficulty_ > 0.0)) {
+                const double seed = mining_interface_->start_difficulty(pubkey_hash_);
+                if (seed > 0.0) {
+                    hashrate_tracker_.set_difficulty_hint(seed);
+                    LOG_INFO << "[Stratum] " << (username_.empty() ? std::string("(empty login)") : username_)
+                             << ": start difficulty " << seed << " (work source; issued "
+                             << hashrate_tracker_.get_current_difficulty() << ")";
+                    if (subscribed_ && hashrate_tracker_.get_current_difficulty() != advertised_difficulty_)
+                        send_set_difficulty(hashrate_tracker_.get_current_difficulty());
+                }
             }
         }
 
@@ -2507,6 +2531,28 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     if (params.size() >= 6 && params[5].is_string())
         version_bits = params[5].get<std::string>();
 
+    // With duplicate submits refused, one header must have one spelling: the
+    // coin parsers are lenient ("1", "0x1", "00000001zz" and 300 leading
+    // zeros are all nonce 1), so each spelling would be a new key, counted and
+    // dispatched again, and stored up to the line limit. Refused unless
+    // canonical, as python's stratum refuses any other format.
+    if (mining_interface_->get_stratum_config().reject_duplicate_submits
+        && !core::stratum::canonical_submit_fields(extranonce2, ntime, nonce, version_bits, EXTRANONCE2_SIZE)) {
+        ++rejected_shares_;
+        auto now_lg = std::chrono::steady_clock::now();
+        if (now_lg - last_badparams_log_ >= REJECT_LOG_INTERVAL) {
+            last_badparams_log_ = now_lg;
+            LOG_INFO << "[Stratum] REJECT non-canonical submit fields user=" << username_
+                     << " sizes en2=" << extranonce2.size() << " ntime=" << ntime.size()
+                     << " nonce=" << nonce.size() << " version_bits=" << version_bits.size();
+        }
+        nlohmann::json response;
+        response["id"] = request_id;
+        response["result"] = false;
+        response["error"] = nlohmann::json::array({20, "Invalid parameters", nullptr});
+        return response;
+    }
+
     // Stale detection: check if job_id is still active.
     auto job_it = active_jobs_.find(job_id);
     bool is_stale = (job_it == active_jobs_.end());
@@ -2708,6 +2754,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.frozen_ref.merged_payout_hash = job.frozen_merged_payout_hash;
     snapshot.frozen_ref.frozen_merkle_branches = job.payload->frozen_merkle_branches;
     snapshot.frozen_ref.frozen_witness_root = job.frozen_witness_root;
+    snapshot.frozen_ref.ref_hash = job.frozen_ref_hash;
+    snapshot.frozen_ref.last_txout_nonce = job.frozen_last_txout_nonce;
     snapshot.frozen_ref.frozen_merged_coinbase_info = job.payload->frozen_merged_coinbase_info;
     snapshot.frozen_ref.share_version = job.share_version;
     snapshot.frozen_ref.desired_version = job.desired_version;
@@ -2743,6 +2791,40 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         response["result"] = false;
         response["error"] = nlohmann::json::array({23, "Low difficulty share", nullptr});
         return response;
+    }
+
+    // ── Duplicate submit (StratumConfig::reject_duplicate_submits) ──
+    // The same (extranonce2, ntime, nonce, version) twice on one job is the
+    // same header. Only submissions that passed the gate above are
+    // remembered (p2pool work.py received_header_hashes, filled after
+    // pow <= pseudoshare target), at most duplicate_submit_keys_per_job per
+    // job; a repeat is neither counted nor dispatched.
+    if (const auto& scfg = mining_interface_->get_stratum_config(); scfg.reject_duplicate_submits) {
+        auto lower = [](std::string v) {
+            for (auto& c : v)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return v;
+        };
+        auto live = active_jobs_.find(job_id);
+        if (live != active_jobs_.end()) {
+            if (!live->second.submitted)
+                live->second.submitted = std::make_shared<std::unordered_set<std::string>>();
+            auto& seen = *live->second.submitted;
+            std::ostringstream key;
+            key << lower(extranonce2) << ':' << lower(ntime) << ':' << lower(nonce) << ':' << effective_version;
+            const std::string k = key.str();
+            if (seen.count(k)) {
+                ++rejected_shares_;
+                LOG_INFO << "[Stratum] duplicate submit from " << username_ << " (job=" << job_id << ")";
+                nlohmann::json response;
+                response["id"] = request_id;
+                response["result"] = false;
+                response["error"] = nlohmann::json::array({22, "Duplicate share", nullptr});
+                return response;
+            }
+            if (seen.size() < scfg.duplicate_submit_keys_per_job)
+                seen.insert(k);
+        }
     }
 
     // ── Pseudoshare accepted — record in RateMonitor ──
@@ -3228,8 +3310,10 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                     template_retry_clean_ = template_retry_clean_ || force_clean;
                     return;
                 }
-                // Accepted (own-coin OR configured-merged): byte-identical build.
-                payout_script = address_to_script(username_);
+                // Accepted (own-coin OR configured-merged). An own-coin address
+                // pays its own script type (accepted_payout_script); anything
+                // else is byte-identical to address_to_script.
+                payout_script = core::accepted_payout_script(username_, own);
             }
         }
 
@@ -3528,6 +3612,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         // frozen_merkle_branches + frozen_merged_coinbase_info live in the
         // shared payload (je.payload) — see fix #2 above.
         je.frozen_witness_root = cbr.snapshot.frozen_ref.frozen_witness_root;
+        je.frozen_ref_hash = cbr.snapshot.frozen_ref.ref_hash;
+        je.frozen_last_txout_nonce = cbr.snapshot.frozen_ref.last_txout_nonce;
         je.share_version = cbr.snapshot.frozen_ref.share_version;
         je.desired_version = cbr.snapshot.frozen_ref.desired_version;
         je.has_frozen = true;

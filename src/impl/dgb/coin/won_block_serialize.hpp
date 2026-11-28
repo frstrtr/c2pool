@@ -43,6 +43,8 @@
 // parent-block (daemon-facing) framing, not share format / PoW / PPLNS.
 // ---------------------------------------------------------------------------
 
+#include <iterator>
+#include <impl/dgb/coin/p2pool_witness_nonce.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -73,8 +75,8 @@ inline bool coinbase_has_witness_commitment(const std::vector<uint8_t>& coinbase
 }
 
 // BIP144 reserialization of the coinbase: marker/flag after the 4-byte version
-// and a single 32-byte all-zero reserved witness item before the 4-byte
-// locktime.  The txid is UNCHANGED (txid is defined over the non-witness
+// and a single 32-byte reserved witness item ('[P2Pool]'*4, the value the
+// commitment output is built with) before the 4-byte locktime.  The txid is UNCHANGED (txid is defined over the non-witness
 // bytes), so the header merkle root stays valid.
 inline std::vector<uint8_t> to_bip144_coinbase(const std::vector<uint8_t>& coinbase)
 {
@@ -86,7 +88,10 @@ inline std::vector<uint8_t> to_bip144_coinbase(const std::vector<uint8_t>& coinb
     out.insert(out.end(), coinbase.begin() + 4, coinbase.end() - 4); // vin/vout
     out.push_back(0x01);                                             // stack_count = 1
     out.push_back(0x20);                                             // item_len    = 32
-    out.insert(out.end(), 32, 0x00);                                 // reserved value
+    // The reserved value equals the one the commitment output was built
+    // with: '[P2Pool]'*4 (dgb::P2POOL_WITNESS_NONCE).
+    out.insert(out.end(), std::begin(dgb::P2POOL_WITNESS_NONCE),
+               std::end(dgb::P2POOL_WITNESS_NONCE));                 // reserved value
     out.insert(out.end(), coinbase.end() - 4, coinbase.end());       // locktime
     return out;
 }

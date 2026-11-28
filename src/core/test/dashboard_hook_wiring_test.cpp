@@ -157,11 +157,7 @@ const std::vector<Binary> kBinaries = {
     {"btc",    {"c2pool/main_btc.cpp"}, false, {}},
     {"bch",    {"c2pool/main_bch.cpp", "impl/bch/pool_entrypoint.hpp"}, false, {}},
     {"bip110", {"c2pool/main_bip110.cpp"}, false, {}},
-    // DGB: its lane is rewriting main_dgb.cpp; these stay on the core default
-    // until it lands them.
-    {"dgb",    {"c2pool/main_dgb.cpp"}, false,
-        {"set_best_share_hash_fn", "set_sharechain_delta_fn", "set_share_lookup_fn",
-         "set_current_payouts_fn", "set_coin_work_fn", "set_stratum_workers_fn"}},
+    {"dgb",    {"c2pool/main_dgb.cpp"}, false, {}},
 };
 
 std::string wiring_code(const Binary& b)

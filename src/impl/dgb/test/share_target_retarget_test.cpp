@@ -15,10 +15,15 @@
 // or chain:: encoders on a SUT-derived intermediate — it asserts the SUT output
 // equals the pre-computed oracle literal.
 //
-// Oracle SSOT: frstrtr/p2pool-dgb-scrypt bitcoin/data.py generate_transaction
-// (pre_target derive -> emergency decay -> ±10% clamp) with MAX_TARGET from
-// networks/digibyte.py = 2**256//2**20 - 1 (2^236 - 1); SHARE_PERIOD=15 =>
-// emergency_threshold = 300s, half_life = 150s.
+// Oracles: the emergency decay is a V36 rule (p2pool-merged-v36, gated on
+// v36_active): C1-C4 pin it for a V36 share. The python V35 network
+// (frstrtr/p2pool-dgb-scrypt data.py generate_transaction:162-170) has NO
+// decay: pre_target2 = clip(pre_target, prev.max_target*9//10, *11//10)
+// whatever the gap. V35_* pin that (c2pool applied the
+// V36 decay to V35 shares, so a python peer rejected the first V35 share after
+// any gap over 300 s, the first share on a revived tip included). MAX_TARGET
+// from networks/digibyte.py = 2**256//2**20 - 1 (2^236 - 1); SHARE_PERIOD=15
+// => emergency_threshold = 300s, half_life = 150s.
 //
 // DETERMINISM: the seeded chain uses HUGE inter-share timestamp gaps so the
 // pool-attempts-per-second estimate drives pre_target to MAX_TARGET; the ±10%
@@ -120,7 +125,7 @@ TEST(DgbShareTargetRetarget, C1_NoDecayHiClamp) {
     dgb::ShareTracker tracker;
     auto tip = seed_chain(tracker, kCount, kHiGap);
     const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
-    auto st = tracker.compute_share_target(tip, kTipTs + 100u, MAX_TARGET);
+    auto st = tracker.compute_share_target(tip, kTipTs + 100u, MAX_TARGET, /*share_version=*/36);
     EXPECT_EQ(st.max_bits, 0x1e00962fu);
     // desired_target = MAX_TARGET -> clipped down to pre_target3 -> bits==max_bits.
     EXPECT_EQ(st.bits, 0x1e00962fu);
@@ -134,7 +139,7 @@ TEST(DgbShareTargetRetarget, C2_DecayOneHalvingNoRemainder) {
     dgb::ShareTracker tracker;
     auto tip = seed_chain(tracker, kCount, kHiGap);
     const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
-    auto st = tracker.compute_share_target(tip, kTipTs + 450u, MAX_TARGET);
+    auto st = tracker.compute_share_target(tip, kTipTs + 450u, MAX_TARGET, /*share_version=*/36);
     EXPECT_EQ(st.max_bits, 0x1e012c5eu);
     EXPECT_EQ(st.bits, 0x1e012c5eu);
     expect_deep_branch_distinct(st.max_bits);
@@ -147,7 +152,7 @@ TEST(DgbShareTargetRetarget, C3_DecayInterpolation) {
     dgb::ShareTracker tracker;
     auto tip = seed_chain(tracker, kCount, kHiGap);
     const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
-    auto st = tracker.compute_share_target(tip, kTipTs + 525u, MAX_TARGET);
+    auto st = tracker.compute_share_target(tip, kTipTs + 525u, MAX_TARGET, /*share_version=*/36);
     EXPECT_EQ(st.max_bits, 0x1e01c28du);
     EXPECT_EQ(st.bits, 0x1e01c28du);
     expect_deep_branch_distinct(st.max_bits);
@@ -169,7 +174,7 @@ TEST(DgbShareTargetRetarget, C4_DecaySaturatesToMax) {
     dgb::ShareTracker tracker;
     auto tip = seed_chain(tracker, kCount, kHiGap);
     const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
-    auto st = tracker.compute_share_target(tip, kTipTs + 1050u, MAX_TARGET);
+    auto st = tracker.compute_share_target(tip, kTipTs + 1050u, MAX_TARGET, /*share_version=*/36);
     EXPECT_EQ(st.max_bits, 0x1e0fffffu);
     EXPECT_EQ(st.bits, 0x1e0fffffu);
 }
@@ -182,9 +187,40 @@ TEST(DgbShareTargetRetarget, C5_LoClamp) {
     dgb::ShareTracker tracker;
     auto tip = seed_chain(tracker, kCount, /*gap=*/1u);
     const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
-    auto st = tracker.compute_share_target(tip, kTipTs + 100u, MAX_TARGET);
+    auto st = tracker.compute_share_target(tip, kTipTs + 100u, MAX_TARGET, /*share_version=*/36);
     EXPECT_EQ(st.max_bits, 0x1d7ae0ccu);
     expect_deep_branch_distinct(st.max_bits);
+}
+
+// ─── V35: no emergency decay, whatever the gap ──────────────────────────────
+// The same 101-share chain and the same gaps as C1-C4, for a V35 share: the
+// max target is the previous share's +-10% (hi clamp = M*11//10 =>
+// max_bits 0x1e00962f) at every gap, a day-long one included. A python V35
+// peer computes exactly this and requires share_info equality.
+TEST(DgbShareTargetRetarget, V35_NoDecayAtAnyGap) {
+    dgb::ShareTracker tracker;
+    auto tip = seed_chain(tracker, kCount, kHiGap);
+    const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
+    for (uint32_t gap : {100u, 301u, 450u, 525u, 1050u, 86400u, 90u * 86400u}) {
+        SCOPED_TRACE(gap);
+        auto st = tracker.compute_share_target(tip, kTipTs + gap, MAX_TARGET, /*share_version=*/35);
+        EXPECT_EQ(st.max_bits, 0x1e00962fu) << "a V35 share took the V36 emergency decay";
+        EXPECT_EQ(st.bits, 0x1e00962fu);
+    }
+    // The lo clamp is unchanged too.
+    dgb::ShareTracker fast;
+    auto ftip = seed_chain(fast, kCount, /*gap=*/1u);
+    EXPECT_EQ(fast.compute_share_target(ftip, kTipTs + 1050u, MAX_TARGET, 35).max_bits, 0x1d7ae0ccu);
+}
+
+// The gate is the version of the share being made, not the tip's: the same
+// tip and gap give the V36 decay for a V36 share (C2) and none for a V35 one.
+TEST(DgbShareTargetRetarget, DecayFollowsTheMintVersion) {
+    dgb::ShareTracker tracker;
+    auto tip = seed_chain(tracker, kCount, kHiGap);
+    const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
+    EXPECT_EQ(tracker.compute_share_target(tip, kTipTs + 450u, MAX_TARGET, 36).max_bits, 0x1e012c5eu);
+    EXPECT_EQ(tracker.compute_share_target(tip, kTipTs + 450u, MAX_TARGET, 35).max_bits, 0x1e00962fu);
 }
 
 }  // namespace

@@ -192,6 +192,11 @@ C2P_PARAM("sharechain.no_p2p_relay", Sharechain, BOOL, RESTART, C_DASH|C_DGB, LI
   C2P_ALIAS("sharechain.no_p2p_relay", BIN_DASH, "--no-p2p-relay", FLAG)
   C2P_ALIAS("sharechain.no_p2p_relay", BIN_DGB, "--no-p2p-relay", FLAG)
 
+// DGB is held at V35 until a flag day (operator, 2026-11-27): the V36 share
+// ratchet runs only when the operator enables it.
+C2P_PARAM("sharechain.v36_ratchet", Sharechain, BOOL, MONEY_RESTART, C_DGB, LIT, "false", NONE, "enable the V36 share ratchet (default: shares held at V35)")
+  C2P_ALIAS("sharechain.v36_ratchet", BIN_DGB, "--v36-ratchet", FLAG)
+
 C2P_PARAM("sharechain.deferred_mint", Sharechain, TRISTATE_BOOL, RESTART, C_DASH, NONE, "", NONE, "queue a solve a busy tracker declines and mint it when the lock frees (default off; --deferred-mint enables)")
   C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--deferred-mint", FLAG)
   C2P_ALIAS("sharechain.deferred_mint", BIN_DASH, "--no-deferred-mint", FLAG_NO_PREFIX)
@@ -547,9 +552,11 @@ C2P_PARAM("money.payout_address", Money, STRING, MONEY_RESTART, C_LTC, LIT, "", 
 C2P_PARAM("money.node_owner_script", Money, HEX, MONEY_RESTART, C_LTC, LIT, "", HEX_EVEN, "node-owner output script")
   C2P_ALIAS("money.node_owner_script", BIN_LTC, "--node-owner-script", VALUE)
 
-C2P_PARAM("money.merged_operator_address", Money, STRING, MONEY_RESTART, C_LTC|C_DOGE, LIT, "", ADDR_COIN, "merged (doge) fee address")
+C2P_PARAM("money.merged_operator_address", Money, STRING, MONEY_RESTART, C_LTC|C_DOGE|C_DGB, LIT, "", ADDR_COIN, "merged (doge) fee address")
   C2P_ALIAS("money.merged_operator_address", BIN_LTC, "--node-owner-merged-address", VALUE)
   C2P_ALIAS("money.merged_operator_address", BIN_LTC, "--merged-operator-address", VALUE)
+  C2P_ALIAS("money.merged_operator_address", BIN_DGB, "--node-owner-merged-address", VALUE)
+  C2P_ALIAS("money.merged_operator_address", BIN_DGB, "--merged-operator-address", VALUE)
 
 C2P_PARAM("money.payout_pubkey_hash", Money, HEX, MONEY_RESTART, C_DASH, LIT, "", HEX_EVEN, "P2PKH for mine-block")
   C2P_ALIAS("money.payout_pubkey_hash", BIN_DASH, "--payout-pubkey-hash", VALUE)

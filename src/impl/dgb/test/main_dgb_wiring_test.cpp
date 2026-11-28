@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// ---------------------------------------------------------------------------
+// Source guard: main_dgb.cpp binds the live seams (rides dgb_work_source_test).
+//
+// The unit KATs drive the seams through the same functions main_dgb calls; a
+// deleted or reordered call in main_dgb would leave them green. This pins the
+// calls themselves, in main_dgb's run_node, and the order the hooks need:
+//   - the payout acceptance and DGB's merged_parent_versions;
+//   - the stratum best-share cell + the one best-change hook (wire_best_share);
+//   - the DOGE wiring (wire_doge_merged_payouts) with the split rule and the
+//     cell as the provider's best-share source, BEFORE wire_best_share (the
+//     hook marks the DOGE payouts dirty);
+//   - the owner's merged scripts for node-fee shares.
+// ---------------------------------------------------------------------------
+
+#include <gtest/gtest.h>
+
+#include <fstream>
+#include <sstream>
+#include <string>
+
+#ifndef DGB_MAIN_SRC
+#error "DGB_MAIN_SRC must be defined by CMake to the path of src/c2pool/main_dgb.cpp"
+#endif
+
+namespace {
+std::string main_src()
+{
+    std::ifstream in(DGB_MAIN_SRC);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+} // namespace
+
+TEST(DgbMainWiring, LiveSeamsAreBound)
+{
+    const std::string s = main_src();
+    ASSERT_FALSE(s.empty()) << DGB_MAIN_SRC;
+    const auto at = [&](const std::string& needle) { return s.find(needle); };
+
+    EXPECT_NE(at("work_source->set_payout_acceptance("), std::string::npos);
+    EXPECT_NE(at("work_source->set_merged_parent_versions(dgb::merged_parent_versions())"), std::string::npos);
+    EXPECT_NE(at("work_source->set_merged_mining_manager(mm_manager.get())"), std::string::npos);
+    EXPECT_NE(at("work_source->set_owner_merged_scripts("), std::string::npos);
+    EXPECT_NE(at("work_source->set_pplns_inputs_fn("), std::string::npos);
+    EXPECT_NE(at("work_source->set_mint_share_fn("), std::string::npos);
+    // The share target is sized by the login's local rate (the server's
+    // per-address rates), unbound before the server goes.
+    const auto rate = at("work_source->set_local_rate_fn(");
+    ASSERT_NE(rate, std::string::npos) << "the share target ignores the login's rate";
+    EXPECT_NE(s.find("srv->get_local_addr_rates()", rate), std::string::npos);
+    const auto unbind = at("if (work_source) work_source->set_local_rate_fn(nullptr);");
+    ASSERT_NE(unbind, std::string::npos);
+    EXPECT_LT(unbind, s.find("    stratum_server.reset();", unbind));
+
+    const auto doge = at("dgb::coin::wire_doge_merged_payouts(mm_manager.get(), p2p_node, work_source.get(), doge_p2sh_split,");
+    const auto best = at("dgb::wire_best_share(p2p_node, stratum_best_share, work_source.get(), ioc,");
+    ASSERT_NE(doge, std::string::npos) << "the DOGE payout provider is not registered";
+    ASSERT_NE(best, std::string::npos) << "the stratum best share is not bound";
+    EXPECT_LT(doge, best) << "the best-change hook is bound before the DOGE wiring";
+    EXPECT_NE(s.find("[cell = stratum_best_share]() { return cell->get(); }", doge), std::string::npos)
+        << "the provider does not read the best share from the cell";
+    EXPECT_NE(s.find("mm->mark_pplns_dirty()", best - 400), std::string::npos)
+        << "the best-change hook does not mark the DOGE payouts dirty";
+    // Clean jobs on a new tip / best share, stopped before the server goes.
+    const auto push = at("dgb::start_job_push_watch(ioc, work_source.get(),");
+    ASSERT_NE(push, std::string::npos) << "no job push on a new DGB tip";
+    EXPECT_NE(s.find("srv->notify_all(clean)", push), std::string::npos);
+    const auto stop = at("if (stop_job_push) stop_job_push();");
+    ASSERT_NE(stop, std::string::npos);
+    EXPECT_LT(stop, s.find("    stratum_server.reset();", stop)) << "the push watch outlives the server";
+    // Nothing else binds the single-slot best-change hook.
+    EXPECT_EQ(at("set_on_best_share_changed("), std::string::npos);
+}
+
+// The DGB --redistribute split (#2347 re-applied on this mint): the default
+// spec, the owner armed, and the job's donation through the producer and mint.
+TEST(DgbMainWiring, TheRedistributeSplitIsWired)
+{
+    std::ifstream f(DGB_MAIN_SRC);
+    ASSERT_TRUE(f.good()) << DGB_MAIN_SRC;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string s = ss.str();
+    for (const char* line : {
+             "std::string redistribute_spec = \"split\";",
+             "if (dgb::spec_names_split(redistribute_spec)) {",
+             "work_source->set_split_owner(owner_script);",
+             "req.donation          = core::job_share_donation(block.share_donation, give_author_pct);",
+             "/*donation=*/core::job_share_donation(in.donation, give_author_pct));",
+             "dgb::coin::DogeP2shSplit{std::move(owner_doge), std::move(owner_parent)});"})
+        EXPECT_NE(s.find(line), std::string::npos) << line;
+    EXPECT_EQ(s.find("split is not available on DGB yet"), std::string::npos);
+}
+
+// The X1 audit (master 8e5b12995: main_dgb.cpp pool hashrate,
+// redistribute.hpp refresh_pplns_cache): no dashboard or redistribute
+// callback reads the tracker without the read guard.
+TEST(DgbMainWiring, TrackerReadsFromCallbacksAreGuarded)
+{
+    std::ifstream f(DGB_MAIN_SRC);
+    ASSERT_TRUE(f.good()) << DGB_MAIN_SRC;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string s = ss.str();
+    EXPECT_EQ(s.find("auto& redist_tracker = p2p_node.tracker();"), std::string::npos);
+    const auto fb = s.find("work_source->set_fallback_payout_fn(");
+    ASSERT_NE(fb, std::string::npos);
+    const std::string body = s.substr(fb, s.find("});", fb) - fb);
+    EXPECT_NE(body.find("auto guard = p2p_node.read_tracker();"), std::string::npos);
+    EXPECT_NE(body.find("redistributor->pick(*guard, best)"), std::string::npos);
+    const auto hr = s.find("mi->set_pool_hashrate_fn(");
+    ASSERT_NE(hr, std::string::npos);
+    EXPECT_EQ(s.substr(hr, s.find("});", hr) - hr).find("p2p_node.tracker()"), std::string::npos);
+}

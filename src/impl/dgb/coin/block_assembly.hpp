@@ -36,6 +36,7 @@
 // STANDALONE parent in the V36 default build (no merged-coinbase leg).
 // ---------------------------------------------------------------------------
 
+#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,6 +49,7 @@
 #include "../share_types.hpp"   // dgb::MerkleLink
 #include "mempool.hpp"          // dgb::coin::compute_txid (block-body txid SSOT)
 #include "merkle_root.hpp"          // dgb::coin::build_block_merkle_root (merkle SSOT)
+#include "p2pool_witness_nonce.hpp"    // P2POOL_WITNESS_NONCE
 #include "witness_commitment.hpp"   // body_has_witness, add_witness_commitment (BIP141)
 
 namespace dgb
@@ -96,6 +98,19 @@ reconstruct_block_header(const SmallBlockHeaderType& small_header,
 // => witness block; a BCH-style is_segwit_activated()==false coin => legacy),
 // NOT an unconditional witness branch here.  This is the identical path
 // NodeRPC::submit_block uses, so the result round-trips and the daemon accepts.
+// True iff the coinbase has a BIP141 witness commitment output
+// (OP_RETURN 0x24 aa21a9ed <32 bytes>).
+inline bool coinbase_has_commitment_output(const MutableTransaction& coinbase)
+{
+    for (const auto& out : coinbase.vout) {
+        const auto& d = out.scriptPubKey.m_data;
+        if (d.size() >= 38 && d[0] == 0x6a && d[1] == 0x24 && d[2] == 0xaa && d[3] == 0x21 && d[4] == 0xa9
+            && d[5] == 0xed)
+            return true;
+    }
+    return false;
+}
+
 inline std::pair<std::vector<unsigned char>, std::string>
 assemble_won_block(const SmallBlockHeaderType& small_header,
                    const MutableTransaction& gentx,
@@ -117,7 +132,15 @@ assemble_won_block(const SmallBlockHeaderType& small_header,
     // body merkle_root below is computed over the post-injection txid.
     MutableTransaction coinbase = gentx;
     uint256 coinbase_txid = gentx_hash;
-    if (body_has_witness(other_txs)) {
+    if (coinbase_has_commitment_output(coinbase)) {
+        // The coinbase already commits to the block's witness root with the
+        // P2Pool reserved value ('[P2Pool]'*4, P2POOL_WITNESS_NONCE): the block
+        // carries that value as the coinbase witness. The txid is unchanged.
+        if (!coinbase.vin.empty())
+            coinbase.vin[0].scriptWitness.stack.assign(
+                1, std::vector<unsigned char>(std::begin(::dgb::P2POOL_WITNESS_NONCE),
+                                              std::end(::dgb::P2POOL_WITNESS_NONCE)));
+    } else if (body_has_witness(other_txs)) {
         add_witness_commitment(coinbase, other_txs);
         coinbase_txid = compute_txid(coinbase);
     }

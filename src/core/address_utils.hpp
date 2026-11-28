@@ -198,6 +198,30 @@ inline PayoutAddressDecision decide_payout_address(
 /// Returns empty vector on failure.
 std::vector<unsigned char> address_to_script(const std::string& address);
 
+/// The job payout script of a login the payout decision ACCEPTED, on a coin
+/// that published its acceptance set (StratumConfig.payout_*). An own-coin
+/// address pays the script its own version bytes / HRP denote; the chain-
+/// agnostic address_to_script knows only a fixed P2SH whitelist and the
+/// ltc/tltc/bc/tb HRPs, so it turned a DigiByte P2SH ("S...", 0x3f) into a
+/// P2PKH of the redeem-script hash and a "dgb1..." address into nothing. Every
+/// other address (a configured merged chain's, a coin-registered native
+/// format), and every coin that published no acceptance, keeps exactly
+/// address_to_script. For an own LTC address both give the same bytes.
+inline std::vector<unsigned char> accepted_payout_script(const std::string& address,
+                                                         const CoinAddressAcceptance& own)
+{
+    const bool published = !own.p2pkh_versions.empty() || !own.p2sh_versions.empty()
+                           || !own.bech32_hrps.empty();
+    if (published) {
+        std::vector<unsigned char> script;
+        if (classify_address_for_coin(address, own, script) == AddressCoinMatch::Own)
+            return script;
+    }
+    return address_to_script(address);
+}
+
+
+
 // -- Generic coin-registered fallback decoders --------------------------------
 // A coin module may register an opaque address decoder that address_to_script
 // consults AFTER its built-in bech32/base58 formats fail. Core holds NO

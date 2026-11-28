@@ -64,11 +64,18 @@
 #include <impl/dgb/coin/header_ingest.hpp>
 #include <impl/dgb/coin/mempool_ingest.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
+#include <impl/dgb/best_share_cell.hpp>         // stratum best share: locked cell + the one best-change hook
+#include <impl/dgb/stratum_job_push.hpp>        // clean jobs on a new tip / best share (1 s watch)
+#include <impl/dgb/stratum_work_gate.hpp>        // no work without sharechain peers / digibyted contact
+#include <impl/dgb/sharechain_stats.hpp>         // dashboard sharechain stats (guarded)
+#include <impl/dgb/dashboard_sharechain.hpp>     // delta / share page / current payouts (core::sharechain_views)
 #include <impl/dgb/coin/work_ref_hash.hpp>      // make_work_ref_hash_params (ref preimage SSOT)
 #include <impl/dgb/coin/coinbase_scriptsig.hpp>   // build_coinbase_scriptsig (BIP34 height + /c2pool-dgb/ tag, #902)
 #include <impl/dgb/run_loop_mint.hpp>              // parse_min_header_80 + mint_local_share_at_frozen_version (#884/#294)
+#include <impl/dgb/mint_retry.hpp>                // mint_with_retry (#11: no share dropped on a busy tracker)
 #include <impl/dgb/auto_ratchet_wire.hpp>          // dgb_select_mint_versions + DGB_BASE/TARGET_VERSION (#884)
 #include <impl/dgb/conn_pplns_producer.hpp>        // make_conn_pplns_inputs (ref-hash bind SSOT)
+#include <impl/dgb/conn_job_producer.hpp>          // build_conn_job_inputs (the job producer SSOT)
 #include <impl/dgb/coin/pplns_weight_walk.hpp>   // compute_pplns_weight_walk (PPLNS step-1 SSOT)
 #include <core/target_utils.hpp>                 // chain::bits_to_target / target_to_average_attempts
 #include <core/version_gate.hpp>                 // core::version_gate::is_v36_active
@@ -98,6 +105,7 @@
 #include <memory>
 #include <atomic>
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <set>
 #include <chrono>
@@ -129,6 +137,8 @@
 #include <impl/ltc/config.hpp>                     // ltc::config::P2PData (coin_broadcaster BroadcasterConfig needs it)
 #include <c2pool/merged/merged_mining.hpp>        // MergedMiningManager / AuxChainConfig / AuxChainRPC
 #include <c2pool/merged/coin_broadcaster.hpp>     // CoinBroadcaster / PeerManagerConfig
+#include <c2pool/merged/aux_chain_params.hpp>     // find_aux_chain_params (DOGE address versions)
+#include <impl/dgb/coin/aux_doge_payout_provider.hpp> // DOGE payout provider + fallback payout address
 #include <core/netaddress.hpp>                    // PeerEndpoint
 #include <boost/asio/thread_pool.hpp>             // header-admission pool (owned at main scope for join)
 #include <boost/asio/post.hpp>
@@ -162,7 +172,8 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P] [--http [H:]P]\n"
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
-        << "       [--redistribute SPEC] [--node-owner-address ADDR]\n"
+        << "       [--redistribute SPEC] [--node-owner-address ADDR] [--node-owner-merged-address DOGEADDR]\n"
+        << "       [--v36-ratchet]   enable the V36 share ratchet (default: shares held at V35)\n"
         << "       [--give-author PCT] [-f|--fee PCT]\n"
         << "       [--sharechain-port P] [--sharechain-addnode HOST:PORT ...]\n"
         << "       [--embedded-serve-mempool-txs[=true|false]]\n"
@@ -302,16 +313,33 @@ int run_node(const core::CoinParams& params, bool testnet,
              // historical behavior of dialing --coin-daemon own :PORT; >0 makes this
              // the authoritative P2P dial port so --coin-daemon may carry the RPC
              // :PORT while the embedded coin-P2P still reaches the real parent P2P port.
-             int coind_p2p_port = -1)
+             int coind_p2p_port = -1,
+             // --node-owner-merged-address / --merged-operator-address (LTC's
+             // spelling): the node owner's DOGE address, for the owner half of
+             // the P2SH split and the owner's node-fee shares (doge_owner_script).
+             const std::string& node_owner_merged_address = "",
+             // --v36-ratchet / sharechain.v36_ratchet: enable the V36 AutoRatchet
+             // (off: DGB is held at V35, dgb::DgbVersionPolicy).
+             bool v36_ratchet = false)
 {
+    // Held at V35 (no --v36-ratchet): V36 shares are refused too, from peers
+    // and from the store (share_init_verify), before any is loaded.
+    dgb::v36_shares_accepted_flag().store(v36_ratchet);
     io::io_context ioc;
 
-    // Author/dev donation u16 (p2pool committed donation field). Built-in default
-    // 0.1% -> u16 66 via the SSOT conversion, shared with DASH/LTC/BTC/BIP110.
-    // BOTH share-identity sites below (ref preimage + create_local_share mint)
-    // consume this SAME value so the committed ref_hash matches the created share
-    // (a mismatch = 100% self-decline). --give-author overrides the AMOUNT only.
-    const uint16_t donation_u16 = core::donation_percent_to_u16(dev_donation);
+    // Author/dev donation (p2pool committed donation field). Built-in default
+    // 0.1% -> u16 66. BOTH share-identity sites below (ref preimage +
+    // create_local_share mint) take the share's donation from
+    // core::job_share_donation(job donation, give_author_pct): the job's own
+    // for a split job, else --give-author's, so the committed ref_hash matches
+    // the created share (a mismatch = 100% self-decline). Clamped to [0, 100] %
+    // as donation_percent_to_u16 does. --give-author overrides the AMOUNT only.
+    if (!std::isfinite(dev_donation)) {
+        std::cerr << "[DGB] --give-author " << dev_donation << " is not a number: the default "
+                  << core::kAuthorFeeDefaultPct << " % is used" << std::endl;
+        dev_donation = core::kAuthorFeeDefaultPct;
+    }
+    const double give_author_pct = std::clamp(dev_donation, 0.0, 100.0);
 
     // Per-coin config root: ~/.c2pool/<net>/ (sharechain LevelDB + addrs.json
     // open underneath). Bucket-1 isolation primitive: DGB never shares LTC's
@@ -440,7 +468,10 @@ int run_node(const core::CoinParams& params, bool testnet,
     // and coin_node, which holds the EmbeddedCoinNode*, both outlive the
     // tracker callback captured below. The DGBWorkSource further down holds
     // the same non-owning ref.
-    c2pool::dgb::HeaderChain header_chain;
+    // DigiByte's Scrypt powLimit on the live chain (dgb_live_header_params:
+    // 0x1e0fffff, regtest 0x207fffff): a Scrypt header above it is refused
+    // and credits no work.
+    c2pool::dgb::HeaderChain header_chain(c2pool::dgb::dgb_live_header_params(regtest), 0);
 
     // Embedded mempool — the in-process pool the work template selects from.
     // Declared HERE (ahead of embedded_coin) because the injected
@@ -572,10 +603,25 @@ int run_node(const core::CoinParams& params, bool testnet,
             if (parts.size() >= 6) cfg.rpc_userpass = parts[4] + ":" + parts[5];
             cfg.multiaddress = true;  // V36: canonical PPLNS coinbase for merged chains
 
-            if (cfg.symbol == "DOGE" && testnet)
-                cfg.aux_payout_address = "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt";
-            else if (cfg.symbol == "DOGE")
-                cfg.aux_payout_address = "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";
+            // createauxblock's address (non-multiaddress / RPC fallback path):
+            // the single donation P2PKH c2pool-dash pays, as a DOGE address of
+            // this network (aux_doge_payout_provider.hpp), never a placeholder.
+            // Plus DOGE's own version bytes for the merged payout views.
+            if (cfg.symbol == "DOGE") {
+                cfg.aux_payout_address = dgb::coin::doge_fallback_payout_address(testnet, regtest);
+                if (const auto* cp = c2pool::merged::find_aux_chain_params(cfg.symbol)) {
+                    const auto& v = regtest ? cp->regtest : testnet ? cp->test : cp->main;
+                    if (!v.p2pkh.empty()) cfg.address_version = v.p2pkh.front();
+                    if (!v.p2sh.empty())  cfg.p2sh_version    = v.p2sh.front();
+                }
+                // An RPC daemon of another network refuses the address (-8/-5):
+                // check it against the daemon's chain, as main_ltc does.
+                cfg.check_payout_address = [sym = cfg.symbol, addr = cfg.aux_payout_address](const std::string& chain) {
+                    return c2pool::merged::check_aux_address_on_chain(sym, chain, addr);
+                };
+                std::cout << "[DGB-MM] DOGE fallback payout address "
+                          << cfg.aux_payout_address << std::endl;
+            }
 
             // P2P port: 7th field override, else the DOGE default (22556 main /
             // 44556 testnet). The 7th field arms the embedded coin-P2P port.
@@ -947,7 +993,10 @@ int run_node(const core::CoinParams& params, bool testnet,
         // #300/#299: replay the captured per-job template transactions[]
         // keyed by share_hash (TemplateCapture above feeds it at seed time);
         // a capture MISS decodes to an empty set -> valid coinbase-only block.
-        dgb::coin::make_template_other_txs_fn(template_capture.provider()));
+        dgb::coin::make_template_other_txs_fn(template_capture.provider()),
+        // Relay only a rebuilt block whose header hash is the share's; the
+        // regtest forced-won seam (a synthetic share, reground below) is exempt.
+        /*require_share_hash=*/!(regtest && force_won_share));
 
     // -- #82 forced-won PoW finalize -------------------------------------
     // A forced-won share (the regtest --regtest-force-won-share live seam)
@@ -1091,7 +1140,38 @@ int run_node(const core::CoinParams& params, bool testnet,
     // to next — header+mempool ingest together, the unblock order integrator
     // directed (2026-06-20).
     dgb::interfaces::Node coin_iface;
-    auto header_ingest_sub  = c2pool::dgb::wire_header_ingest(coin_iface, header_chain);
+    // The header ingest (header_ingest.hpp): linked on the parent; the tip
+    // follows the branch with the most Scrypt work; an empty chain takes only
+    // the header on genesis, block 1 at height 1. An unconnected or buffered
+    // fork header asks the coin node for headers with the chain's locator (at
+    // most every 2 s); the tip height is published for the HTTP thread.
+    // --regtest without --coin-genesis: the regtest genesis is not built in,
+    // so the first header is taken as block 1 (the coin node answers the locator
+    // it does not know from block 1); --coin-genesis pins it.
+    const uint256 dgb_genesis = !coin_genesis.IsNull() ? coin_genesis
+        : uint256S(testnet ? "308ea0711d5763be2995670dd9ca9872753561285a84da1d58be58acaa822252"
+                           : "7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
+    auto header_tip_pub = std::make_shared<std::atomic<uint32_t>>(0);
+    auto last_header_request = std::make_shared<std::chrono::steady_clock::time_point>();
+    c2pool::dgb::HeaderIngestOptions header_opts;
+    // The ingest's fork buffer, shared with every getheaders locator.
+    auto header_fork = std::make_shared<c2pool::dgb::ForkBuffer>();
+    header_opts.fork = header_fork;
+    if (regtest && coin_genesis.IsNull()) {
+        header_chain.set_base_height(1);
+    } else {
+        uint256 g = dgb_genesis;
+        header_opts.genesis = c2pool::dgb::u256::from_le_bytes(reinterpret_cast<const unsigned char*>(g.begin()));
+    }
+    header_opts.request_headers = [&coin_p2p, &header_chain, dgb_genesis, header_fork, last_header_request]() {
+        const auto now = std::chrono::steady_clock::now();
+        if (!coin_p2p || !coin_p2p->is_handshake_complete() || now - *last_header_request < std::chrono::seconds(2))
+            return;
+        *last_header_request = now;
+        coin_p2p->send_getheaders(70019, c2pool::dgb::getheaders_locator(header_chain, dgb_genesis, header_fork.get()), uint256::ZERO);
+    };
+    header_opts.on_tip = [header_tip_pub](uint32_t h) { header_tip_pub->store(h); };
+    auto header_ingest_sub  = c2pool::dgb::wire_header_ingest(coin_iface, header_chain, header_opts);
     // Pass the fee-proof UTXO view (nullptr when the lane is disarmed) so a
     // relayed tx is fee-proved at ingest against the SAME view selection uses.
     auto mempool_ingest_sub = c2pool::dgb::wire_mempool_ingest(coin_iface, mempool, dgb_utxo_ptr);
@@ -1246,6 +1326,7 @@ int run_node(const core::CoinParams& params, bool testnet,
     // No behavior change when --coin-daemon is absent: coin_p2p stays null, the
     // consumer seam idles exactly as before this slice.
     io::steady_timer coin_getheaders_timer(ioc);
+    std::function<void()> stop_coin_header_driver;
     if (!coin_daemon.empty()) {
         if (coin_magic.empty())
             std::cout << "[DGB] WARNING: --coin-daemon set without --coin-magic "
@@ -1267,6 +1348,10 @@ int run_node(const core::CoinParams& params, bool testnet,
         coin_p2p->set_lifetime(coin_p2p);
         assert(coin_p2p->lifetime_armed() && "DGB coin-P2P dial lifetime failed to arm");
         coin_p2p->enable_mempool_request();  // also exercise the tx ingest seam
+        coin_p2p->set_locator_fn([&header_chain, dgb_genesis, header_fork]() {
+            return c2pool::dgb::getheaders_locator(header_chain, dgb_genesis, header_fork.get());
+        });
+        coin_p2p->set_on_block_inv(header_opts.request_headers);
         coin_p2p->connect(target);
         std::cout << "[DGB] embedded coin-daemon P2P producer dialing "
                   << target.to_string() << " magic=" << HexStr(coin_magic)
@@ -1277,7 +1362,7 @@ int run_node(const core::CoinParams& params, bool testnet,
         // chain into validate_and_append. 3s mirrors main_btc.cpp's driver.
         coin_getheaders_timer.expires_after(std::chrono::seconds(3));
         coin_getheaders_timer.async_wait(
-            [&coin_p2p, coin_genesis]
+            [&coin_p2p, &header_chain, dgb_genesis, header_fork]
             (const boost::system::error_code& ec) {
                 if (ec) return;
                 if (!coin_p2p->is_handshake_complete()) {
@@ -1289,9 +1374,9 @@ int run_node(const core::CoinParams& params, bool testnet,
                 // Empty chain (fresh regtest) -> locator = [genesis]; one
                 // getheaders batch (<=2000) covers a short regtest chain. Walk-
                 // forward continuation for long chains is a follow-up slice.
-                std::vector<uint256> locator;
-                if (!coin_genesis.IsNull())
-                    locator.push_back(coin_genesis);
+                // The chain's locator (a restart with stored headers resumes
+                // from its tip), else [genesis].
+                const std::vector<uint256> locator = c2pool::dgb::getheaders_locator(header_chain, dgb_genesis, header_fork.get());
                 std::cout << "[DGB] coin-daemon handshake OK — sending initial "
                              "getheaders, locator="
                           << (locator.empty()
@@ -1300,6 +1385,20 @@ int run_node(const core::CoinParams& params, bool testnet,
                           << std::endl;
                 // 70019 == DigiByte Core PROTOCOL_VERSION (coin/p2p_node.hpp).
                 coin_p2p->send_getheaders(70019, locator, uint256::ZERO);
+            });
+        // Header sync stays alive after startup: every
+        // 12 s, a fresh handshake or no progress since the last tick sends
+        // getheaders with the chain's locator.
+        stop_coin_header_driver = dgb::start_periodic(ioc, std::chrono::milliseconds(12000),
+            [&coin_p2p, &header_chain, dgb_genesis, header_fork, last_h = std::make_shared<uint32_t>(0),
+             was = std::make_shared<bool>(false)]() {
+                const bool hs = coin_p2p && coin_p2p->is_handshake_complete();
+                const uint32_t h = header_chain.tip_height().value_or(0);
+                if (hs && (!*was || h <= *last_h))
+                    coin_p2p->send_getheaders(70019, c2pool::dgb::getheaders_locator(header_chain, dgb_genesis, header_fork.get()),
+                                              uint256::ZERO);
+                *was = hs;
+                *last_h = h;
             });
     }
 
@@ -1361,6 +1460,10 @@ int run_node(const core::CoinParams& params, bool testnet,
             &ioc, &coin_iface, &config, "DGB-CoinP2P");
         coin_p2p->set_lifetime(coin_p2p);
         assert(coin_p2p->lifetime_armed() && "DGB coin-P2P dial lifetime failed to arm");
+        coin_p2p->set_locator_fn([&header_chain, dgb_genesis, header_fork]() {
+            return c2pool::dgb::getheaders_locator(header_chain, dgb_genesis, header_fork.get());
+        });
+        coin_p2p->set_on_block_inv(header_opts.request_headers);
 
         // Peers already dialed this run (exclusion set for failover); cleared to
         // re-sweep once the banked set is exhausted so a dead first pick — or a
@@ -1411,13 +1514,13 @@ int run_node(const core::CoinParams& params, bool testnet,
         standalone_driver_keepalive = schedule_standalone_dial;
         std::weak_ptr<std::function<void()>> weak_dial = schedule_standalone_dial;
         *schedule_standalone_dial =
-            [standalone_dial_timer, weak_dial, &coin_p2p, &header_chain,
+            [standalone_dial_timer, weak_dial, &coin_p2p, &header_chain, header_fork,
              genesis_locator, dial_standalone_peer, hdr_last_height,
              hdr_last_progress, hdr_was_handshaked,
              kDriverTickSec, kNoProgressFailoverSec]() {
                 standalone_dial_timer->expires_after(std::chrono::seconds(kDriverTickSec));
                 standalone_dial_timer->async_wait(
-                    [standalone_dial_timer, weak_dial, &coin_p2p, &header_chain,
+                    [standalone_dial_timer, weak_dial, &coin_p2p, &header_chain, header_fork,
                      genesis_locator, dial_standalone_peer, hdr_last_height,
                      hdr_last_progress, hdr_was_handshaked, kNoProgressFailoverSec]
                     (const boost::system::error_code& ec) {
@@ -1437,17 +1540,13 @@ int run_node(const core::CoinParams& params, bool testnet,
                             // least significant) — the inverse of the
                             // from_le_bytes(uint256) the ingest builder used, so
                             // reversing the limbs reconstructs the wire uint256.
-                            std::vector<uint256> locator;
-                            if (auto tip = header_chain.tip_hash(); tip) {
-                                std::vector<unsigned char> b(32);
-                                for (int i = 0; i < 4; ++i)
-                                    for (int j = 0; j < 8; ++j)
-                                        b[i * 8 + j] = static_cast<unsigned char>(
-                                            (tip->limb[i] >> (8 * j)) & 0xffu);
-                                locator.emplace_back(b);
-                            } else {
-                                locator = genesis_locator;
-                            }
+                            // A full locator (the tip, 10 below, doubling steps,
+                            // genesis): the coin node finds the fork point, so a tip it
+                            // does not have no longer makes it answer from
+                            // genesis (the dgb.voidbind wedge, 2026-11-27).
+                            const std::vector<uint256> locator = c2pool::dgb::getheaders_locator(
+                                header_chain, genesis_locator.empty() ? uint256() : genesis_locator.front(),
+                                header_fork.get());
                             std::cout << "[DGB] standalone header-sync getheaders "
                                          "locator="
                                       << (locator.empty()
@@ -1533,6 +1632,8 @@ int run_node(const core::CoinParams& params, bool testnet,
     // uses the "dgbrt" bech32 HRP). Pass it through so a legitimate --regtest
     // payout address is accepted rather than rejected as Foreign.
     work_source->set_regtest(regtest);
+    // The best share stratum jobs build on (wire_best_share below).
+    auto stratum_best_share = std::make_shared<dgb::BestShareCell>();
     // #961 cross-lane (B4): publish DGB's REGISTRY-SOURCED own-coin payout-address
     // acceptance into the StratumConfig the core StratumServer reads, so the SAME
     // decide_payout_address() door-reject (mining.authorize) + no-empty-payout
@@ -1541,8 +1642,19 @@ int run_node(const core::CoinParams& params, bool testnet,
     // Network-derived; own-coin + a CONFIGURED merged chain (DOGE) stay accepted.
     {
         const auto acc = dgb::address_acceptance(testnet, regtest);
+        // Work from the header chain only once it has reached its tip (median
+        // time at most an hour old), as a
+        // latch, on mainnet only: an idle testnet/regtest chain would hold
+        // work for good, as no block can be found to clear it.
+        if (!testnet && !regtest)
+            work_source->set_tip_recent_sec(3600);
         work_source->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions,
                                            acc.bech32_hrps);
+        // DGB's versions on every network (main_ltc's merged_parent_versions):
+        // a login address DGB could own is never identified as DOGE's (DGB's
+        // P2PKH 30 is also DOGE's). Only read by the merged-chain login
+        // resolution, so a node without --merged is unchanged.
+        work_source->set_merged_parent_versions(dgb::merged_parent_versions());
     }
 
     // Node-owner fee (p2pool -f/--fee): arm the deterministic payout-identity
@@ -1577,7 +1689,69 @@ int run_node(const core::CoinParams& params, bool testnet,
     // standalone DGB node — the structural no-op path proven in #1413's KAT).
     if (mm_manager)
         work_source->set_merged_mining_manager(mm_manager.get());
+
+    // ── DOGE payout provider + work-change hook + best-share dirty mark ──────
+    // WITHOUT a provider every rebuild records "no_provider"
+    // (merged_mining.cpp rebuild_cached_blocks), the commitment stays empty and
+    // the DGB coinbase never commits to a DOGE block. The BTC parent lane's
+    // wiring on the DGB node (aux_doge_payout_provider.hpp
+    // wire_doge_merged_payouts). Null mm_manager (no --merged) => nothing bound
+    // => standalone DGB byte-identical.
+    //
+    // The operator's P2SH rule (aux_doge_payout_provider.hpp DogeP2shSplit): a
+    // P2SH parent key with no DOGE address of its own is paid half to the node
+    // owner's DOGE script, half to the donation. The owner's DOGE script:
+    // --node-owner-merged-address, else the --node-owner-address key when it
+    // is a DGB P2PKH/P2WPKH, else none (that half goes to the donation). The
+    // owner's node-fee shares carry it as their merged address.
+    std::shared_ptr<const dgb::coin::DogeP2shSplit> doge_p2sh_split;
+    if (mm_manager) {
+        std::string owner_src;
+        auto owner_doge = dgb::coin::doge_owner_script(node_owner_address, node_owner_merged_address,
+                                                       testnet, regtest, owner_src);
+        std::cout << "[DGB-MM] DOGE owner script for the P2SH split and node-fee shares: "
+                  << (owner_doge.empty() ? std::string("none, the donation") : HexStr(Span<const unsigned char>(owner_doge.data(), owner_doge.size())))
+                  << " (" << owner_src << ")" << std::endl;
+        if (node_owner_fee > 0.0 && !owner_doge.empty())
+            work_source->set_owner_merged_scripts({{dgb::coin::DOGE_AUX_CHAIN_ID, owner_doge}});
+        // The P2SH-owner rule: a P2SH --node-owner-address's own DOGE amount
+        // (the owner half of split jobs) goes wholly to the owner DOGE script
+        // (an explicit --node-owner-merged-address), else to the donation.
+        std::vector<unsigned char> owner_parent;
+        if (!node_owner_address.empty()) {
+            std::vector<unsigned char> s;
+            if (core::classify_address_for_coin(node_owner_address, dgb::address_acceptance(testnet, regtest), s)
+                    == core::AddressCoinMatch::Own
+                && s.size() == 23 && s[0] == 0xa9 && s[22] == 0x87)
+                owner_parent = std::move(s);
+        }
+        doge_p2sh_split = std::make_shared<const dgb::coin::DogeP2shSplit>(
+            dgb::coin::DogeP2shSplit{std::move(owner_doge), std::move(owner_parent)});
+    }
+    // The provider reads the best share from the stratum best-share cell under
+    // the tracker guard (wire_best_share below keeps the cell fresh).
+    if (dgb::coin::wire_doge_merged_payouts(mm_manager.get(), p2p_node, work_source.get(), doge_p2sh_split,
+                                            [cell = stratum_best_share]() { return cell->get(); }))
+        std::cout << "[DGB-MM] DOGE payout provider + work-change hook wired ("
+                  << mm_manager->chain_count() << " aux chain(s))" << std::endl;
 #endif // AUX_DOGE
+
+    // ── Stratum best share (best_share_cell.hpp) ─────────────────────────────
+    // Without this every job froze a NULL prev share: the producer declined it
+    // and no local share could ever be credited. The jobs read a lock-protected
+    // cell refreshed under the tracker guard by the node's ONE best-change hook
+    // (NodeImpl::best_share_hash reads the tracker unlocked); the same hook
+    // marks the DOGE payouts dirty under --merged and bumps the work
+    // generation so miners get jobs on the new best share.
+    {
+        std::function<void()> also_on_best;
+#ifdef AUX_DOGE
+        if (auto* mm = mm_manager.get())
+            also_on_best = [mm]() { mm->mark_pplns_dirty(); };
+#endif // AUX_DOGE
+        dgb::wire_best_share(p2p_node, stratum_best_share, work_source.get(), ioc,
+                             std::move(also_on_best));
+    }
 
     // -- External-daemon GBT tip fallback bind (the fallback V36 mandates PERSIST)
     // While the embedded HeaderChain is unfed (tip_hash()==nullopt -- the live
@@ -1607,6 +1781,8 @@ int run_node(const core::CoinParams& params, bool testnet,
                     dgb::stratum::DGBWorkSource::GbtTip tip;
                     tip.previousblockhash = ph->get<std::string>();
                     tip.bits              = bt->get<std::string>();
+                    if (auto ht = tmpl.find("height"); ht != tmpl.end() && ht->is_number_unsigned())
+                        tip.height = ht->get<uint32_t>();
                     // GBT previousblockhash is 64-hex big-endian display -- the
                     // exact u256_be_display_hex convention the embedded path emits,
                     // so it flows verbatim (parity by the daemon's own GBT contract).
@@ -1665,187 +1841,67 @@ int run_node(const core::CoinParams& params, bool testnet,
     // VOTING (oracle p2pool-dgb-scrypt), v36 once the crossing ACTIVATES. State
     // persists per-coin under <net_subdir>/v36_ratchet.json so a crossed node
     // never regresses on restart.
+    //
+    // Operator decision (2026-11-27): DGB is HELD at V35 until a flag day
+    // (dgb::DgbVersionPolicy): without --v36-ratchet the node mints V35 and
+    // votes 35, and no ratchet state is read or written. With it, the
+    // AutoRatchet as above. The policy keeps its own mutex (stratum sessions
+    // build coinbases concurrently under the SHARED tracker lock).
     const std::string ratchet_path =
         (core::filesystem::config_path() / net_subdir / "v36_ratchet.json").string();
-    auto dgb_ratchet = std::make_shared<dgb::AutoRatchet>(
-        ratchet_path, dgb::DGB_TARGET_VERSION, dgb::DGB_BASE_VERSION);
-    // Stratum sessions build coinbases concurrently under the SHARED tracker
-    // lock; the ratchet's own state transitions need their own mutex.
-    auto dgb_ratchet_mutex = std::make_shared<std::mutex>();
-    LOG_INFO << "[AutoRatchet] Initialized: state="
-             << dgb::ratchet_state_str(dgb_ratchet->state())
-             << " base=V" << dgb::DGB_BASE_VERSION
-             << " target=V" << dgb::DGB_TARGET_VERSION
-             << " file=" << ratchet_path;
+    auto dgb_versions = std::make_shared<dgb::DgbVersionPolicy>(v36_ratchet, ratchet_path);
+    if (auto* r = dgb_versions->ratchet()) {
+        LOG_INFO << "[AutoRatchet] Initialized (--v36-ratchet): state="
+                 << dgb::ratchet_state_str(r->state())
+                 << " base=V" << dgb::DGB_BASE_VERSION
+                 << " target=V" << dgb::DGB_TARGET_VERSION
+                 << " file=" << ratchet_path;
+    } else {
+        LOG_INFO << "[AutoRatchet] OFF: DGB shares are V35, voting 35 (the V36 ratchet needs --v36-ratchet)";
+        if (dgb_versions->stale_state_file_ignored())
+            LOG_WARNING << "[AutoRatchet] a persisted ratchet state " << ratchet_path
+                        << " exists and is IGNORED while --v36-ratchet is off";
+    }
     {
         auto& pplns_tracker = p2p_node.tracker();
         work_source->set_pplns_inputs_fn(
-            [&pplns_tracker, &p2p_node, &params, &header_chain, donation_u16,
-             dgb_ratchet, dgb_ratchet_mutex](
+            [&pplns_tracker, &p2p_node, &params, give_author_pct, dgb_versions](
                 const uint256& prev_share_hash,
                 const std::string& /*extranonce1_hex*/,
                 const std::vector<unsigned char>& payout_script,
-                const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)
+                const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+                const std::vector<unsigned char>& aux_mm_scriptsig,
+                const dgb::stratum::DGBWorkSource::JobBlock& block)
                 -> std::optional<dgb::coin::ConnCoinbasePplnsInputs>
             {
-                // Non-blocking tracker read. Contended -> decline (empty job).
+                // Non-blocking tracker read. Contended -> decline (the job is held).
                 auto guard = p2p_node.read_tracker();
                 if (!guard)
                     return std::nullopt;
 
-                // No tip / parent not in chain -> safe coinbase-only empty job
-                // (pre-wire behavior; nothing to PPLNS-split yet).
-                if (prev_share_hash.IsNull() || !pplns_tracker.chain.contains(prev_share_hash))
-                    return std::nullopt;
-
-                // Prospective block bits: at emission there is no found block, so
-                // the prospective NEXT share reuses the tip share's block target
-                // -- the same value create_local_share() reads from the found
-                // block header (share.m_min_header.m_bits) and the walk feeds into
-                // the pre-V36 max_weight cap. Read under the held tracker lock.
-                uint32_t block_bits = 0;
-                uint32_t prev_ts    = 0;
-                uint128  prev_abswork;
-                uint32_t prev_absheight = 0;
-                pplns_tracker.chain.get(prev_share_hash).share.invoke([&](auto* prev) {
-                    block_bits      = prev->m_min_header.m_bits;
-                    prev_ts         = prev->m_timestamp;
-                    prev_abswork    = prev->m_abswork;
-                    prev_absheight  = prev->m_absheight;
-                });
-                if (block_bits == 0)
-                    return std::nullopt;  // tip share carries no usable target.
-
-                // #884: ask the AutoRatchet ONCE for this template's {mint,
-                // vote} pair; everything version-dependent below uses it.
-                int64_t  mint_version = 0;
-                uint64_t vote_version = 0;
-                {
-                    std::lock_guard<std::mutex> rl(*dgb_ratchet_mutex);
-                    const auto [mv, vv] = dgb::dgb_select_mint_versions(
-                        *dgb_ratchet, pplns_tracker, prev_share_hash);
-                    mint_version = mv;
-                    vote_version = static_cast<uint64_t>(vv);
-                }
-                const bool use_v36_pplns =
-                    core::version_gate::is_v36_active(mint_version);
-
-                // PAYOUT half -- PPLNS weight walk SSOT (the verifier's step 1).
-                dgb::CumulativeWeights walk;
-                try {
-                    walk = dgb::coin::compute_pplns_weight_walk(
-                        pplns_tracker, prev_share_hash, block_bits, params, use_v36_pplns);
-                } catch (const std::invalid_argument&) {
-                    // Insufficient-depth guard (the SAME boundary the verifier
-                    // refuses): decline rather than emit a wrong split.
-                    return std::nullopt;
-                }
-                if (walk.weights.empty())
-                    return std::nullopt;  // no payout recipients yet -> empty job.
-
-                // -- FROZEN template-time fields (mirror create_local_share) --
-                // timestamp: clip to >= prev.timestamp + 1.
-                uint32_t timestamp = static_cast<uint32_t>(std::time(nullptr));
-                if (timestamp <= prev_ts)
-                    timestamp = prev_ts + 1;
-
-                // share target AFTER timestamp clip (== create_local_share order).
-                const auto desired_target = chain::bits_to_target(block_bits);
-                const auto st = pplns_tracker.compute_share_target(
-                    prev_share_hash, timestamp, desired_target);
-                const uint32_t max_bits = st.max_bits;
-                const uint32_t bits     = st.bits;
-
-                // absheight / abswork / far_share_hash from the parent.
-                const uint32_t absheight = prev_absheight + 1;
-                const auto cur_attempts = chain::target_to_average_attempts(
-                    chain::bits_to_target(bits));
-                const uint128 abswork = prev_abswork + uint128(cur_attempts.GetLow64());
-
-                uint256 far_share_hash;
-                {
-                    auto [prev_height, last] =
-                        pplns_tracker.chain.get_height_and_last(prev_share_hash);
-                    if (last.IsNull() && prev_height < 99)
-                        far_share_hash = uint256();  // chain complete & < 99 deep
-                    else
-                        far_share_hash =
-                            pplns_tracker.chain.get_nth_parent_key(prev_share_hash, 99);
-                }
-
-                // merged_payout_hash (V36) over the same block target.
-                const uint256 merged_payout_hash =
-                    pplns_tracker.compute_merged_payout_hash(prev_share_hash, desired_target);
-
-                // Merged-mining addresses forwarded from the session.
-                std::vector<dgb::MergedAddressEntry> merged_addresses;
-                merged_addresses.reserve(merged_addrs.size());
-                for (const auto& entry : merged_addrs) {
-                    dgb::MergedAddressEntry e;
-                    e.m_chain_id = entry.first;
-                    e.m_script.m_data = entry.second;
-                    merged_addresses.push_back(std::move(e));
-                }
-
-                // subsidy for the prospective NEXT block (== create_local_share
-                // subsidy arg): subsidy_func(next_height). total_fees fold into
-                // the embedded coinbasevalue elsewhere; the PPLNS split here uses
-                // the block reward the verifier splits.
-                const uint64_t subsidy = params.subsidy_func
-                    ? params.subsidy_func(absheight)
-                    : 0;
-
-                // #902 -- production coinbase scriptSig: [BIP34 height push]
-                // [/c2pool-dgb/ tag]. Built from the coin block the next share
-                // sits on (header_chain.next_block_height()). Before this the
-                // scriptSig was EMPTY on the production path: no BIP34 height
-                // (=> bad-cb-height on any won block) and no pool tag. The SAME
-                // bytes feed BOTH the ref preimage (rin.coinbase_scriptSig, so
-                // the committed ref_hash matches) AND the emitted connection
-                // coinbase (ain.coinbase_script) -- a single SSOT so the two can
-                // never diverge and self-reject our own shares (#901 finding).
-                const std::vector<unsigned char> coinbase_scriptsig =
-                    dgb::coin::build_coinbase_scriptsig(header_chain.next_block_height());
-
-                // REF half -- assemble the ref preimage via the SSOT and hash it
-                // through the verifier primitive. V36/V35 split owned by
-                // compute_ref_hash_for_work().
-                dgb::coin::WorkRefHashInputs rin;
-                rin.share_version   = mint_version;   // #884: ratchet-selected
-                rin.desired_version = vote_version;
-                rin.prev_share      = prev_share_hash;
-                rin.coinbase_scriptSig = coinbase_scriptsig;  // #902: commit the BIP34+tag scriptSig
-                rin.share_nonce     = 0;            // share commitment nonce (not block)
-                rin.payout_script   = payout_script;
-                rin.subsidy         = subsidy;
-                rin.donation        = donation_u16;  // author default 0.1% (u16 66); --give-author overrides
-                rin.stale_info      = 0;
-                rin.has_segwit      = false;       // segwit populated by template-cache follow-on
-                rin.merged_addresses    = merged_addresses;
-                rin.merged_payout_hash  = merged_payout_hash;
-                rin.far_share_hash  = far_share_hash;
-                rin.max_bits        = max_bits;
-                rin.bits            = bits;
-                rin.timestamp       = timestamp;
-                rin.absheight       = absheight;
-                rin.abswork         = abswork;
-
-                // Assemble the final PPLNS inputs via the make_conn_pplns_inputs()
-                // SSOT (conn_pplns_producer.hpp): it computes ref_hash /
-                // last_txout_nonce from the SAME verifier primitive
-                // (compute_ref_hash_for_work) and forwards the walked weights into
-                // ConnCoinbasePplnsInputs -- ONE ref-hash and ONE payout
-                // implementation shared with the verifier, by construction.
-                dgb::ConnPplnsAssemblyInputs ain;
-                ain.weights         = std::move(walk.weights);
-                ain.total_weight    = walk.total_weight;
-                ain.subsidy         = subsidy;
-                ain.coinbase_script = coinbase_scriptsig;  // #902: same BIP34+tag scriptSig as the ref preimage
-                // #884: PPLNS formula / finder fee / donation script from the
-                // SAME ratchet-selected version (use_v36_pplns above agrees).
-                dgb::apply_conn_mint_version(ain, mint_version, payout_script);
-                ain.ref_params      = dgb::coin::make_work_ref_hash_params(rin, params);
-                return dgb::make_conn_pplns_inputs(ain, params);
+                // The producer SSOT (conn_job_producer.hpp, lifted from this
+                // lambda): PPLNS inputs + the frozen share fields at the prev
+                // share. #884: the AutoRatchet is asked ONCE, at the point the
+                // producer needs the {mint, vote} pair.
+                dgb::ConnJobRequest req;
+                req.prev_share_hash   = prev_share_hash;
+                req.payout_script     = payout_script;
+                req.merged_addrs      = merged_addrs;
+                req.next_block_height = block.height;   // the job template's block
+                req.block_bits        = block.bits;
+                req.block_value       = block.value;
+                req.local_hash_rate   = block.local_hash_rate;
+                req.now               = static_cast<uint32_t>(std::time(nullptr));
+                // --give-author's, or a split job's own (decide_job_payout):
+                // the ref_hash commits to it.
+                req.donation          = core::job_share_donation(block.share_donation, give_author_pct);
+                req.aux_mm_scriptsig  = aux_mm_scriptsig;
+                return dgb::build_conn_job_inputs(
+                    pplns_tracker, params, req,
+                    [&]() -> std::pair<int64_t, uint64_t> {
+                        const auto [mv, vv] = dgb_versions->select(pplns_tracker, prev_share_hash);
+                        return {mv, static_cast<uint64_t>(vv)};
+                    });
             });
     }
 
@@ -1873,15 +1929,14 @@ int run_node(const core::CoinParams& params, bool testnet,
     // frozen_ref). It does NOT ask the ratchet again: if the ratchet moved
     // between template and submit, a fresh answer would rebuild a gentx that no
     // longer matches the coinbase the miner hashed. The mint is
-    // mint_local_share_at_frozen_version (run_loop_mint.hpp). Every other field
-    // mirrors the producer exactly: the same donation, no merged addrs
-    // (standalone DGB parent), segwit_active=false (the producer emits a
-    // non-segwit coinbase), so the reconstruction is byte-identical when the
-    // sharechain tip has not moved between template build and submit; if it has,
-    // create_local_share returns null (a correctly-declined stale share).
+    // mint_local_share_at_frozen_version (run_loop_mint.hpp): it records the
+    // coinbase the miner hashed (in.actual_coinbase) with the share fields the
+    // job's ref commits to (in.frozen_*, has_frozen), as the BTC lane does, so
+    // the share is exactly the submitted work. Same donation, segwit_active=false
+    // (the producer emits a non-segwit coinbase).
     {
         work_source->set_mint_share_fn(
-            [&p2p_node, &params, donation_u16](
+            [&p2p_node, &params, give_author_pct, &ioc](
                 const dgb::stratum::DGBWorkSource::MintShareInputs& in) -> uint256
             {
                 // in.coinbase_bytes is the coinbase scriptSig (BIP34 height +
@@ -1894,40 +1949,54 @@ int run_node(const core::CoinParams& params, bool testnet,
                     return uint256();
                 }
 
-                // Exclusive tracker lock, non-blocking: defer to the next
-                // submission if the compute thread is mid-think() rather than
-                // block the Stratum IO thread. Released BEFORE broadcast_share /
-                // notify_local_share, which take their own locks / post to io.
-                std::unique_lock<std::shared_mutex> lk(
-                    p2p_node.tracker_mutex(), std::try_to_lock);
-                if (!lk.owns_lock()) {
-                    LOG_INFO << "[DGB-MINT] tracker busy -- share deferred "
-                                "(retry on next submission)";
-                    return uint256();
-                }
-
-                uint256 share_hash;
-                try {
-                    share_hash = dgb::mint_local_share_at_frozen_version(
-                        in, *min_header, p2p_node.tracker(), params,
-                        /*donation=*/donation_u16);
-                } catch (const std::exception& e) {
-                    LOG_WARNING << "[DGB-MINT] create_local_share threw: " << e.what();
-                    return uint256();
-                }
-
-                lk.unlock();
-
-                if (!share_hash.IsNull()) {
-                    p2p_node.broadcast_share(share_hash);
-                    p2p_node.notify_local_share(share_hash);
-                    LOG_INFO << "[DGB-MINT] share "
-                             << share_hash.GetHex().substr(0, 16)
-                             << " v" << in.share_version
-                             << " minted onto the sharechain + broadcast (prev="
-                             << in.prev_share.GetHex().substr(0, 16) << ")";
-                }
-                return share_hash;
+                // Exclusive tracker lock, non-blocking: the Stratum IO thread
+                // is never blocked. While the tracker is busy (the compute
+                // thread mid-think, a payout provider's read guard) the mint is
+                // retried on the IO context, bounded (dgb::mint_with_retry):
+                // before, the share was dropped. The share carries the job's
+                // frozen fields, so a later mint makes the same share. The lock
+                // is released BEFORE broadcast_share / notify_local_share,
+                // which take their own locks / post to io.
+                auto attempt = [&p2p_node, &params, give_author_pct, in,
+                                hdr = *min_header]() -> std::optional<uint256> {
+                    std::unique_lock<std::shared_mutex> lk(p2p_node.tracker_mutex(), std::try_to_lock);
+                    if (!lk.owns_lock())
+                        return std::nullopt;
+                    uint256 share_hash;
+                    try {
+                        // The job's donation (a split job), else --give-author's:
+                        // the one its coinbase's ref_hash committed to.
+                        share_hash = dgb::mint_local_share_at_frozen_version(
+                            in, hdr, p2p_node.tracker(), params,
+                            /*donation=*/core::job_share_donation(in.donation, give_author_pct));
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[DGB-MINT] create_local_share threw: " << e.what();
+                        return uint256();
+                    }
+                    lk.unlock();
+                    if (!share_hash.IsNull()) {
+                        p2p_node.broadcast_share(share_hash);
+                        p2p_node.notify_local_share(share_hash);
+                        LOG_INFO << "[DGB-MINT] share "
+                                 << share_hash.GetHex().substr(0, 16)
+                                 << " v" << in.share_version
+                                 << " minted onto the sharechain + broadcast (prev="
+                                 << in.prev_share.GetHex().substr(0, 16) << ")";
+                    }
+                    return share_hash;
+                };
+                bool queued = false;
+                const uint256 now_hash = dgb::mint_with_retry(
+                    ioc, attempt,
+                    [](const uint256& h, int tries) {
+                        if (!h.IsNull())
+                            LOG_INFO << "[DGB-MINT] share minted after " << tries
+                                     << " tries (the tracker was busy)";
+                    },
+                    &queued);
+                if (queued)
+                    LOG_INFO << "[DGB-MINT] tracker busy -- the mint is retried on the IO context";
+                return now_hash;
             });
         std::cout << "[DGB] sharechain mint seam BOUND (set_mint_share_fn -> "
                      "create_local_share at the job's AutoRatchet version -> broadcast_share + "
@@ -1940,12 +2009,41 @@ int run_node(const core::CoinParams& params, bool testnet,
     // touches NOTHING on the sharechain (validation/codec/PPLNS unchanged) -- it
     // is node-local and consensus-safe. Absent --redistribute the fallback stays
     // unbound and the empty-credential path is byte-identical to prior builds.
-    // A spec naming split (the LTC/DASH default, not available on DGB yet)
-    // binds nothing either, and says so: never read as pplns.
-    if (dgb::spec_names_split(redistribute_spec))
-        std::cout << "[DGB] WARNING: --redistribute \"" << redistribute_spec
-                  << "\": split is not available on DGB yet -- no redistribute policy bound"
-                     " (as without --redistribute)" << std::endl;
+    // --redistribute split (the default, #2347): a job with no payout script
+    // (an empty login, the job sent before the login) pays the node owner
+    // with share donation core::kSplitShareDonation (32768/65535: the owner
+    // and the donation half and half), decided when the job is built
+    // (DGBWorkSource::decide_job_payout), so the minted share carries the
+    // payout and donation its coinbase committed to. The owner is
+    // --node-owner-address, an own-network DGB P2PKH/P2SH address; its DOGE
+    // half follows its DGB key (a P2SH owner: the explicit owner DOGE
+    // address, else the donation; aux_doge_payout_provider.hpp). None usable:
+    // the owner half cannot be paid; no policy is bound (an empty login is
+    // refused at authorize, as before), said once here.
+    if (dgb::spec_names_split(redistribute_spec)) {
+        std::vector<unsigned char> owner_script;
+        const bool own = !node_owner_address.empty()
+            && core::classify_address_for_coin(node_owner_address, dgb::address_acceptance(testnet, regtest),
+                                               owner_script) == core::AddressCoinMatch::Own;
+        // P2PKH, P2SH or a 20-byte P2WPKH: the payouts a V35 share carries
+        // (a bech32 owner arms the split too).
+        const bool carried = (owner_script.size() == 25 && owner_script[0] == 0x76 && owner_script[1] == 0xa9)
+                             || (owner_script.size() == 23 && owner_script[0] == 0xa9 && owner_script[22] == 0x87)
+                             || (owner_script.size() == 22 && owner_script[0] == 0x00 && owner_script[1] == 0x14);
+        if (own && carried) {
+            work_source->set_split_owner(owner_script);
+            std::cout << "[DGB] redistribute split: unattributable work pays the node owner \""
+                      << node_owner_address << "\" and the donation half and half (share donation "
+                      << core::kSplitShareDonation << "/65535 instead of --give-author's)" << std::endl;
+        } else {
+            std::cout << "[DGB] WARNING: --redistribute split: "
+                      << (node_owner_address.empty() ? std::string("no --node-owner-address")
+                                                     : "--node-owner-address \"" + node_owner_address
+                                                           + "\" is not an own-network DGB P2PKH/P2SH/P2WPKH address")
+                      << " -- the owner half cannot be paid; no redistribute policy on this node"
+                         " (an empty login is refused at authorize)" << std::endl;
+        }
+    }
     if (dgb::binds_redistributor(redistribute_spec)) {
         auto redistributor = std::make_shared<dgb::Redistributor>();
         redistributor->set_hybrid_weights(dgb::parse_redistribute_spec(redistribute_spec));
@@ -1975,13 +2073,19 @@ int run_node(const core::CoinParams& params, bool testnet,
                       << "\" is not an own-network DGB P2PKH/P2SH address; fee arm "
                          "stays null (empty script, no burn)" << std::endl;
         }
-        auto& redist_tracker = p2p_node.tracker();
+        // The pick walks the PPLNS window (Redistributor::refresh_pplns_cache):
+        // under the tracker read guard, from the submit path (it was an
+        // unguarded read). Busy: no fallback payout this time (the empty
+        // payout's fail-safe: nothing is burned).
         work_source->set_fallback_payout_fn(
-            [redistributor, &redist_tracker, ws = work_source.get()]()
+            [redistributor, &p2p_node, ws = work_source.get()]()
                 -> std::vector<unsigned char> {
                 uint256 best;
                 if (auto bf = ws->get_best_share_hash_fn()) best = bf();
-                const dgb::RedistributeResult r = redistributor->pick(redist_tracker, best);
+                auto guard = p2p_node.read_tracker();
+                if (!guard)
+                    return {};
+                const dgb::RedistributeResult r = redistributor->pick(*guard, best);
                 if (r.pubkey_hash.IsNull())
                     return {};   // unconfigured identity -> fail-safe (no burn)
                 // Build the scriptPubKey from the RAW 20-byte hash (storage
@@ -2015,6 +2119,18 @@ int run_node(const core::CoinParams& params, bool testnet,
             std::cout << "[DGB] stratum listening on " << stratum_addr << ":"
                       << stratum_port
                       << " (work source: DGBWorkSource — Scrypt-only)" << std::endl;
+            // A job's share target is sized by its login's local hash rate
+            // (the server's per-address pseudoshare rates, p2pool
+            // get_local_addr_rates): at most ~1.67% of the pool's shares.
+            work_source->set_local_rate_fn(
+                [srv = stratum_server.get()](const core::stratum::PayoutKey& key) -> double {
+                    const auto rates = srv->get_local_addr_rates();
+                    const auto it = rates.find(key);
+                    return it == rates.end() ? 0.0 : it->second;
+                });
+            // A new session's start difficulty from the node's pseudoshare
+            // rate (dgb_start_difficulty: rate / 10 per second).
+            work_source->set_node_rate_fn([srv = stratum_server.get()]() { return srv->get_total_hashrate(); });
         } else {
             std::cout << "[DGB] stratum FAILED to bind " << stratum_addr << ":"
                       << stratum_port << " — stratum disabled" << std::endl;
@@ -2022,6 +2138,62 @@ int run_node(const core::CoinParams& params, bool testnet,
         }
     } else {
         std::cout << "[DGB] stratum disabled (no --stratum flag)" << std::endl;
+    }
+
+    // Clean jobs on a new DGB tip, a new best share or a fresh DOGE commitment,
+    // within a second (stratum_job_push.hpp); before, only the 25 s keepalive
+    // refreshed a miner's job, non-clean.
+    std::function<void()> stop_job_push;
+    if (stratum_server) {
+        auto* srv = stratum_server.get();
+        // The cell's change-driven refresh gives up
+        // after its bounded retries while the tracker stays busy; each tick
+        // also re-reads the best share (non-blocking), and a change bumps the
+        // work generation, which this tick then pushes.
+        stop_job_push = dgb::start_job_push_watch(ioc, work_source.get(),
+            [srv](bool clean) { srv->notify_all(clean); }, dgb::kJobPushTick,
+            [&p2p_node, cell = stratum_best_share, ws = work_source.get()]() {
+                const uint256 before = cell->get();
+                if (dgb::refresh_best_share_cell(p2p_node, *cell) && cell->get() != before)
+                    ws->bump_work_generation();
+            });
+    }
+
+    // The stratum work gate (stratum_work_gate.hpp; python work.py
+    // preprocess_request / get_work): no work while the node has no
+    // sharechain peers or no best share (mainnet: PERSIST), or has had no
+    // servable template (lost contact with digibyted) for more than 60 s;
+    // once a hold has lasted 15 s the live sessions are closed
+    // once, so rigs fail over. The share download and verification go on.
+    std::function<void()> stop_work_gate;
+    if (stratum_server) {
+        auto* srv = stratum_server.get();
+        const bool require_peers = !testnet && !regtest;
+        const auto steady_sec = []() {
+            return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        };
+        auto gate = std::make_shared<dgb::WorkGateState>();
+        gate->last_contact = steady_sec();
+        stop_work_gate = dgb::start_periodic(ioc, dgb::kWorkGateTick,
+            [&p2p_node, &coin_p2p, srv, ws = work_source.get(), cell = stratum_best_share, require_peers,
+             steady_sec, gate]() {
+                // The cell is refreshed here too: at
+                // startup it holds the raw head, which must not release work
+                // for a tick after the first peer connects.
+                const uint256 before = cell->get();
+                if (dgb::refresh_best_share_cell(p2p_node, *cell) && cell->get() != before)
+                    ws->bump_work_generation();
+                dgb::WorkGateObservation ob;
+                ob.require_peers = require_peers;
+                ob.sharechain_peers = p2p_node.get_peer_info_json().size();
+                ob.coin_dialled = static_cast<bool>(coin_p2p);
+                ob.coin_handshaken = coin_p2p && coin_p2p->is_handshake_complete();
+                ob.embedded_serves = ws->embedded_chain_serves();
+                ob.template_servable = ws->template_servable();
+                ob.best_share_null = cell->get().IsNull();
+                dgb::work_gate_tick(*gate, ob, steady_sec(), *ws, *srv);
+            });
     }
 
     // ── #82 REGTEST-GATED forced-won-share LIVE seam (decision (a), 2026-06-21) ──
@@ -2356,9 +2528,11 @@ int run_node(const core::CoinParams& params, bool testnet,
         // come from the single embedded coin P2P peer's version metadata
         // (empty until --coin-daemon arms it). Captures are main-scope
         // objects that outlive ioc.run(); all reads display-only.
-        mi->set_coin_sync_status_fn([&header_chain, &coin_p2p]() -> nlohmann::json {
+        mi->set_coin_sync_status_fn([header_tip_pub, &coin_p2p]() -> nlohmann::json {
             nlohmann::json s = nlohmann::json::object();
-            const uint32_t hh = header_chain.tip_height().value_or(0);
+            // The tip height the io thread publishes (the chain is not read
+            // from this thread).
+            const uint32_t hh = header_tip_pub->load();
             uint32_t th = 0;
             nlohmann::json peers = nlohmann::json::array();
             if (coin_p2p && coin_p2p->peer_version() > 0) {
@@ -2376,11 +2550,31 @@ int run_node(const core::CoinParams& params, bool testnet,
             return s;
         });
 
-        // (4) scrypt pool stats — sharechain length feeds getinfo poolshares.
-        mi->set_sharechain_stats_fn([&p2p_node]() {
-            nlohmann::json r = nlohmann::json::object();
-            r["total_shares"] =
-                static_cast<uint64_t>(p2p_node.tracker().chain.size());
+        // (4) scrypt pool stats (sharechain_stats.hpp, LTC's field shape),
+        //     read under the tracker guard. While think() holds the tracker:
+        //     the last full result with the snapshot's live counts (LTC's
+        //     s_last_good), or the snapshot's counts alone before the first
+        //     one (no chain_height: the snapshot has a count, not a height).
+        //     The best share is the stratum cell's: best_share_hash() reads
+        //     IO-thread state, and this runs on the HTTP thread.
+        mi->set_sharechain_stats_fn([&p2p_node, cell = stratum_best_share]() {
+            static std::mutex s_mutex;
+            static nlohmann::json s_last_good;
+            const uint256 best = cell->get();
+            auto guard = p2p_node.read_tracker();
+            if (!guard) {
+                const auto snap = p2p_node.get_tracker_snapshot();
+                std::lock_guard<std::mutex> lk(s_mutex);
+                nlohmann::json out = s_last_good.is_null() ? nlohmann::json::object() : s_last_good;
+                if (s_last_good.is_null())
+                    out["total_shares"] = snap.chain_count;
+                out["verified_count"] = snap.verified_count;
+                out["fork_count"] = snap.fork_count;
+                return out;
+            }
+            nlohmann::json r = dgb::sharechain_stats_json(*guard, best);
+            std::lock_guard<std::mutex> lk(s_mutex);
+            s_last_good = r;
             return r;
         });
 
@@ -2558,6 +2752,69 @@ int run_node(const core::CoinParams& params, bool testnet,
         // Window data is the dashboard grid — tip-sensitive; refresh on tip change.
         mi->mark_last_cache_tip_driven();
 
+        // (4d) the explorer's live updates, the share page, the current
+        //      payouts and the stratum workers (DASHBOARD-GAPS-DGB.md item 1):
+        //      core::sharechain_views (#2348) with DGB's address encoder
+        //      (dashboard_sharechain.hpp). Each feeder copies what it needs
+        //      under ONE read_tracker() guard (busy: an empty / busy document,
+        //      or the last payouts) and builds the JSON after it; the found-
+        //      block ledger and the cell take their own locks, before the guard.
+        auto found_share_hashes = [mi]() {
+            std::vector<std::string> out;
+            if (!mi) return out;
+            for (const auto& fb : mi->get_found_blocks()) {
+                const std::string sh = mi->found_block_share_hash(fb);
+                if (!sh.empty()) out.push_back(sh);
+            }
+            return out;
+        };
+        mi->set_sharechain_delta_fn([&p2p_node, mi, found_share_hashes](const std::string& since) -> nlohmann::json {
+            const auto found = found_share_hashes();
+            core::sharechain_views::ChainSnapshot snap;
+            {
+                auto guard = p2p_node.read_tracker();
+                if (!guard) return nlohmann::json::object();
+                snap = dgb::dashboard::delta_snapshot(*guard, since);
+            }
+            const std::string fee_hash160 = mi ? mi->get_node_fee_hash160() : std::string{};
+            return dgb::dashboard::delta_json(snap, fee_hash160, found);
+        });
+        mi->set_share_lookup_fn([&p2p_node, mi](const std::string& hash_hex) -> nlohmann::json {
+            const auto found = mi ? mi->get_found_blocks() : std::vector<core::MiningInterface::FoundBlock>{};
+            nlohmann::json detail;
+            {
+                auto guard = p2p_node.read_tracker();
+                if (!guard) return nlohmann::json{{"error", "tracker busy"}};
+                detail = dgb::dashboard::share_detail(*guard, hash_hex);
+            }
+            if (detail.contains("error")) return detail;
+            core::sharechain_views::add_found_block_fields(detail, found,
+                [mi](const core::MiningInterface::FoundBlock& fb) { return mi->is_primary_found_block(fb); });
+            return detail;
+        });
+        {
+            struct LastPayouts { std::mutex m; nlohmann::json j = nlohmann::json::object(); };
+            auto last = std::make_shared<LastPayouts>();
+            mi->set_current_payouts_fn([&p2p_node, cell = stratum_best_share, ws = work_source.get(), last]()
+                                           -> nlohmann::json {
+                const uint256 best = cell->get();
+                const auto t = ws->last_template_summary();
+                if (best.IsNull() || !t) return nlohmann::json::object();
+                auto guard = p2p_node.read_tracker();
+                if (!guard) {
+                    std::lock_guard<std::mutex> l(last->m);
+                    return last->j;
+                }
+                auto out = dgb::dashboard::current_payouts(*guard, best, t->bits, t->coinbase_value);
+                if (!out.empty()) {
+                    std::lock_guard<std::mutex> l(last->m);
+                    last->j = out;
+                }
+                return out;
+            });
+        }
+        mi->set_stratum_workers_fn([ws = work_source.get()]() { return ws->snapshot_stratum_workers(); });
+
         // (4c) lightweight tip endpoint for RealTime polling. Returns nullopt
         //      while the sharechain is still bootstrapping. Mirrors ltc.
         mi->set_sharechain_tip_fn(
@@ -2586,18 +2843,44 @@ int run_node(const core::CoinParams& params, bool testnet,
         // (5) pool hashrate — attempts/s over the target-lookbehind window off
         //     the verified best share (SSOT: node.cpp L4 pool-hashrate line).
         //     Guards to 0 when the window cannot form (no best / height<=2).
+        //     Read under the tracker guard; while think() holds the tracker,
+        //     the last value (it was an unguarded read).
         mi->set_pool_hashrate_fn([&p2p_node, work_source]() -> double {
+            static std::atomic<double> s_last{0.0};
             auto best_fn = work_source->get_best_share_hash_fn();
             if (!best_fn) return 0.0;
             uint256 best = best_fn();
-            auto& tr = p2p_node.tracker();
-            if (best.IsNull() || !tr.chain.contains(best)) return 0.0;
-            int32_t height = static_cast<int32_t>(tr.chain.get_height(best));
-            if (height <= 2 || tr.m_params == nullptr) return 0.0;
-            int32_t dist = std::min<int32_t>(
-                height - 1, static_cast<int32_t>(tr.m_params->target_lookbehind));
-            auto aps = tr.get_pool_attempts_per_second(best, dist, /*use_min_work=*/false);
-            return static_cast<double>(aps.GetLow64());
+            auto guard = p2p_node.read_tracker();
+            if (!guard) return s_last.load();
+            auto& tr = *guard;
+            double rate = 0.0;
+            if (!best.IsNull() && tr.chain.contains(best) && tr.m_params != nullptr) {
+                const int32_t height = static_cast<int32_t>(tr.chain.get_height(best));
+                if (height > 2) {
+                    const int32_t dist = std::min<int32_t>(
+                        height - 1, static_cast<int32_t>(tr.m_params->target_lookbehind));
+                    rate = static_cast<double>(
+                        tr.get_pool_attempts_per_second(best, dist, /*use_min_work=*/false).GetLow64());
+                }
+            }
+            s_last.store(rate);
+            return rate;
+        });
+
+        // (5b) the best share (/web/best_share_hash, the sync status) from the
+        //      stratum best-share cell, and the block value / network
+        //      difficulty / height from the last template served (a plain
+        //      read: no template is built for the dashboard).
+        mi->set_best_share_hash_fn([cell = stratum_best_share]() { return cell->get(); });
+        mi->set_coin_work_fn([ws = work_source.get()]() -> core::MiningInterface::CoinWorkInfo {
+            core::MiningInterface::CoinWorkInfo info;
+            if (const auto t = ws->last_template_summary()) {
+                info.valid = true;
+                info.height = t->height;
+                info.coinbase_value_sat = t->coinbase_value;
+                info.network_difficulty = chain::target_to_difficulty(chain::bits_to_target(t->bits));
+            }
+            return info;
         });
 
         // (6) share-peers — the pool node sharechain P2P peer snapshot
@@ -2830,6 +3113,11 @@ int run_node(const core::CoinParams& params, bool testnet,
     // alive — explicit reset keeps destruction order safe (stratum_server was
     // declared first, so it would otherwise outlive them).
     if (found_block_report) *found_block_report = nullptr;  // #995: unbind before mi dies
+    if (stop_job_push) stop_job_push();   // before the server it pushes to goes
+    if (stop_work_gate) stop_work_gate(); // it closes the server's sessions
+    if (stop_coin_header_driver) stop_coin_header_driver();
+    if (work_source) work_source->set_local_rate_fn(nullptr);   // it reads the server's rates
+    if (work_source) work_source->set_node_rate_fn(nullptr);
     stratum_server.reset();
     web_server.reset();
 
@@ -2881,8 +3169,10 @@ int main(int argc, char** argv)
     uint256 coin_genesis;                   // --coin-genesis HASH (initial getheaders locator base)
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT (external digibyted submit arm)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH to digibyte.conf (creds source)
-    std::string redistribute_spec;         // --redistribute SPEC (node-local payout policy, #307)
+    std::string redistribute_spec = "split";   // --redistribute SPEC (node-local payout policy, #307; default split, #2347)
     std::string node_owner_address;        // --node-owner-address ADDR (operator payout identity for --redistribute fee, #307; also -f/--fee destination)
+    std::string node_owner_merged_address; // --node-owner-merged-address / --merged-operator-address DOGEADDR (LTC spelling)
+    bool v36_ratchet = false;              // --v36-ratchet: enable the V36 AutoRatchet (default: held at V35)
     // Author/dev donation + node-owner fee (ported from BTC/DASH). The built-in
     // author default is HARD-PINNED at 0.1% (core::kAuthorFeeDefaultPct → u16 66);
     // --give-author overrides the AMOUNT only. Node-owner fee defaults 0 (off).
@@ -3018,6 +3308,11 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--node-owner-address") == 0 && i + 1 < argc) {
             node_owner_address = argv[++i];    // operator payout addr -> "fee" identity (#307 fee arm + -f/--fee destination)
+        }
+        else if (std::strcmp(argv[i], "--v36-ratchet") == 0) v36_ratchet = true;
+        else if ((std::strcmp(argv[i], "--node-owner-merged-address") == 0
+                  || std::strcmp(argv[i], "--merged-operator-address") == 0) && i + 1 < argc) {
+            node_owner_merged_address = argv[++i];   // the owner's DOGE address (P2SH split owner half, node-fee shares)
         }
         else if ((std::strcmp(argv[i], "--give-author") == 0
                   || std::strcmp(argv[i], "--dev-donation") == 0) && i + 1 < argc) {
@@ -3179,6 +3474,10 @@ int main(int argc, char** argv)
         if (rc.file_set("sharechain.no_p2p_relay") && rc.get_string("sharechain.no_p2p_relay").value_or("") == "true") no_p2p_relay = true;
         if (rc.file_set("money.redistribute"))       redistribute_spec  = rc.get_string("money.redistribute").value_or(redistribute_spec);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
+        if (rc.file_set("money.merged_operator_address"))
+            node_owner_merged_address = rc.get_string("money.merged_operator_address").value_or(node_owner_merged_address);
+        if (rc.file_set("sharechain.v36_ratchet") && rc.get_string("sharechain.v36_ratchet").value_or("") == "true")
+            v36_ratchet = true;
         if (rc.file_set("money.give_author_pct"))    dev_donation       = rc.get_double("money.give_author_pct").value_or(dev_donation);
         if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee     = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
         // embedded.serve_mempool_txs (S1 fee-proof lane): a [dgb] settings-file
@@ -3226,7 +3525,9 @@ int main(int argc, char** argv)
                         embedded_doge,
                         serve_mempool_txs, serve_mempool_txs_off,
                         sharechain_addnodes,
-                        coind_p2p_port);
+                        coind_p2p_port,
+                        node_owner_merged_address,
+                        v36_ratchet);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.

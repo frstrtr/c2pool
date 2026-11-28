@@ -288,6 +288,12 @@ public:
 
     /// Batch-update the is_verified flag for multiple shares without rewriting share data.
     bool mark_shares_verified(const std::vector<uint256>& hashes);
+    /// Clears the verified flag of these shares in one synced batch (each
+    /// share and its cached pow_hash are kept): they are verified again after
+    /// a load. Reads the index records themselves, so a record whose share
+    /// data is gone is cleared too. False when the store is closed or the
+    /// commit fails.
+    bool mark_shares_unverified(const std::vector<uint256>& hashes);
 
     /// Batch-update is_verified + pow_hash for multiple shares.
     bool mark_shares_verified_with_pow(const std::vector<std::pair<uint256, uint256>>& hash_pow_pairs);

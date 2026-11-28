@@ -299,6 +299,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # the same with and without it (MiningInterface::header_scrypt_count).
     # Same fold-into-core_test reasoning as every TU here.
     add_executable(core_test
+        accepted_payout_script_test.cpp
+        stratum_submit_frozen_ref_test.cpp
+        stratum_empty_login_refusal_test.cpp
+        stratum_duplicate_submit_test.cpp
+        stratum_start_difficulty_test.cpp
         addr_store_save_test.cpp
         address_coin_validation_test.cpp
         analytics_tag_test.cpp
@@ -329,6 +334,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         known_txs_backing_test.cpp
         known_txs_eviction_test.cpp
         leveldb_store_lock_test.cpp
+        sharechain_unverify_test.cpp
         listener_family_test.cpp
         merged_aux_target_le_test.cpp
         muhash_chacha20_test.cpp

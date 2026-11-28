@@ -39,6 +39,8 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 
 namespace {
@@ -110,9 +112,11 @@ TEST(DgbWorkSource, NoMergedChainInDefaultBuild)
 {
     Fixture fx;
     auto ws = fx.make();
-    // DGB V36 default build is a standalone Scrypt parent (no merged mining;
-    // -DAUX_DOGE dual-parent is a parked STRETCH).
+    // No merged-mining manager bound (standalone DGB, no --merged): no chain is
+    // merged. With --merged DOGE the manager decides
+    // (aux_doge_payout_provider_test.cpp HasMergedChainFollowsTheManager).
     EXPECT_FALSE(ws->has_merged_chain(0x0001));
+    EXPECT_FALSE(ws->has_merged_chain(98));
 }
 
 TEST(DgbWorkSource, BestShareHashFnEmptyUntilWired)
@@ -262,6 +266,8 @@ core::stratum::JobSnapshot make_job(uint32_t share_bits, const std::string& bloc
     j.block_nbits   = block_nbits;
     j.subsidy       = 500000000ULL;
     j.segwit_active = false;
+    // A job this work source built carries the producer's frozen ref.
+    j.frozen_ref.ref_hash = uint256(std::vector<unsigned char>(32, 0x5a));
     return j;
 }
 const char* kEN1 = "00000000";
@@ -283,6 +289,47 @@ TEST(DgbWorkSource, MiningSubmitWonBlockDispatchesBroadcaster)
     ASSERT_TRUE(result.is_boolean());
     EXPECT_TRUE(result.get<bool>());     // won block -> accepted reply
     EXPECT_TRUE(fx.submit_called);       // broadcaster reached
+}
+
+// A job without the producer's frozen ref (a coinbase this work source did not
+// build): its SHARE path is refused (no mint), but a won block is always
+// dispatched first and only its share is skipped.
+TEST(DgbWorkSource, MiningSubmitRefusesTheShareOfAJobWithoutFrozenRef)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    bool minted = false;
+    ws->set_mint_share_fn([&](const dgb::stratum::DGBWorkSource::MintShareInputs&) -> uint256 {
+        minted = true;
+        return uint256(std::vector<unsigned char>(32, 0x01));
+    });
+    auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"03000001");
+    job.frozen_ref.ref_hash.SetNull();
+    auto result = ws->mining_submit("DGBaddr.worker1", "job-noref", kEN1, kEN2, kNT, kNON, "rid",
+                                    /*merged_addresses=*/{}, &job);
+    ASSERT_TRUE(result.is_array()) << result.dump();
+    ASSERT_GE(result.size(), 2u);
+    EXPECT_FALSE(result[0].get<bool>());
+    EXPECT_EQ(result[1][0].get<int>(), 21);
+    EXPECT_FALSE(minted) << "no share may be minted from a job not built here";
+}
+
+TEST(DgbWorkSource, MiningSubmitAlwaysDispatchesAWonBlockEvenWithoutFrozenRef)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    bool minted = false;
+    ws->set_mint_share_fn([&](const dgb::stratum::DGBWorkSource::MintShareInputs&) -> uint256 {
+        minted = true;
+        return uint256(std::vector<unsigned char>(32, 0x01));
+    });
+    auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
+    job.frozen_ref.ref_hash.SetNull();
+    auto result = ws->mining_submit("DGBaddr.worker1", "job-noref-won", kEN1, kEN2, kNT, kNON, "rid",
+                                    /*merged_addresses=*/{}, &job);
+    EXPECT_TRUE(fx.submit_called) << "a won block was held back by the frozen-ref guard";
+    EXPECT_FALSE(minted) << "no share is minted from a job not built here";
+    EXPECT_TRUE(result.is_boolean() && result.get<bool>()) << result.dump();
 }
 
 TEST(DgbWorkSource, MiningSubmitShareAcceptDispatchesMint)
@@ -952,6 +999,59 @@ TEST(DgbWorkSource, WorkTemplateServesRealV4BitsAndPrevhash)
     ASSERT_TRUE(tmpl.contains("previousblockhash"));
     EXPECT_EQ(tmpl["previousblockhash"].get<std::string>(), expected_prev);
     EXPECT_EQ(ws->get_current_gbt_prevhash(), expected_prev);
+
+    // With the tip-recency check main_dgb arms (an hour),
+    // a header chain whose median time is older (this 2026-09 fixture) serves
+    // no work; unchecked (0) it serves the template above.
+    ws->set_tip_recent_sec(3600);
+    EXPECT_FALSE(ws->get_current_work_template().contains("bits")) << "work served from a chain behind its tip";
+    // Behind its tip, digibyted's template when the GBT
+    // fallback is bound (its prevhash, bits and height).
+    ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+        return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", "1a00ffff", 24200000};
+    });
+    const auto gbt = ws->get_current_work_template();
+    ASSERT_TRUE(gbt.contains("bits"));
+    EXPECT_EQ(gbt["bits"].get<std::string>(), "1a00ffff");
+    EXPECT_EQ(gbt["previousblockhash"].get<std::string>(), std::string(56, '0') + "0badf00d");
+    EXPECT_EQ(gbt["height"].get<uint32_t>(), 24200000u);
+    // The prevhash getter (the job push watches it)
+    // follows the same source.
+    EXPECT_EQ(ws->get_current_gbt_prevhash(), std::string(56, '0') + "0badf00d");
+    EXPECT_FALSE(ws->embedded_chain_serves());
+    ws->set_gbt_tip_fn(nullptr);
+    ws->set_tip_recent_sec(0);
+    EXPECT_TRUE(ws->get_current_work_template().contains("bits"));
+    // No latch. The chain serves while its median
+    // time is at most the bound old, and stops once it is older (no header
+    // for an hour): digibyted's template when bound, else no work.
+    int64_t now = fx.chain.median_time_past() + 60;
+    ws->set_tip_clock([&now]() { return now; });
+    ws->set_tip_recent_sec(3600);
+    const auto fresh = ws->get_current_work_template();
+    ASSERT_TRUE(fresh.contains("bits")) << "a recent tip serves no work";
+    EXPECT_EQ(fresh["previousblockhash"].get<std::string>(), expected_prev);
+    now += 3600;
+    EXPECT_FALSE(ws->embedded_chain_serves()) << "a stale tip still serves";
+    EXPECT_FALSE(ws->get_current_work_template().contains("bits")) << "work served from a stale tip";
+    ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+        return dgb::stratum::DGBWorkSource::GbtTip{std::string(56, '0') + "0badf00d", "1a00ffff", 24200000};
+    });
+    EXPECT_EQ(ws->get_current_work_template()["previousblockhash"].get<std::string>(),
+              std::string(56, '0') + "0badf00d") << "a stale tip: digibyted's template";
+    ws->set_gbt_tip_fn(nullptr);
+    ws->set_tip_clock(nullptr);
+}
+
+// main_dgb arms the tip check on mainnet only.
+TEST(DgbWorkSource, MainDgbArmsTheTipCheckOnMainnetOnly)
+{
+    std::ifstream f(DGB_MAIN_SRC);
+    ASSERT_TRUE(f.good()) << DGB_MAIN_SRC;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    EXPECT_NE(ss.str().find("        if (!testnet && !regtest)\n            work_source->set_tip_recent_sec(3600);"),
+              std::string::npos);
 }
 
 
@@ -1004,7 +1104,7 @@ TEST(DgbWorkSource, GbtTipFallbackPopulatesPrevhashAndBitsWhenChainEmpty)
     int calls = 0;
     ws->set_gbt_tip_fn([&]() -> std::optional<GbtTip> {
         ++calls;
-        return GbtTip{kPrev, kBits};
+        return GbtTip{kPrev, kBits, 123};
     });
 
     // mining.notify prevhash source (stratum_server get_current_gbt_prevhash).
@@ -1018,8 +1118,27 @@ TEST(DgbWorkSource, GbtTipFallbackPopulatesPrevhashAndBitsWhenChainEmpty)
     ASSERT_TRUE(tmpl.contains("bits"));
     EXPECT_EQ(tmpl["bits"].get<std::string>(), kBits);
 
+    // The height is the daemon's (the empty header chain has none), and so
+    // is the subsidy the template claims.
+    ASSERT_TRUE(tmpl.contains("height"));
+    EXPECT_EQ(tmpl["height"].get<uint32_t>(), 123u);
+
     // TTL cache: the two accessors above must not each trigger a fresh RPC.
     EXPECT_LE(calls, 1);
+}
+
+// A daemon template without a height: no work (the empty header chain's
+// height is its base, 0: BIP34 0 and subsidy(0)).
+TEST(DgbWorkSource, GbtTipFallbackWithoutHeightServesNoWork)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    ws->set_gbt_tip_fn([]() -> std::optional<GbtTip> {
+        return GbtTip{std::string(64, '1'), "1b0404cb", 0};
+    });
+    auto tmpl = ws->get_current_work_template();
+    EXPECT_FALSE(tmpl.contains("previousblockhash")) << tmpl.dump();
+    EXPECT_FALSE(tmpl.contains("height")) << tmpl.dump();
 }
 
 TEST(DgbWorkSource, GbtTipFallbackAbsentWhenSeamUnbound)
@@ -1063,17 +1182,20 @@ TEST(DgbWorkSource, ConnectionCoinbaseDelegatesToPplnsSsotByteIdentical)
     Fixture fx;
     auto ws = fx.make();
     const auto inputs = sample_pplns_inputs();
+    ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+        return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1b0404cb", 20000000};
+    });
 
     // Bind a producer that hands back the fixed inputs regardless of args.
     ws->set_pplns_inputs_fn(
         [&](const uint256&, const std::string&, const Script&,
-            const std::vector<std::pair<uint32_t, Script>>&)
+            const std::vector<std::pair<uint32_t, Script>>&, const Script&, const dgb::stratum::DGBWorkSource::JobBlock&)
             -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             return inputs;
         });
 
     auto wired = ws->build_connection_coinbase(
-        uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", Script{0x01}, {});
+        uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", Script{0x76, 0xa9, 0x14, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x88, 0xac}, {});
 
     // The SSOT called directly with the same inputs is the oracle.
     auto oracle = dgb::coin::build_connection_coinbase_from_pplns(inputs);
@@ -1094,17 +1216,20 @@ TEST(DgbWorkSource, ConnectionCoinbaseFreezesProducerVersionOnSnapshot)
     for (int64_t ver : {int64_t(35), int64_t(36)}) {
         Fixture fx;
         auto ws = fx.make();
+        ws->set_gbt_tip_fn([]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+            return dgb::stratum::DGBWorkSource::GbtTip{std::string(64, '1'), "1b0404cb", 20000000};
+        });
         auto inputs = sample_pplns_inputs();
         inputs.share_version   = ver;
         inputs.desired_version = 36;
         ws->set_pplns_inputs_fn(
             [&](const uint256&, const std::string&, const Script&,
-                const std::vector<std::pair<uint32_t, Script>>&)
+                const std::vector<std::pair<uint32_t, Script>>&, const Script&, const dgb::stratum::DGBWorkSource::JobBlock&)
                 -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
                 return inputs;
             });
         auto wired = ws->build_connection_coinbase(
-            uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", Script{0x01}, {});
+            uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", Script{0x76, 0xa9, 0x14, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x88, 0xac}, {});
         EXPECT_EQ(wired.snapshot.frozen_ref.share_version, ver);
         EXPECT_EQ(wired.snapshot.frozen_ref.desired_version, 36u);
     }
@@ -1116,7 +1241,7 @@ TEST(DgbWorkSource, ConnectionCoinbaseProducerNulloptYieldsEmptyJob)
     auto ws = fx.make();
     ws->set_pplns_inputs_fn(
         [&](const uint256&, const std::string&, const Script&,
-            const std::vector<std::pair<uint32_t, Script>>&)
+            const std::vector<std::pair<uint32_t, Script>>&, const Script&, const dgb::stratum::DGBWorkSource::JobBlock&)
             -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
             return std::nullopt;  // tip not yet known
         });
@@ -1126,3 +1251,21 @@ TEST(DgbWorkSource, ConnectionCoinbaseProducerNulloptYieldsEmptyJob)
 }
 
 }  // namespace
+// VARDIFF item (a): DGB sessions use the LTC / BTC / DASH hygiene profile
+// (TCP keepalive, a handshake timeout, the idle reaper backstop, a bounded
+// write queue); before, all off on DGB.
+TEST(DgbWorkSource, SessionHygieneProfile)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    const auto& c = ws->get_stratum_config();
+    EXPECT_TRUE(c.tcp_keepalive_enabled);
+    EXPECT_EQ(c.tcp_keepalive_idle_sec, 60u);
+    EXPECT_EQ(c.tcp_keepalive_interval_sec, 10u);
+    EXPECT_EQ(c.tcp_keepalive_count, 3u);
+    EXPECT_EQ(c.handshake_timeout_sec, 30u);
+    EXPECT_EQ(c.session_idle_timeout_sec, 1800u);
+    EXPECT_EQ(c.max_write_queue_depth, 256u);
+    EXPECT_EQ(c.keepalive_notify_sec, 25u);
+    EXPECT_TRUE(c.reject_duplicate_submits);
+}

@@ -26,6 +26,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <impl/nmc/coin/aux_id.hpp>          // nmc::coin::NMC_AUXPOW_CHAIN_ID (v37 bucket-2)
 #include "share_check.hpp"
 #include "think_p1_walk_bounds.hpp"  // SSOT: think_p1_walk_count / think_p1_in_pruning_zone
+#include "think_p6_desired_cutoff.hpp"  // SSOT: dormant-chain revive (ReviveState, think_p6_revive_*)
 #include "coin/naughty_propagation.hpp"  // SSOT: propagate_naughty_from_parent (data.py:543-549)
 #include <impl/dgb/coin/desired_version_tally.hpp>  // SSOT: accumulate_version_weights / accumulate_version_counts (#429 follow-on)
 #include <impl/dgb/coin/share_weight_decay.hpp>  // SSOT: weight-decay constants/half_life/decay_per_share (#450 rewire)
@@ -1487,10 +1488,24 @@ public:
         // This prevents requesting shares from stale/pruned chain tails that
         // peers no longer have. Without this, we hammer peers with unanswerable
         // requests and they eventually drop us.
+        // Dormant-chain revive (think_p6_desired_cutoff.hpp): while no head has
+        // ever verified here, a parent the cutoff drops is still requested,
+        // bounded per think and in total; ends for good once a best exists.
+        const bool revive = think_p6_revive_armed(m_revive, !best.IsNull() && chain.contains(best),
+                                                  verified.size());
+        int revive_this_think = 0;
         std::vector<std::pair<NetService, uint256>> desired_result;
         for (auto& d : desired) {
             if (d.max_timestamp >= timestamp_cutoff) {
                 desired_result.emplace_back(d.peer, d.hash);
+            } else if (think_p6_revive_take(m_revive, revive, revive_this_think)) {
+                desired_result.emplace_back(d.peer, d.hash);
+                LOG_INFO << "[REVIVE] requesting parent " << d.hash.GetHex().substr(0, 16)
+                         << " of a dormant chain (head ts=" << d.max_timestamp << ", "
+                         << ((timestamp_cutoff + 24u * 60u * 60u > d.max_timestamp)
+                                 ? (timestamp_cutoff + 24u * 60u * 60u - d.max_timestamp) / 86400u : 0u)
+                         << " d old); "
+                         << m_revive.requests_left << " revive requests left";
             } else {
                 static int filter_log = 0;
                 if (filter_log++ % 10 == 0)
@@ -1585,10 +1600,16 @@ public:
         uint32_t bits;
     };
 
+    // `share_version`: the version of the share being made. The emergency
+    // time-based decay (Step 3) is a V36 rule (p2pool-merged-v36, gated on
+    // v36_active); a V35 share's max target is the previous share's max
+    // target +-10% with no decay (the python V35 network, data.py
+    // generate_transaction), whatever the gap since the previous share.
     ShareTarget compute_share_target(
         const uint256& prev_share_hash,
         uint32_t desired_timestamp,
-        const uint256& desired_target)
+        const uint256& desired_target,
+        int64_t share_version)
     {
         // MAX_TARGET: network-specific share difficulty floor
         // Mainnet: 2^236 - 1, Testnet: 2^256/20 - 1  (from PoolConfig)
@@ -1724,7 +1745,7 @@ public:
             prev_max_target = chain::bits_to_target(obj->m_max_bits);
         });
 
-        // Step 3: Emergency time-based decay (death spiral prevention)
+        // Step 3: Emergency time-based decay (death spiral prevention), V36 only
         // Phase 1b from p2pool-v36: doubles target every SHARE_PERIOD * 10
         // seconds past the threshold of SHARE_PERIOD * 20 seconds since last share.
         uint256 clamp_ref_target = prev_max_target;
@@ -1733,7 +1754,7 @@ public:
             prev_ts = obj->m_timestamp;
         });
 
-        if (prev_ts > 0 && desired_timestamp > prev_ts)
+        if (core::version_gate::is_v36_active(share_version) && prev_ts > 0 && desired_timestamp > prev_ts)
         {
             auto time_since_share = desired_timestamp - prev_ts;
             auto emergency_threshold = PoolConfig::share_period() * 20;
@@ -2249,7 +2270,12 @@ public:
                 uint64_t amount = (uint288(subsidy) * uint288(199) * weight / (uint288(200) * total_weight)).GetLow64();
                 if (amount > 0)
                 {
-                    result[script] = static_cast<double>(amount);
+                    // V35 weights are keyed by address string: shown by script.
+                    std::vector<unsigned char> out = script;
+                    if (is_v35_weight_key(script))
+                        out = v35_address_to_script(v35_key_address(script),
+                                                    v35_address_net(PoolConfig::is_testnet)).value_or(script);
+                    result[out] += static_cast<double>(amount);
                     sum += amount;
                 }
             }
@@ -2806,6 +2832,11 @@ public:
     // (c2pool_refactored.cpp); never invoked from share verification. Peers validate
     // the merged commitment via the AuxPoW merkle proof, NOT by re-deriving these
     // outputs, so output ordering is node-local (dogecoind accepts any valid order).
+    //
+    // `resolve` (optional, node-local): maps a weight key to the script its
+    // amount is paid to instead of resolve_merged_payout_script (an empty
+    // result still means unconvertible). Only the key -> script mapping
+    // changes; the arithmetic below is the same for every caller.
     std::map<std::vector<unsigned char>, uint64_t>
     get_merged_expected_payouts(const uint256& best_share_hash,
                                 const uint256& block_target,
@@ -2813,7 +2844,10 @@ public:
                                 uint32_t chain_id,
                                 const std::vector<unsigned char>& donation_script,
                                 const std::vector<unsigned char>& operator_ltc_script = {},
-                                const std::vector<unsigned char>& operator_merged_script = {})
+                                const std::vector<unsigned char>& operator_merged_script = {},
+                                const std::function<std::vector<unsigned char>(const std::vector<unsigned char>&)>&
+                                    resolve = {},
+                                const std::function<bool(const std::vector<unsigned char>&)>& donation_sink = {})
     {
         auto chain_len = std::min(chain.get_height(best_share_hash),
                                   static_cast<int32_t>(PoolConfig::real_chain_length()));
@@ -2855,6 +2889,8 @@ public:
             std::vector<unsigned char> script;
             if (!operator_ltc_script.empty() && !operator_merged_script.empty() && key == operator_ltc_script) {
                 script = operator_merged_script;
+            } else if (resolve) {
+                script = resolve(key);
             } else {
                 script = resolve_merged_payout_script(key);
             }
@@ -2882,8 +2918,21 @@ public:
         uint64_t remainder = (total_distributed <= miners_reward) ? (miners_reward - total_distributed) : 0;
         uint64_t final_donation = donation_amount + remainder;
 
+        // `donation_sink` (optional, node-local): an entry the caller routes at
+        // least partly to the donation afterwards (the DOGE P2SH split sends
+        // a - floor(a/2) >= 1 of an amount a >= 1 there). With such an entry the
+        // >= 1 sat donation is guaranteed after the caller's step, so the
+        // deduction below is skipped and the split sees the whole amount.
+        bool sink_pays_donation = false;
+        if (donation_sink)
+            for (const auto& [scr, amt] : result)
+                if (amt >= 1 && donation_sink(scr)) {
+                    sink_pays_donation = true;
+                    break;
+                }
+
         // V36 CONSENSUS RULE: Donation must be >= 1 satoshi
-        if (final_donation < 1 && static_cast<int64_t>(subsidy) > 0 && !result.empty()) {
+        if (final_donation < 1 && static_cast<int64_t>(subsidy) > 0 && !result.empty() && !sink_pays_donation) {
             // Deduct from largest miner (deterministic tiebreak by script)
             auto largest = std::max_element(result.begin(), result.end(),
                 [](const auto& a, const auto& b) {
@@ -2910,7 +2959,12 @@ public:
     // punish/score-down shares canonical accepts, breaking the #81 zero-
     // divergence gate. Head-scoring (Phase 4) now punishes only naughty heads.
 
+public:
+    /// Dormant-chain revive state (think() Phase 6, think_p6_desired_cutoff.hpp).
+    const ReviveState& revive_state() const { return m_revive; }
+
 private:
+    ReviveState m_revive;
     std::vector<stale_callback_t> m_stale_callbacks;
 
     // -- Skip list caches for O(log n) weight queries --
@@ -3038,7 +3092,8 @@ private:
                     auto att = chain::target_to_average_attempts(target);
                     delta.total_weight = att * 65535;
                     delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
-                    auto addr_bytes = get_share_script(obj);
+                    // V34/V35 by address string (python share.address), V36 by script.
+                    auto addr_bytes = get_share_weight_key(obj);
                     delta.weights[addr_bytes] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                 });
                 return delta;

@@ -167,6 +167,13 @@ bool SharechainStorage::mark_shares_verified(const std::vector<uint256>& hashes)
     return m_leveldb_store->mark_shares_verified(hashes);
 }
 
+bool SharechainStorage::mark_shares_unverified(const std::vector<uint256>& hashes)
+{
+    if (!m_leveldb_store)
+        return false;
+    return m_leveldb_store->mark_shares_unverified(hashes);
+}
+
 bool SharechainStorage::mark_shares_verified_with_pow(
     const std::vector<std::pair<uint256, uint256>>& hash_pow_pairs)
 {

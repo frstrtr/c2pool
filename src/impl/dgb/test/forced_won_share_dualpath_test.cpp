@@ -171,7 +171,8 @@ struct Rig {
         reconstruct = make_reconstruct_closure_from_template(
             won_fields(won, sh, link),
             [gb](const uint256&) { return gb; },
-            [other](const uint256&) { return other; });
+            [other](const uint256&) { return other; },
+            /*require_share_hash=*/false);   // the forced-won seam
     }
 };
 

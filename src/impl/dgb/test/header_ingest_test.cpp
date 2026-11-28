@@ -38,6 +38,8 @@
 
 #include <gtest/gtest.h>
 
+#include <core/hash.hpp>
+
 #include <impl/dgb/coin/header_ingest.hpp>
 #include <impl/dgb/coin/node_interface.hpp>
 #include <impl/dgb/coin/header_chain.hpp>
@@ -65,11 +67,12 @@ constexpr uint32_t EASY_BITS = 0x207fffffu;
 // satisfiable PoW: starting from seed_nonce, advance the nonce until the live
 // make_header_sample scrypt(header) digest is <= the declared target. Returns a
 // header validate_and_append's now-live satisfaction gate accepts.
-BlockHeaderType satisfiable_scrypt_header(uint32_t seed_nonce, uint32_t timestamp)
+BlockHeaderType satisfiable_scrypt_header(uint32_t seed_nonce, uint32_t timestamp,
+                                          const uint256& prev = uint256())
 {
     BlockHeaderType h;
     h.m_version = 1;
-    h.m_previous_block.SetNull();
+    h.m_previous_block = prev;
     h.m_merkle_root.SetHex(
         "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b");
     h.m_timestamp = timestamp;
@@ -124,7 +127,8 @@ TEST(HeaderIngest, AnnouncedScryptHeaderIsIngested)
               u256_be_display_hex(make_header_sample(h).block_hash));
 }
 
-// 2. A multi-header batch is ingested in arrival order: the tip is the LAST
+// 2. A multi-header batch (each header on the previous one) is ingested in
+//    arrival order: the tip is the LAST
 //    header, and the chain grew by the full batch length (height delta == 1
 //    versus a single-header chain). The second header's nTime is strictly
 //    greater (MTP monotonicity gate) and its nonce-search seed distinct, so it
@@ -132,7 +136,9 @@ TEST(HeaderIngest, AnnouncedScryptHeaderIsIngested)
 TEST(HeaderIngest, BatchIngestedInArrivalOrder)
 {
     BlockHeaderType h1 = satisfiable_scrypt_header(0, 1231006505u);
-    BlockHeaderType h2 = satisfiable_scrypt_header(1000, 1231006506u);
+    // Linked: the ingest appends a header only onto its parent.
+    auto packed1 = pack(h1);
+    BlockHeaderType h2 = satisfiable_scrypt_header(1000, 1231006506u, Hash(packed1.get_span()));
 
     HeaderChain one;
     dgb::interfaces::Node node_one;

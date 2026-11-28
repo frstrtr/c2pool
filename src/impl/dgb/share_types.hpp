@@ -94,6 +94,21 @@ struct SegwitDataDefault
     }
 };
 
+// The python V35 network's none-value for segwit_data (p2pool-dgb-scrypt
+// data.py: PossiblyNoneType(dict(txid_merkle_link=dict(branch=[], index=0),
+// wtxid_merkle_root=2**256-1), ...)): a V35 share whose segwit_data equals it
+// reads as None there. A present segwit_data of a coinbase-only job ({[], 0},
+// root 0) is NOT the none-value, so it must not be written as "absent".
+struct SegwitDataDefaultV35
+{
+    static SegwitData get()
+    {
+        uint256 all_ones;
+        all_ones.SetHex(std::string(64, 'f'));
+        return SegwitData{{}, all_ones};
+    }
+};
+
 struct TxHashRefs
 {
     uint64_t m_share_count;

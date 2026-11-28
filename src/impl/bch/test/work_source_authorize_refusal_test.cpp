@@ -73,9 +73,17 @@ int run_work_source_authorize_refusal_checks()
             CHECK(v35.ws->authorize_refusal(a).empty(), a << " has a v35 form and must be accepted");
         std::cout << "[" << (g_failures == before ? "PASS" : "FAIL") << "] BchAuthorizeRefusal.LegacyFormsAccepted\n";
 
+        // The stratum server also asks about an EMPTY login now (core
+        // stratum_server.cpp mining.authorize): BCH has no reason to refuse
+        // one, so an empty login keeps today's outcome on BCH.
+        const int before_empty = g_failures;
+        CHECK(v35.ws->authorize_refusal("").empty(), "an empty login must keep today's outcome on BCH");
+        std::cout << "[" << (g_failures == before_empty ? "PASS" : "FAIL") << "] BchAuthorizeRefusal.EmptyLoginNotRefused\n";
+
         const int before36 = g_failures;
         Rig v36(36);
         CHECK(v36.ws->authorize_refusal(kP2sh32).empty(), "v36 shares carry the script: no refusal");
+        CHECK(v36.ws->authorize_refusal("").empty(), "an empty login must keep today's outcome on BCH");
         std::cout << "[" << (g_failures == before36 ? "PASS" : "FAIL") << "] BchAuthorizeRefusal.V36AuthorAcceptsEverything\n";
     } catch (const std::exception& e) {
         std::cerr << "  FAIL: threw: " << e.what() << "\n";

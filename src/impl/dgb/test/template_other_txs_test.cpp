@@ -18,6 +18,7 @@
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -182,7 +183,6 @@ TEST(DgbTemplateOtherTxs, ReconstructsBlockWithFundedTemplateTxs)
 
     auto sh = make_small_header();
     ::dgb::MerkleLink link;
-    const uint256 won = won_hash();
     auto gentx_bytes = noseg_bytes(make_gentx());
     auto ug = unpack_gentx_coinbase(gentx_bytes);
 
@@ -190,6 +190,9 @@ TEST(DgbTemplateOtherTxs, ReconstructsBlockWithFundedTemplateTxs)
     const auto other = deserialize_template_other_txs(sel.transactions);
     const auto expected =
         reconstruct_won_block_from_template(sh, link, ug.tx, ug.txid, other);
+    // The won share is the block: its hash is the rebuilt header's (the
+    // closure relays only that block).
+    const uint256 won = Hash(std::span<const unsigned char>(expected.bytes.data(), 80));
 
     // Actual: the run-loop shape -- closure pulls the per-share captured txs[]
     // through the bridge factory.

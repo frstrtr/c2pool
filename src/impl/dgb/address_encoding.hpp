@@ -17,7 +17,9 @@
 
 #include <core/address_utils.hpp>   // core::CoinAddressAcceptance (issue #961)
 
+#include <algorithm>
 #include <cstdint>
+#include <vector>
 
 namespace dgb
 {
@@ -50,6 +52,26 @@ inline core::CoinAddressAcceptance address_acceptance(bool testnet, bool regtest
         a.bech32_hrps    = { addr::BECH32_MAIN };
     }
     return a;
+}
+
+// DGB's base58 P2PKH and P2SH versions on EVERY network (mainnet 30/63,
+// testnet 126/140; regtest reuses testnet's) — StratumConfig::
+// merged_parent_versions, as main_ltc publishes LTC's: a login address DGB
+// could own is never identified as a merged chain's (core/merged_chain_addr.hpp).
+// DGB's mainnet P2PKH 30 is also DOGE's: without this a DGB "D..." primary
+// counts as a DOGE address in the login resolution.
+inline std::vector<uint8_t> merged_parent_versions()
+{
+    std::vector<uint8_t> out;
+    for (bool testnet : {false, true})
+        for (bool regtest : {false, true}) {
+            const auto a = address_acceptance(testnet, regtest);
+            for (const auto* vs : {&a.p2pkh_versions, &a.p2sh_versions})
+                for (auto v : *vs)
+                    if (std::find(out.begin(), out.end(), v) == out.end())
+                        out.push_back(v);
+        }
+    return out;
 }
 
 } // namespace dgb

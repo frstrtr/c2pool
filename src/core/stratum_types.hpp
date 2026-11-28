@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <cctype>
 #include <optional>
 #include <string>
 #include <utility>
@@ -113,6 +114,21 @@ struct StratumConfig {
     // so the DASH lane narrows it to keep those two under the template's
     // control. Default: every other coin byte-identical.
     uint32_t version_rolling_pool_mask{0x1fffe000};
+
+    // A repeated mining.submit of the same (extranonce2, ntime, nonce,
+    // version) on a job, among the submissions that pass the pseudoshare
+    // (vardiff) gate, is refused with [22, "Duplicate share"]: not counted,
+    // not dispatched (p2pool work.py received_header_hashes, filled only
+    // after pow <= pseudoshare target). Off (default): every lane
+    // byte-identical (a repeat is accepted and counted again).
+    // With it on, a submission is also refused [20, "Invalid parameters"]
+    // unless its fields have their one canonical spelling
+    // (canonical_submit_fields), so one header has one key.
+    bool reject_duplicate_submits{false};
+    // At most this many submissions are remembered per job (bounded memory
+    // on a public port); past it a job's new submissions are checked against
+    // the ones remembered but not added.
+    size_t duplicate_submit_keys_per_job{256};
 
     // ── Live-session hygiene (production ZOMBIE-SESSION LEAK fix) ──────────
     // A NAT-dropped miner's TCP connection is frequently never FIN/RST'd, so
@@ -239,6 +255,28 @@ inline PayoutKey payout_script_key(const std::vector<unsigned char>& script)
 /// creation, which refused its PoW, whenever the last job built was easier.
 /// The work source's mining_submit gets the same bits (JobSnapshot::share_bits;
 /// BTC/BCH classify the submission against them).
+/// The submission fields in their one canonical spelling, as python p2pool's
+/// stratum parses them (bitcoin/stratum.py rpc_submit: extranonce2 decoded
+/// from hex and asserted to be COINBASE_NONCE_LENGTH-4 bytes, ntime and nonce
+/// unpacked from exactly 4 bytes, version_bits at most 4 bytes): extranonce2
+/// exactly 2*extranonce2_size hex digits, ntime and nonce exactly 8, and
+/// version_bits empty or 1..8. Hex digits of either case.
+inline bool canonical_submit_fields(const std::string& extranonce2, const std::string& ntime,
+                                    const std::string& nonce, const std::string& version_bits,
+                                    size_t extranonce2_size)
+{
+    auto hex = [](const std::string& v, size_t min, size_t max) {
+        if (v.size() < min || v.size() > max)
+            return false;
+        for (unsigned char c : v)
+            if (!std::isxdigit(c))
+                return false;
+        return true;
+    };
+    return hex(extranonce2, 2 * extranonce2_size, 2 * extranonce2_size) && hex(ntime, 8, 8)
+        && hex(nonce, 8, 8) && (version_bits.empty() || hex(version_bits, 1, 8));
+}
+
 inline uint32_t pool_share_bits(uint32_t job_frozen_bits, uint32_t live_bits)
 {
     return job_frozen_bits != 0 ? job_frozen_bits : live_bits;

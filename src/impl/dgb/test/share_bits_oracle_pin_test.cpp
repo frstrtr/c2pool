@@ -93,13 +93,13 @@ TEST(DgbShareBitsOraclePin, MinTargetEncodesToZero) {
 TEST(DgbShareBitsOraclePin, GenesisMaxBitsAreOracleLiteral) {
     dgb::ShareTracker tracker;
     const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
-    auto st = tracker.compute_share_target(uint256(), kTs, MAX_TARGET);
+    auto st = tracker.compute_share_target(uint256(), kTs, MAX_TARGET, /*share_version=*/36);
     EXPECT_EQ(st.max_bits, ORACLE_BITS_MAX_TARGET);
 }
 
 TEST(DgbShareBitsOraclePin, GenesisDesiredAboveMaxClampsToOracleMaxBits) {
     dgb::ShareTracker tracker;
-    auto st = tracker.compute_share_target(uint256(), kTs, all_ones());
+    auto st = tracker.compute_share_target(uint256(), kTs, all_ones(), /*share_version=*/36);
     EXPECT_EQ(st.bits, ORACLE_BITS_MAX_TARGET);
     EXPECT_EQ(st.bits, st.max_bits);
 }
@@ -107,14 +107,14 @@ TEST(DgbShareBitsOraclePin, GenesisDesiredAboveMaxClampsToOracleMaxBits) {
 TEST(DgbShareBitsOraclePin, GenesisDesiredBelowFloorClampsToOracleMaxOver30) {
     dgb::ShareTracker tracker;
     // desired_target = 0 -> clipped up to MAX_TARGET/30 (data.py min clip).
-    auto st = tracker.compute_share_target(uint256(), kTs, uint256());
+    auto st = tracker.compute_share_target(uint256(), kTs, uint256(), /*share_version=*/36);
     EXPECT_EQ(st.bits, ORACLE_BITS_MAX_OVER_30);
 }
 
 TEST(DgbShareBitsOraclePin, GenesisDesiredInRangeEncodesToOracleMaxOver2) {
     dgb::ShareTracker tracker;
     const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
-    auto st = tracker.compute_share_target(uint256(), kTs, MAX_TARGET / 2);
+    auto st = tracker.compute_share_target(uint256(), kTs, MAX_TARGET / 2, /*share_version=*/36);
     EXPECT_EQ(st.bits, ORACLE_BITS_MAX_OVER_2);
 }
 

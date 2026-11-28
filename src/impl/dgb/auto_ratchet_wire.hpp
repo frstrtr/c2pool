@@ -31,6 +31,12 @@
 // pins the constants and hands callers the {mint, vote} version pair.
 
 #include "auto_ratchet.hpp"
+#include <utility>
+#include <system_error>
+#include <string>
+#include <mutex>
+#include <memory>
+#include <filesystem>
 
 namespace dgb
 {
@@ -59,5 +65,52 @@ inline std::pair<int64_t, int64_t> dgb_select_mint_versions(
 {
     return ratchet.get_share_version(tracker, best_share_hash);
 }
+
+// The share version policy of c2pool-dgb. Operator decision (2026-11-27):
+// hold DGB at V35 until a flag day. The live DGB network is python V35 only
+// (SUCCESSOR None): a V36 share there "can't follow" a V35 one
+// (PeerMisbehavingError, data.py), so the ratchet must never switch by itself
+// once c2pool shares reach its 95% window.
+//   Held (the default): mint V35 and vote 35, as python does (VOTING_VERSION
+//     35, so its peers log no "unsupported share implementation" majority);
+//     no AutoRatchet, so no v36_ratchet.json is read or written. A file left
+//     by an earlier build is logged and ignored.
+//   Opt-in (--v36-ratchet / sharechain.v36_ratchet): the AutoRatchet, as
+//     before (mint the baseline, vote 36, switch at the activation window).
+class DgbVersionPolicy
+{
+public:
+    DgbVersionPolicy(bool v36_ratchet, const std::string& state_file_path)
+        : state_file_(state_file_path)
+    {
+        if (v36_ratchet) {
+            ratchet_ = std::make_unique<AutoRatchet>(state_file_path, DGB_TARGET_VERSION, DGB_BASE_VERSION);
+            return;
+        }
+        std::error_code ec;
+        stale_state_file_ = !state_file_path.empty() && std::filesystem::exists(state_file_path, ec);
+    }
+
+    bool ratchet_enabled() const { return ratchet_ != nullptr; }
+    /// Held, and a persisted ratchet state file exists (ignored).
+    bool stale_state_file_ignored() const { return stale_state_file_; }
+    const std::string& state_file() const { return state_file_; }
+    AutoRatchet* ratchet() { return ratchet_.get(); }
+
+    /// The {mint, vote} pair for the next job.
+    std::pair<int64_t, int64_t> select(ShareTracker& tracker, const uint256& best_share_hash)
+    {
+        if (!ratchet_)
+            return {DGB_BASE_VERSION, DGB_BASE_VERSION};
+        std::lock_guard<std::mutex> l(mu_);
+        return dgb_select_mint_versions(*ratchet_, tracker, best_share_hash);
+    }
+
+private:
+    std::string state_file_;
+    std::unique_ptr<AutoRatchet> ratchet_;
+    std::mutex mu_;
+    bool stale_state_file_ = false;
+};
 
 } // namespace dgb

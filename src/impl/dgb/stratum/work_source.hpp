@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
+#include <limits>
 
 // dgb::stratum::DGBWorkSource — concrete `core::stratum::IWorkSource`
 // implementation for c2pool-dgb (DigiByte Scrypt-only, V36).
@@ -49,6 +50,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -105,6 +107,27 @@ public:
         /// the AutoRatchet, so the share matches the coinbase the miner hashed.
         int64_t                    share_version = 36;
         uint64_t                   desired_version = 36;
+        /// The coinbase the miner hashed (coinb1||en1||en2||coinb2): the share's
+        /// header and hash_link are built from it, so the share is the work the
+        /// miner did (the extranonce lives in its OP_RETURN nonce slot).
+        std::vector<unsigned char> actual_coinbase;
+        /// The share fields the job's ref_hash commits to (JobSnapshot::
+        /// frozen_ref, from the producer); stamped by the mint when has_frozen.
+        bool                       has_frozen = false;
+        uint32_t                   frozen_absheight = 0;
+        uint128                    frozen_abswork;
+        uint256                    frozen_far_share_hash;
+        uint32_t                   frozen_max_bits = 0;
+        uint32_t                   frozen_bits = 0;
+        uint32_t                   frozen_timestamp = 0;
+        uint256                    frozen_merged_payout_hash;
+        /// The merged-chain scripts the job's coinbase committed to (V36
+        /// merged_addresses, in the producer's order), after the node-fee rule
+        /// (effective_merged_addrs): the share carries exactly these.
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged_addrs;
+        /// The share's donation when its job set one (a split job,
+        /// JobSnapshot::share_donation); none: the node's own (--give-author).
+        std::optional<uint16_t>    donation;
     };
 
     /// Callback invoked when `mining_submit` validates a submission whose
@@ -137,11 +160,37 @@ public:
     std::string                         get_current_gbt_prevhash() const override;
     uint64_t                            get_work_generation() const override;
     bool                                has_merged_chain(uint32_t chain_id) const override;
+    // A DGB P2SH payout's auto-derived DOGE entry is dropped (its DOGE share
+    // takes the operator's P2SH split); see work_source.cpp. --redistribute
+    // split (set_split_owner): a job with no payout script (an empty login,
+    // the job sent before the login) pays the node owner, and its shares
+    // carry core::kSplitShareDonation (returned): PPLNS gives the owner and
+    // the donation half of their weight each. Decided when the job is built,
+    // so the share minted from it carries the payout and donation its
+    // coinbase committed to.
+    std::optional<uint16_t> decide_job_payout(
+        std::vector<unsigned char>& payout_script,
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged) const override;
+
+    /// --redistribute split: the node owner's DGB script (P2PKH / P2SH) the
+    /// jobs with no payout pay. Empty: off (an empty login is refused at
+    /// authorize, as before).
+    void set_split_owner(std::vector<unsigned char> script);
+    // An empty login, or a DGB address a V35 share cannot carry (P2WSH,
+    // P2TR): refused at authorize, with the reason.
+    std::string                         authorize_refusal(const std::string& username) const override;
 
     // ── IWorkSource: per-connection bookkeeping ──────────────────────────
     void register_stratum_worker(const std::string& session_id,
                                  const core::stratum::WorkerInfo& info) override;
     void unregister_stratum_worker(const std::string& session_id) override;
+    /// A copy of the registered stratum workers (the dashboard's
+    /// set_stratum_workers_fn).
+    std::map<std::string, core::stratum::WorkerInfo> snapshot_stratum_workers() const
+    {
+        std::lock_guard<std::mutex> lk(workers_mutex_);
+        return workers_;
+    }
     void update_stratum_worker(const std::string& session_id,
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
@@ -155,6 +204,33 @@ public:
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
+    // The same, for a connection's login key: the job's share target is
+    // sized by that login's local hash rate (set_local_rate_fn).
+    // `share_donation`: decide_job_payout's for the job (a split job), the
+    // donation its ref_hash commits to; none: the node's own (--give-author).
+    // `desired_share_difficulty` (the login's "/N") is not used yet: the
+    // share target stays the per-login cap.
+    core::stratum::CoinbaseResult        build_connection_coinbase_for(
+        const core::stratum::PayoutKey& login_key,
+        const uint256& prev_share_hash,
+        const std::string& extranonce1_hex,
+        const std::vector<unsigned char>& payout_script,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+        const std::optional<uint16_t>& share_donation = std::nullopt,
+        const std::optional<double>& desired_share_difficulty = std::nullopt) const override;
+
+    /// The local hash rate (attempts/s) of a login key, from the stratum
+    /// server's per-address rates (main_dgb: get_local_addr_rates); unset or
+    /// unknown: 0.
+    using LocalRateFn = std::function<double(const core::stratum::PayoutKey&)>;
+    void set_local_rate_fn(LocalRateFn fn);
+
+    /// A new session's start difficulty (dgb_start_difficulty, as the python
+    /// DGB network): node rate / 10 per second, else 3000x the dust target of
+    /// the current template. The node rate is set_node_rate_fn's (main_dgb:
+    /// the stratum server's total pseudoshare rate); unset: 0.
+    double start_difficulty(const core::stratum::PayoutKey& login_key) const override;
+    void set_node_rate_fn(std::function<double()> fn);
 
     // ── IWorkSource: share submission ────────────────────────────────────
     nlohmann::json mining_submit(
@@ -248,11 +324,33 @@ public:
     /// emitted coinbase is byte-identical to the verifier's
     /// generate_share_transaction() BY CONSTRUCTION: both delegate to the single
     /// compute_pplns_payout_split() SSOT via build_connection_coinbase_from_pplns.
+    /// `aux_mm_scriptsig`: the tagged DOGE merged-mining commitment
+    /// ([0x2c][44 B]) the producer appends to the coinbase scriptSig BEFORE it
+    /// builds the ref preimage and the coinbase; empty when merged mining is
+    /// off or has no commitment yet.
+    /// `block`: the block the job is built for, read from ONE template (the
+    /// one whose header the job carries, CoinbaseResult::snapshot.has_header):
+    /// its height (the coinbase's BIP34 height), its bits (the share's header
+    /// bits, so the PPLNS walk's block target, p2pool generate_transaction's
+    /// block_target) and the value its coinbase may claim.
+    /// `local_hash_rate`: the login's local hash rate (attempts/s; 0 unknown),
+    /// which sizes the job's share target.
+    struct JobBlock {
+        uint32_t height = 0;
+        uint32_t bits   = 0;
+        uint64_t value  = 0;
+        double   local_hash_rate = 0.0;
+        /// The job's share donation (a split job, decide_job_payout); none:
+        /// the node's own (--give-author). The ref_hash commits to it.
+        std::optional<uint16_t> share_donation;
+    };
     using PplnsInputsFn = std::function<std::optional<dgb::coin::ConnCoinbasePplnsInputs>(
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)>;
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+        const std::vector<unsigned char>& aux_mm_scriptsig,
+        const JobBlock& block)>;
     void set_pplns_inputs_fn(PplnsInputsFn fn);
 
     /// External-daemon GBT tip fallback (the fallback V36 mandates PERSIST).
@@ -273,9 +371,56 @@ public:
     struct GbtTip {
         std::string previousblockhash;  ///< GBT big-endian display hex (u256_be_display_hex convention)
         std::string bits;               ///< GBT nBits compact hex, daemon-authoritative
+        uint32_t    height = 0;         ///< GBT height (the next block's); 0 = unknown: no work
     };
     using GbtTipFn = std::function<std::optional<GbtTip>()>;
     void set_gbt_tip_fn(GbtTipFn fn);
+    /// The GBT cache's clock (seconds), a test seam; unset: std::time.
+    void set_gbt_clock(std::function<int64_t()> fn)
+    {
+        std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
+        gbt_clock_ = std::move(fn);
+    }
+
+    /// Work is served from the embedded header chain only while its tip is
+    /// recent: its median time past at most `sec` old (0, the default: not
+    /// checked). Otherwise (header sync, or a tip that stopped moving) the
+    /// GBT fallback's template is served when bound, else no work: the
+    /// embedded template would be for an old height and prevhash.
+    void set_tip_recent_sec(uint32_t sec) { tip_recent_sec_.store(sec); }
+    /// The tip-age clock (seconds), a test seam; unset: std::time.
+    void set_tip_clock(std::function<int64_t()> fn)
+    {
+        std::lock_guard<std::mutex> lk(tip_clock_mutex_);
+        tip_clock_ = std::move(fn);
+    }
+
+    /// True when work comes from the embedded header chain: it has a tip and
+    /// that tip is recent (set_tip_recent_sec); false: digibyted's GBT
+    /// template, or none. The one source choice of the template, the prevhash
+    /// getter and the work gate.
+    bool embedded_chain_serves() const;
+
+    /// Whether a template can be served now: the embedded chain serves, or
+    /// digibyted's GBT answers with a height (through the GBT cache, so at
+    /// most one getblocktemplate per TTL). The work gate's digibyted contact.
+    bool template_servable() const;
+
+    /// The stratum work gate (stratum_work_gate.hpp): a non-empty reason holds
+    /// all work (no template, so no job) and refuses mining.authorize with it;
+    /// empty serves work. Logged once per change.
+    void set_work_hold(const std::string& reason);
+    std::string work_hold() const;
+
+    /// The last template this source served (display only: the dashboard's
+    /// block value, network difficulty and height). A plain read: it never
+    /// builds a template or reaches digibyted.
+    struct TemplateSummary {
+        uint32_t height = 0;
+        uint32_t bits = 0;
+        uint64_t coinbase_value = 0;
+    };
+    std::optional<TemplateSummary> last_template_summary() const;
 
     /// Dispatch one share-difficulty submission to the bound mint callback.
     /// The stage-4d mining_submit classify branch calls this on the
@@ -328,11 +473,24 @@ public:
         config_.payout_bech32_hrps    = std::move(bech32_hrps);
     }
 
+    /// The parent coin's (DGB's) P2PKH/P2SH versions on every network, never
+    /// claimed by a merged chain when the core stratum server identifies a
+    /// login address (StratumConfig::merged_parent_versions; main_dgb binds
+    /// dgb::merged_parent_versions(), as main_ltc does for LTC).
+    void set_merged_parent_versions(std::vector<uint8_t> versions) {
+        config_.merged_parent_versions = std::move(versions);
+    }
+
     /// Node-owner fee (p2pool -f/--fee). Arms the deterministic per-(tip,
     /// connection) payout-identity substitution used by build_connection_coinbase
     /// and mining_submit. pct 0 or empty script => disabled (byte-identical to no
     /// fee). Ported from BTCWorkSource::set_node_owner_fee.
     void set_node_owner_fee(double pct, std::vector<unsigned char> script);
+
+    /// The node owner's merged-chain scripts (chain id -> script), written
+    /// into the owner's node-fee shares instead of the miner's merged
+    /// addresses. Empty (default): such shares carry no merged address.
+    void set_owner_merged_scripts(std::vector<std::pair<uint32_t, std::vector<unsigned char>>> scripts);
 
 private:
     /// Resolve the effective payout script for a job/share: the node owner's
@@ -346,6 +504,17 @@ private:
         const std::vector<unsigned char>& miner_script,
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex) const;
+
+    /// The merged addresses a job/share commits to: the miner's, unless the
+    /// node fee substituted the owner's payout (effective != miner script),
+    /// then the owner's merged scripts (set_owner_merged_scripts; none: no
+    /// merged address). A node-fee share therefore never ties the owner's
+    /// parent script to a miner's DOGE script (the tracker's per-miner merged
+    /// address table would then pay that miner for the owner's other shares).
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> effective_merged_addrs(
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& miner_merged,
+        const std::vector<unsigned char>& miner_script,
+        const std::vector<unsigned char>& effective_script) const;
 
     // External dependencies (non-owning references)
     c2pool::dgb::HeaderChain&   chain_;
@@ -387,6 +556,7 @@ private:
     // submitted username carries no valid payout address.
     mutable std::mutex          fallback_payout_mutex_;
     FallbackPayoutFn            fallback_payout_fn_;
+    std::vector<unsigned char>  split_owner_script_;   // --redistribute split (under fallback_payout_mutex_)
 
     // Node-owner fee (p2pool -f/--fee). Guarded by node_owner_fee_mutex_.
     // Default off (pct 0, empty script) => effective_payout_script returns the
@@ -394,12 +564,35 @@ private:
     mutable std::mutex          node_owner_fee_mutex_;
     double                      node_owner_fee_pct_{0.0};
     std::vector<unsigned char>  node_owner_script_;
+    std::vector<std::pair<uint32_t, std::vector<unsigned char>>> owner_merged_scripts_;
+    // P2SH payout scripts already told about the DOGE split (bounded).
+    mutable std::mutex                          p2sh_warned_mutex_;
+    // The last inline rebuild of a dirty DOGE payout cache (steady ns).
+    mutable std::atomic<int64_t>                last_inline_rebuild_ns_{std::numeric_limits<int64_t>::min() / 2};
+    mutable std::set<std::vector<unsigned char>> p2sh_warned_;
 
     // Per-connection coinbase PPLNS-inputs producer (#327/#330 live-wire).
     // Empty until set_pplns_inputs_fn() bound in main_dgb; while empty the
     // per-connection coinbase path returns an empty job (pre-wire behavior).
     mutable std::mutex          pplns_inputs_mutex_;
     PplnsInputsFn               pplns_inputs_fn_;
+    std::atomic<uint32_t>       tip_recent_sec_{0};
+    mutable std::mutex          work_hold_mutex_;
+    std::string                 work_hold_;      // under work_hold_mutex_
+    mutable std::mutex          summary_mutex_;
+    mutable std::optional<TemplateSummary> summary_;   // under summary_mutex_
+    mutable std::atomic<int>    tip_state_{-1};   // last logged: 1 at tip, 0 behind/held, 2 behind/GBT
+    mutable std::mutex          tip_clock_mutex_;
+    std::function<int64_t()>    tip_clock_;      // under tip_clock_mutex_
+    int64_t tip_age() const;   // seconds since the chain's median time past
+    mutable std::mutex          local_rate_mutex_;
+    LocalRateFn                 local_rate_fn_;
+    std::function<double()>     node_rate_fn_;   // under local_rate_mutex_
+    core::stratum::CoinbaseResult build_coinbase(
+        const uint256& prev_share_hash, const std::string& extranonce1_hex,
+        const std::vector<unsigned char>& payout_script,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+        double local_hash_rate, const std::optional<uint16_t>& share_donation) const;
 
     // Embedded DGB-as-DOGE-parent merged-mining manager (set_merged_mining_manager).
     // Non-owning; null unless a --merged DOGE spec armed the aux backend in
@@ -417,6 +610,8 @@ private:
     GbtTipFn                      gbt_tip_fn_;
     mutable std::optional<GbtTip> gbt_tip_cache_;
     mutable int64_t               gbt_tip_cache_time_ = 0;
+    mutable int64_t               gbt_tip_fail_time_ = 0;   // last failed GBT (negative cache)
+    std::function<int64_t()>      gbt_clock_;               // under gbt_tip_mutex_
     static constexpr int64_t      GBT_TIP_TTL_SECONDS = 5;
 
     // Resolve the external-daemon GBT tip fallback (previousblockhash + bits),

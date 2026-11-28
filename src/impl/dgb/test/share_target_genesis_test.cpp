@@ -39,14 +39,14 @@ constexpr uint32_t kTs = 1700000000u;
 TEST(DgbShareTargetGenesis, MaxBitsFromMaxTarget) {
     dgb::ShareTracker tracker;
     const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
-    auto st = tracker.compute_share_target(uint256(), kTs, MAX_TARGET);
+    auto st = tracker.compute_share_target(uint256(), kTs, MAX_TARGET, /*share_version=*/36);
     EXPECT_EQ(st.max_bits, chain::target_to_bits_upper_bound(MAX_TARGET));
 }
 
 TEST(DgbShareTargetGenesis, DesiredAboveMaxClampsToMax) {
     dgb::ShareTracker tracker;
     const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
-    auto st = tracker.compute_share_target(uint256(), kTs, all_ones());
+    auto st = tracker.compute_share_target(uint256(), kTs, all_ones(), /*share_version=*/36);
     // bits_target clipped to MAX_TARGET -> bits == max_bits.
     EXPECT_EQ(st.bits, chain::target_to_bits_upper_bound(MAX_TARGET));
     EXPECT_EQ(st.bits, st.max_bits);
@@ -59,7 +59,7 @@ TEST(DgbShareTargetGenesis, DesiredBelowFloorClampsToMaxOver30) {
     const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
     const uint256 floor = MAX_TARGET / 30;
     // desired_target = 0 -> clipped up to MAX_TARGET/30 (data.py min clip).
-    auto st = tracker.compute_share_target(uint256(), kTs, uint256());
+    auto st = tracker.compute_share_target(uint256(), kTs, uint256(), /*share_version=*/36);
     EXPECT_EQ(st.bits, chain::target_to_bits_upper_bound(floor));
 }
 
@@ -67,7 +67,7 @@ TEST(DgbShareTargetGenesis, DesiredInRangePreserved) {
     dgb::ShareTracker tracker;
     const uint256 MAX_TARGET = dgb::PoolConfig::max_target();
     const uint256 mid = MAX_TARGET / 2;  // within (MAX_TARGET/30, MAX_TARGET)
-    auto st = tracker.compute_share_target(uint256(), kTs, mid);
+    auto st = tracker.compute_share_target(uint256(), kTs, mid, /*share_version=*/36);
     EXPECT_EQ(st.bits, chain::target_to_bits_upper_bound(mid));
     // invariant: MAX_TARGET/30 <= resulting target <= MAX_TARGET.
     const uint256 tgt = chain::bits_to_target(st.bits);

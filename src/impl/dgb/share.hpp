@@ -60,7 +60,7 @@ struct BaseShare : chain::BaseShare<uint256, Version>
     // [x]address[>=34] or [x]pubkey_hash[<34]
     uint64_t m_subsidy;                 // subsidy
     uint16_t m_donation;                // donation
-    dgb::StaleInfo m_stale_info;        // stale_info
+    dgb::StaleInfo m_stale_info{dgb::StaleInfo::none}; // stale_info
     uint64_t m_desired_version;         // desired_version
     //
     // [x] segwit_data [if segwit_activated]
@@ -193,7 +193,11 @@ struct Formatter
 
         if constexpr (is_segwit_activated(version))
         {
-            READWRITE(Optional(obj->m_segwit_data, SegwitDataDefault));
+            // V35: python's none-value (root 2**256-1); V36: the zero sentinel.
+            if constexpr (core::version_gate::is_v36_active(version))
+                READWRITE(Optional(obj->m_segwit_data, SegwitDataDefault));
+            else
+                READWRITE(Optional(obj->m_segwit_data, SegwitDataDefaultV35));
         }
 
         // V36: merged_addresses (after segwit_data, before far_share_hash)

@@ -13,6 +13,7 @@
 #include <map>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <iomanip>
 #include <sstream>
 #include <ctime>
@@ -174,6 +175,11 @@ private:
         uint32_t frozen_timestamp{0};
         uint256  frozen_merged_payout_hash;
         uint256  frozen_witness_root;                  // wtxid_merkle_root at template time
+        // The ref the job's coinbase committed to (its OP_RETURN) and that
+        // coinbase's last_txout_nonce, for work sources that check or rebuild
+        // the share at submit (DGB). Carried as built; no lane rewrites them.
+        uint256  frozen_ref_hash;
+        uint64_t frozen_last_txout_nonce{0};
         bool     has_frozen{false};
         int64_t  share_version{36};    // AutoRatchet-determined share version at template time
         uint64_t desired_version{36};  // Version vote
@@ -194,6 +200,10 @@ private:
         bool has_payout{false};
         std::vector<unsigned char> payout_script;
         std::map<uint32_t, std::vector<unsigned char>> merged_scripts;
+        // The (extranonce2, ntime, nonce, version) submissions seen on this
+        // job (StratumConfig::reject_duplicate_submits); shared so the per-
+        // submit job copy stays cheap. Lives as long as the job.
+        std::shared_ptr<std::unordered_set<std::string>> submitted;
         // The donation its ref_hash committed to, when decide_job_payout set
         // one (a split job); none: the node's own.
         std::optional<uint16_t> share_donation;
@@ -262,6 +272,8 @@ private:
     std::chrono::steady_clock::time_point last_lowdiff_log_{};
     std::chrono::steady_clock::time_point last_badparams_log_{};
     static constexpr std::chrono::seconds REJECT_LOG_INTERVAL{5};
+    // The extranonce2 size mining.subscribe announces, in bytes.
+    static constexpr int EXTRANONCE2_SIZE = 4;
 
     // Merged mining: per-chain payout addresses set by the miner.
     std::map<uint32_t, std::string> merged_addresses_;
@@ -307,6 +319,7 @@ private:
 
     // Suggested difficulty from miner (mining.suggest_difficulty)
     double suggested_difficulty_ = 0.0;
+    bool   start_difficulty_applied_ = false;   // IWorkSource::start_difficulty, first authorize only
 
     // Per-miner SHARE difficulty from a colon-less "ADDR/<diff>" login token
     // (p2pool desired_share_target), set by every authorize. Unset when absent

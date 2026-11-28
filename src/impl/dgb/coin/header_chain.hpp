@@ -47,6 +47,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include <impl/dgb/coin/dgb_arith256.hpp>
@@ -92,6 +93,10 @@ struct HeaderSample {
     // 19-field positional brace-inits in the tests stay valid (each just omits
     // it, defaulting to 0). make_header_sample fills it from the wire header.
     uint32_t n_bits     = 0;
+    // The parent's block id (hashPrevBlock), little-endian as block_hash; 0 ==
+    // not populated. The ingest links on it (header_ingest.hpp): a header is
+    // appended only onto its parent. LAST field, for the positional inits.
+    u256     prev_hash  = 0;
 };
 
 // Outcome of validating + ingesting one header.
@@ -187,6 +192,86 @@ inline u256 digishield_next_target(const RetargetWindow& rw,
     return bn_new;
 }
 
+// ── Header work (DigiByte Core GetBlockProof) ───────────────────────────────
+namespace work_detail {
+inline u256 bit_not(const u256& a)
+{
+    u256 r;
+    for (int i = 0; i < 4; ++i)
+        r.limb[i] = ~a.limb[i];
+    return r;
+}
+// a - b modulo 2^256.
+inline u256 sub(const u256& a, const u256& b)
+{
+    u256 r;
+    uint64_t borrow = 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t x = a.limb[i], y = b.limb[i];
+        r.limb[i] = x - y - borrow;
+        borrow = (x < y || (x == y && borrow)) ? 1 : 0;
+    }
+    return r;
+}
+// floor(n / d), d != 0: bitwise long division, the remainder carried at 257
+// bits (a remainder shifted past 2^256 is above d, so d is taken off).
+inline u256 div(const u256& n, const u256& d)
+{
+    u256 q, r;
+    for (int bit = 255; bit >= 0; --bit) {
+        const bool carry = (r.limb[3] >> 63) != 0;
+        for (int i = 3; i > 0; --i)
+            r.limb[i] = (r.limb[i] << 1) | (r.limb[i - 1] >> 63);
+        r.limb[0] = (r.limb[0] << 1) | ((n.limb[bit / 64] >> (bit % 64)) & 1u);
+        if (carry || !(r < d)) {
+            r = sub(r, d);
+            q.limb[bit / 64] |= uint64_t(1) << (bit % 64);
+        }
+    }
+    return q;
+}
+} // namespace work_detail
+
+/// The work of a header of `target`: floor(2^256 / (target + 1)), as
+/// DigiByte Core's GetBlockProof computes it ((~target / (target + 1)) + 1).
+/// 0 for a zero target (never credited).
+inline u256 header_work(const u256& target)
+{
+    if (target.is_zero())
+        return u256{};
+    u256 plus_one = target;
+    plus_one += u256(1);
+    if (plus_one.is_zero())   // target == 2^256 - 1
+        return u256(1);
+    u256 w = work_detail::div(work_detail::bit_not(target), plus_one);
+    w += u256(1);
+    return w;
+}
+
+/// Whether a compact nBits is one DigiByte Core's SetCompact marks negative
+/// (the sign bit with a non-zero mantissa) or overflowing (a mantissa that
+/// does not fit 256 bits at its exponent): CheckProofOfWork refuses both.
+inline bool compact_negative_or_overflow(uint32_t bits)
+{
+    const uint32_t size = bits >> 24;
+    const uint32_t word = bits & 0x007fffffu;
+    if (word == 0)
+        return false;
+    if (bits & 0x00800000u)
+        return true;
+    return size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32);
+}
+
+/// a + b, saturating at 2^256 - 1.
+inline u256 saturating_add(const u256& a, const u256& b)
+{
+    u256 r = a;
+    r += b;
+    if (r < a)
+        return work_detail::bit_not(u256{});
+    return r;
+}
+
 // Work-neutral header chain with a Scrypt-only DigiShield retarget body.
 // Append order is oldest..newest; the retarget walk reads nearest-first.
 class HeaderChain {
@@ -220,7 +305,7 @@ public:
             // PoW validate path. A zero target is not a validatable Scrypt
             // header (the structural guard here is that a malformed target
             // never credits work).
-            if (h.target.is_zero())
+            if (h.target.is_zero() || compact_negative_or_overflow(h.n_bits))
                 return IngestResult::REJECTED;
 
             // Minimum-difficulty ceiling (DigiByte Core CheckProofOfWork
@@ -286,7 +371,7 @@ public:
             if (h.n_time <= median_time_past())
                 return IngestResult::REJECTED;
 
-            m_chain.push_back(h);
+            push_header(h, header_work(h.target));
             m_cumulative_work += work_from_target(h.target);  // credited
             trim_to_window();
             return IngestResult::VALIDATED_SCRYPT;
@@ -296,7 +381,7 @@ public:
         default:
             // Extends the header chain; work-neutral (NO m_cumulative_work
             // change) and excluded from the retarget window by construction.
-            m_chain.push_back(h);
+            push_header(h, u256{});
             trim_to_window();
             return IngestResult::ACCEPTED_CONTINUITY;
         }
@@ -386,6 +471,102 @@ public:
     // fills it at the validate_and_append boundary, so until that lands this
     // returns nullopt and get_current_work_template holds previousblockhash
     // back -- a truthful absence, never a fabricated hash.
+    // The position (0 == oldest retained) of the header with block id `hash`
+    // in the retained window, searched from the tip back; none if not there.
+    // O(1) through the block-id index (every retained header with an id).
+    std::optional<std::size_t> find_index(const u256& hash) const
+    {
+        if (hash.is_zero())
+            return std::nullopt;
+        const auto range = m_index.equal_range(hash.limb[0]);
+        for (auto it = range.first; it != range.second; ++it) {
+            const uint64_t pos = it->second - m_front_seq;
+            if (pos < m_chain.size() && m_chain[pos].block_hash == hash)
+                return static_cast<std::size_t>(pos);
+        }
+        return std::nullopt;
+    }
+
+    // Drops every header after position `index` (a reorg onto a fork from
+    // m_chain[index]): the header there becomes the tip. Heights stay
+    // positional (tip_height() == base + index). cumulative_work is the
+    // monotone proxy of credited work (see trim_to_window) and is not
+    // decremented (no production path reads it).
+    void truncate_after(std::size_t index)
+    {
+        while (m_chain.size() > index + 1)
+            pop_back_header();
+    }
+
+    // The headers after position `index`, oldest first (what truncate_after
+    // would drop), and their restore: appended back as they were, without
+    // validating again (they were validated in this same context).
+    std::vector<HeaderSample> tail_after(std::size_t index) const
+    {
+        std::vector<HeaderSample> out;
+        for (std::size_t i = index + 1; i < m_chain.size(); ++i)
+            out.push_back(m_chain[i]);
+        return out;
+    }
+    void restore_tail(const std::vector<HeaderSample>& tail)
+    {
+        for (const auto& h : tail)
+            push_header(h, header_credit(h));
+        trim_to_window();
+    }
+
+    // The Scrypt work `h` is credited with when it is appended: its
+    // header_work when it is a Scrypt header whose nBits is neither negative
+    // nor overflowing and whose target is non-zero, at most pow_limit (when
+    // set) and met by its scrypt hash; else 0 (a non-Scrypt header carries
+    // no work here). The context-free half of
+    // validate_and_append: the MTP check can still refuse it.
+    u256 header_credit(const HeaderSample& h) const
+    {
+        if (dgb_header_disposition(h.n_version) != HeaderDisposition::VALIDATE_SCRYPT || h.target.is_zero()
+            || compact_negative_or_overflow(h.n_bits))
+            return u256{};
+        if (!m_ds_params.pow_limit.is_zero() && h.target > m_ds_params.pow_limit)
+            return u256{};
+        if (h.pow_hash > h.target)
+            return u256{};
+        return header_work(h.target);
+    }
+
+    // The Scrypt work credited to the headers after position `index` (the
+    // branch a fork from m_chain[index] would replace).
+    u256 work_after(std::size_t index) const
+    {
+        if (index + 1 >= m_chain_work.size())
+            return u256{};
+        return work_detail::sub(m_chain_work.back(), m_chain_work[index]);
+    }
+
+    // A getheaders block locator (DigiByte Core CChain::GetLocator shape):
+    // the tip, the 10 headers below it one by one, then steps doubling back
+    // to the oldest retained header. Only headers with a populated id. Empty
+    // for an empty chain. The coin node finds the fork point from it, so a tip it
+    // does not have (a stale block) no longer makes it answer from genesis.
+    std::vector<u256> locator() const
+    {
+        std::vector<u256> out;
+        if (m_chain.empty())
+            return out;
+        // Core: push, step back by nStep, and double nStep once more than
+        // 10 are in.
+        std::size_t step = 1;
+        for (std::size_t i = m_chain.size() - 1;;) {
+            if (!m_chain[i].block_hash.is_zero())
+                out.push_back(m_chain[i].block_hash);
+            if (i == 0)
+                break;
+            i = i >= step ? i - step : 0;
+            if (out.size() > 10)
+                step *= 2;
+        }
+        return out;
+    }
+
     std::optional<u256> tip_hash() const
     {
         if (m_chain.empty() || m_chain.back().block_hash.is_zero())
@@ -502,7 +683,7 @@ private:
     void trim_to_window()
     {
         while (m_chain.size() > HEADER_WINDOW_CAP) {
-            m_chain.pop_front();
+            pop_front_header();
             ++m_base_height;
         }
     }
@@ -537,7 +718,62 @@ private:
     // access here is positional / back() / size(), all O(1) on a deque, so the
     // container swap from std::vector is behaviour-preserving for consumers.
     std::deque<HeaderSample>  m_chain;          // oldest .. newest (<= CAP)
+    // Block id (low limb) -> the header's sequence number; position ==
+    // sequence - m_front_seq. Every push / pop keeps it in step.
+    std::unordered_multimap<uint64_t, uint64_t> m_index;
+    uint64_t                  m_front_seq = 0;    // sequence number of m_chain.front()
+    // The Scrypt work credited through each retained header (a running sum
+    // from the chain's start, saturating; in step with m_chain): the work of
+    // a range is a difference.
+    std::deque<u256>          m_chain_work;
+
+    void push_header(const HeaderSample& h, const u256& credit)
+    {
+        const uint64_t seq = m_front_seq + m_chain.size();
+        const u256 before = m_chain_work.empty() ? m_work_floor : m_chain_work.back();
+        m_chain.push_back(h);
+        m_chain_work.push_back(saturating_add(before, credit));
+        if (!h.block_hash.is_zero())
+            m_index.emplace(h.block_hash.limb[0], seq);
+    }
+    void unindex(const HeaderSample& h, uint64_t seq)
+    {
+        if (h.block_hash.is_zero())
+            return;
+        const auto range = m_index.equal_range(h.block_hash.limb[0]);
+        for (auto it = range.first; it != range.second; ++it)
+            if (it->second == seq) {
+                m_index.erase(it);
+                return;
+            }
+    }
+    void pop_front_header()
+    {
+        unindex(m_chain.front(), m_front_seq);
+        m_chain.pop_front();
+        m_work_floor = m_chain_work.front();
+        m_chain_work.pop_front();
+        ++m_front_seq;
+    }
+    void pop_back_header()
+    {
+        unindex(m_chain.back(), m_front_seq + m_chain.size() - 1);
+        m_chain.pop_back();
+        m_chain_work.pop_back();
+    }
+    u256                      m_work_floor{};   // the running sum below m_chain_work.front()
     uint64_t                  m_cumulative_work = 0;
 };
+
+/// The live header chain's parameters (main_dgb): DigiByte's Scrypt
+/// powLimit, ~uint256(0) >> 20 (compact 0x1e0fffff) on mainnet and testnet,
+/// 0x207fffff on regtest. No retarget window (the served bits come from the
+/// MultiShield V4 walk).
+inline DigiShieldParams dgb_live_header_params(bool regtest)
+{
+    DigiShieldParams p;
+    p.pow_limit = regtest ? ::dgb::coin::compact_to_target(0x207fffffu) : ::dgb::coin::multishield_pow_limit();
+    return p;
+}
 
 } // namespace c2pool::dgb

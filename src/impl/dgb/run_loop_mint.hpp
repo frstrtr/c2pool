@@ -33,6 +33,8 @@
 #include <optional>
 #include <vector>
 
+#include <btclibs/span.h>
+#include <btclibs/util/strencodings.h>      // HexStr (the V35 commitment gate)
 #include <core/pack.hpp>                  // PackStream, operator>>
 #include <core/pack_types.hpp>            // BaseScript
 #include <core/uint256.hpp>
@@ -117,9 +119,9 @@ inline uint256 mint_local_share_with_ratchet(
 // in.share_version / in.desired_version (JobSnapshot::frozen_ref). Re-asking
 // here could pick a different version if the ratchet moved between template
 // and submit, and the rebuilt gentx would no longer match the coinbase the miner
-// hashed. Every other argument mirrors the producer: no merged addrs (standalone
-// DGB parent) and segwit_active=false (the producer emits a non-segwit
-// coinbase). The caller owns the tracker lock and the header parse.
+// hashed. The mined coinbase and the job's frozen share fields are stamped when
+// the inputs carry them (has_frozen); segwit_active=false (the producer emits a
+// non-segwit coinbase). The caller owns the tracker lock and the header parse.
 template <typename TrackerT, typename InputsT>
 inline uint256 mint_local_share_at_frozen_version(
     const InputsT&                      in,
@@ -131,21 +133,61 @@ inline uint256 mint_local_share_at_frozen_version(
     BaseScript coinbase;
     coinbase.m_data = in.coinbase_bytes;
 
+    // The mined coinbase and the job's frozen share fields, when the inputs
+    // carry them (DGBWorkSource::MintShareInputs does): the share is then the
+    // work the miner hashed and commits to the job's ref, as on the BTC lane.
+    // Inputs without them (has_frozen false, no coinbase) rebuild as before.
+    std::vector<unsigned char> actual_coinbase;
+    bool has_frozen = false;
+    uint32_t f_absheight = 0, f_max_bits = 0, f_bits = 0, f_timestamp = 0;
+    uint128 f_abswork;
+    uint256 f_far, f_merged_payout_hash;
+    std::vector<MergedAddressEntry> merged_addrs;
+    if constexpr (requires { in.merged_addrs; }) {
+        merged_addrs.reserve(in.merged_addrs.size());
+        for (const auto& [chain_id, script] : in.merged_addrs) {
+            MergedAddressEntry e;
+            e.m_chain_id = chain_id;
+            e.m_script.m_data = script;
+            merged_addrs.push_back(std::move(e));
+        }
+    }
+    if constexpr (requires { in.has_frozen; in.actual_coinbase; }) {
+        actual_coinbase = in.actual_coinbase;
+        has_frozen = in.has_frozen;
+        if (has_frozen) {
+            f_absheight = in.frozen_absheight;
+            f_abswork = in.frozen_abswork;
+            f_far = in.frozen_far_share_hash;
+            f_max_bits = in.frozen_max_bits;
+            f_bits = in.frozen_bits;
+            f_timestamp = in.frozen_timestamp;
+            f_merged_payout_hash = in.frozen_merged_payout_hash;
+        }
+    }
+
+    const bool v35_segwit = !core::version_gate::is_v36_active(static_cast<int64_t>(in.share_version))
+                            && static_cast<int64_t>(in.share_version) >= dgb::SEGWIT_ACTIVATION_VERSION;
+    const std::vector<unsigned char> v35_commitment =
+        v35_segwit ? p2pool_witness_commitment_script(uint256()) : std::vector<unsigned char>{};
     return create_local_share(
         tracker, params, min_header, coinbase,
         in.subsidy, in.prev_share, in.merkle_branches,
         in.payout_script,
         donation,
-        std::vector<MergedAddressEntry>{},
+        merged_addrs,                        // the job's merged addresses (V36 shares carry them)
         StaleInfo::none,
-        /*segwit_active=*/false,             // producer emits non-segwit coinbase
-        std::string{},                       // witness_commitment_hex
+        // V35 shares carry segwit_data (the producer's coinbase-only {[], 0,
+        // root 0}, with the P2Pool witness commitment in the coinbase).
+        v35_segwit,                          // segwit_active
+        v35_segwit ? HexStr(Span<const unsigned char>(v35_commitment.data(), v35_commitment.size()))
+                   : std::string{},          // witness_commitment_hex (the gate)
         std::vector<unsigned char>{},        // message_data
-        std::vector<unsigned char>{},        // actual_coinbase_bytes
+        actual_coinbase,                     // actual_coinbase_bytes (the mined coinbase)
         uint256(),                           // witness_root
-        0u, 0u,                              // override_max_bits / override_bits
-        0u, uint128(), uint256(), 0u, uint256(),
-        /*has_frozen=*/false,
+        f_max_bits, f_bits,                  // override_max_bits / override_bits
+        f_absheight, f_abswork, f_far, f_timestamp, f_merged_payout_hash,
+        has_frozen,
         std::vector<uint256>{}, uint256(),
         std::vector<unsigned char>{},
         static_cast<int64_t>(in.share_version),     // frozen at template time

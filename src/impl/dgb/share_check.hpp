@@ -5,6 +5,7 @@
 // Ported from legacy sharechains/data.cpp + sharechains/share.cpp
 
 #include "config_pool.hpp"
+#include "address_encoding.hpp"   // dgb::address_acceptance (v34/v35 address decode, network versions)
 #include "share.hpp"
 #include "share_messages.hpp"
 #include "share_types.hpp"
@@ -28,8 +29,11 @@
 #include <btclibs/base58.h>
 #include <btclibs/bech32.h>
 #include <core/address_utils.hpp>
+#include <impl/dgb/coin/p2pool_witness_nonce.hpp>   // P2POOL_WITNESS_NONCE
+#include <impl/dgb/v35_address.hpp>   // v35_address_to_script: the python network's V34/V35 address rule
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstring>
 #include <stdexcept>
@@ -51,14 +55,8 @@ inline bool version_switch_underweight(const uint288& new_ver_weight,
     return new_ver_weight < (total_weight * uint32_t(60)) / uint288(100);
 }
 
-// P2Pool witness nonce: '[P2Pool]' repeated 4 times = 32 bytes
+// P2Pool witness nonce ('[P2Pool]'*4): coin/p2pool_witness_nonce.hpp.
 // Used for witness commitment: SHA256d(wtxid_merkle_root || P2POOL_WITNESS_NONCE)
-static const unsigned char P2POOL_WITNESS_NONCE[32] = {
-    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
-    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
-    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
-    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
-};
 
 // Compute P2Pool witness commitment hash from raw wtxid merkle root.
 // Returns SHA256d(root || '[P2Pool]'*4)
@@ -66,6 +64,16 @@ inline uint256 compute_p2pool_witness_commitment(const uint256& wtxid_merkle_roo
     uint256 nonce;
     std::memcpy(nonce.data(), P2POOL_WITNESS_NONCE, 32);
     return Hash(wtxid_merkle_root, nonce);
+}
+
+// The P2Pool witness commitment output script: 0x6a24aa21a9ed ||
+// SHA256d(wtxid_merkle_root || '[P2Pool]'*4) (p2pool data.py generate_transaction).
+inline std::vector<unsigned char> p2pool_witness_commitment_script(const uint256& wtxid_merkle_root)
+{
+    std::vector<unsigned char> s = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+    const uint256 c = compute_p2pool_witness_commitment(wtxid_merkle_root);
+    s.insert(s.end(), c.data(), c.data() + 32);
+    return s;
 }
 
 // ============================================================================
@@ -485,6 +493,15 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     return {ref_hash, nonce};
 }
 
+// Whether V36 shares are accepted (main_dgb: the --v36-ratchet opt-in; held at
+// V35 without it). The library default accepts them (tests, tools).
+inline std::atomic<bool>& v36_shares_accepted_flag()
+{
+    static std::atomic<bool> accepted{true};
+    return accepted;
+}
+inline bool v36_shares_accepted() { return v36_shares_accepted_flag().load(std::memory_order_relaxed); }
+
 // Thread-local state from share_init_verify — read by attempt_verify() without re-computing scrypt.
 inline thread_local bool g_last_init_is_block = false;
 inline thread_local uint256 g_last_pow_hash;  // scrypt hash of the share header
@@ -522,6 +539,36 @@ uint256 share_init_verify(const ShareT& share, const core::CoinParams& params, b
     // --- Basic validation ---
     if (share.m_coinbase.size() < 2 || share.m_coinbase.size() > 100)
         throw std::invalid_argument("bad coinbase size");
+
+    // While DGB is held at V35 (no --v36-ratchet), a V36 share is refused:
+    // the python V35 network cannot load one.
+    if constexpr (core::version_gate::is_v36_active(ShareT::version))
+        if (!v36_shares_accepted())
+            throw std::invalid_argument("V36 share while DGB shares are held at V35");
+
+    // V35 is segwit-activated on the python network: a V35 share without
+    // segwit_data (python's None) fails there (Share.__init__ reads
+    // share_info['segwit_data']['txid_merkle_link']).
+    if constexpr (ShareT::version >= dgb::SEGWIT_ACTIVATION_VERSION
+                  && !core::version_gate::is_v36_active(ShareT::version))
+        if constexpr (requires { share.m_segwit_data; })
+            if (!share.m_segwit_data.has_value()
+                || (share.m_segwit_data->m_txid_merkle_link.m_branch.empty()
+                    && share.m_segwit_data->m_wtxid_merkle_root == SegwitDataDefaultV35::get().m_wtxid_merkle_root))
+                // (the wire none-value {[], root 2**256-1} reads back as present here)
+                throw std::invalid_argument("V35 share without segwit_data");
+
+    // V34/V35: the python network turns the share's address into its payout
+    // script or rejects the share (p2pool-dgb-scrypt Share.__init__:
+    // address_to_script2); this node rejects exactly those (before, an
+    // undecodable or foreign address fell back to raw bytes, a dgb1p bech32m
+    // address was accepted, an uppercase one misread).
+    if constexpr (requires { share.m_address; })
+    {
+        const std::string addr(share.m_address.m_data.begin(), share.m_address.m_data.end());
+        if (!v35_address_to_script(addr, v35_address_net(PoolConfig::is_testnet)))
+            throw std::invalid_argument("share address is not payable on this network");
+    }
 
     if (share.m_merkle_link.m_branch.size() > 16)
         throw std::invalid_argument("merkle branch too long");
@@ -941,8 +988,27 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
     else if constexpr (requires { obj->m_address; })
     {
         // V34/V35: m_address contains a human-readable address string.
-        // Convert to scriptPubKey for PPLNS weight computation.
+        // Convert to scriptPubKey for PPLNS weight computation, with the DGB
+        // network's own version bytes / HRPs first, as the oracle does
+        // (p2pool bitcoin/data.py address_to_script2(address, net.PARENT)):
+        // the chain-agnostic address_to_script does not know DGB's P2SH (0x3f)
+        // or "dgb", so it read an "S..." as a P2PKH and a "dgb1..." as nothing,
+        // and every such share's generation transaction came out wrong.
         std::string addr_str(obj->m_address.m_data.begin(), obj->m_address.m_data.end());
+        // The python network's own rule, exactly (v35_address.hpp): D/S
+        // base58 with DGB's versions, BIP173 bech32 read with padding_bugfix.
+        // A share whose address it rejects is rejected at share_init_verify;
+        // the fallbacks below only ever see such unverified shares.
+        if (auto oracle = v35_address_to_script(addr_str, v35_address_net(PoolConfig::is_testnet)))
+            return *oracle;
+        {
+            core::CoinAddressAcceptance net = address_acceptance(PoolConfig::is_testnet, false);
+            if (PoolConfig::is_testnet)   // regtest: testnet base58 bytes, its own HRP
+                net.bech32_hrps.push_back(addr::BECH32_REGTEST);
+            std::vector<unsigned char> own;
+            if (core::classify_address_for_coin(addr_str, net, own) == core::AddressCoinMatch::Own)
+                return own;
+        }
         auto script = core::address_to_script(addr_str);
         if (!script.empty())
             return script;
@@ -951,6 +1017,17 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
     }
     else
         return pubkey_hash_to_script(obj->m_pubkey_hash, 0);
+}
+
+// The PPLNS weight key of a share: V34/V35 shares by their ADDRESS STRING
+// (tagged, v35_weight_key), as the python V35 network keys them
+// (WeightsSkipList: share.address); V36 shares by script.
+inline std::vector<unsigned char> get_share_weight_key(const auto* obj)
+{
+    if constexpr (requires { obj->m_address; })
+        return v35_weight_key(std::string(obj->m_address.m_data.begin(), obj->m_address.m_data.end()));
+    else
+        return get_share_script(obj);
 }
 
 // ============================================================================
@@ -1056,7 +1133,9 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
     // pre-V36 formulae, 0.5% finder fee, >=1-sat V36 donation floor with the
     // (amount, script) tiebreak, and the ascending sort truncated to [-4000:]).
     // Reference: frstrtr/p2pool-merged-v36 data.py generate_transaction().
-    auto finder_script = get_share_script(&share);
+    // Pre-V36: the finder is keyed like the weights, by the share's address
+    // string as it carries it (get_share_weight_key).
+    auto finder_script = use_v36_pplns ? get_share_script(&share) : get_share_weight_key(&share);
     auto pplns_split = dgb::coin::compute_pplns_payout_split(
         weights, total_weight, subsidy, use_v36_pplns, finder_script);
     auto& payout_outputs = pplns_split.payout_outputs;
@@ -1564,6 +1643,73 @@ std::string verify_merged_coinbase_commitment(
 }
 
 // ============================================================================
+// check_v35_share_info()
+//
+// The python V35 network regenerates every share's share_info from the chain
+// and its own share_data, and rejects the share unless it is EQUAL
+// (p2pool-dgb-scrypt data.py check():520-553 -> generate_transaction):
+//   max_bits      = from the pool rate over TARGET_LOOKBEHIND, clamped to the
+//                   previous share's max target +-10% (no decay on V35);
+//   bits          = clip(the share's own target, (pre_target3//30,
+//                   pre_target3)): equal iff inside that range;
+//   timestamp     = max(its own, previous + 1);
+//   absheight     = previous + 1;
+//   abswork       = previous + target_to_average_attempts(bits);
+//   far_share_hash= None if the chain ends < 99 back, else the 99th parent.
+// This node verified only the generation transaction, so it accepted (and
+// built on) V35 shares python rejects. Python decides only once the chain
+// behind the share is rooted or at least REAL_CHAIN_LENGTH long
+// (get_height_and_last's assert); so does this check. Throws on a mismatch.
+// ============================================================================
+template <typename ShareT, typename TrackerT>
+void check_v35_share_info(const ShareT& share, TrackerT& tracker, const core::CoinParams& params)
+{
+    if (share.m_prev_hash.IsNull() || !tracker.chain.contains(share.m_prev_hash))
+        return;
+    // One height source with attempt_verify (the accumulated height, which
+    // survives pruning): python decides once the chain is
+    // rooted or REAL_CHAIN_LENGTH long, and so does attempt_verify before it
+    // gets here; a walk height cut short by a pruned tail no longer skips the
+    // check.
+    const int32_t prev_height = tracker.chain.get_acc_height(share.m_prev_hash);
+    const uint256 last = tracker.chain.get_last(share.m_prev_hash);
+    if (!(prev_height >= static_cast<int32_t>(params.real_chain_length) || last.IsNull()))
+        return;   // python has not decided either
+
+    uint32_t prev_ts = 0, prev_absheight = 0;
+    uint128 prev_abswork;
+    tracker.chain.get(share.m_prev_hash).share.invoke([&](auto* prev) {
+        prev_ts = prev->m_timestamp;
+        prev_absheight = prev->m_absheight;
+        prev_abswork = prev->m_abswork;
+    });
+
+    if (share.m_timestamp < prev_ts + 1)
+        throw std::invalid_argument("share_info invalid: timestamp not after the previous share's");
+    if (share.m_absheight != prev_absheight + 1)
+        throw std::invalid_argument("share_info invalid: absheight");
+    {
+        const auto att = chain::target_to_average_attempts(chain::bits_to_target(share.m_bits));
+        if (share.m_abswork != prev_abswork + uint128(att.GetLow64()))
+            throw std::invalid_argument("share_info invalid: abswork");
+    }
+    {
+        uint256 far;
+        if (!(last.IsNull() && prev_height < 99))
+            far = tracker.chain.get_nth_parent_key(share.m_prev_hash, 99);
+        if (share.m_far_share_hash != far)
+            throw std::invalid_argument("share_info invalid: far_share_hash");
+    }
+    const auto st = tracker.compute_share_target(share.m_prev_hash, share.m_timestamp,
+                                                 chain::bits_to_target(share.m_bits),
+                                                 static_cast<int64_t>(ShareT::version));
+    if (st.max_bits != share.m_max_bits)
+        throw std::invalid_argument("share_info invalid: max_bits");
+    if (st.bits != share.m_bits)
+        throw std::invalid_argument("share_info invalid: bits");
+}
+
+// ============================================================================
 // share_check()
 //
 // The check()-phase verification after init:
@@ -1671,6 +1817,9 @@ bool share_check(const ShareT& share,
     // the AutoRatchet transitions to ACTIVATED.
     constexpr int64_t share_ver = ShareT::version;
     bool v36_active = (core::version_gate::is_v36_active(share_ver));
+    // V34/V35: share_info must be exactly what the python network regenerates.
+    if constexpr (share_ver >= 34 && !core::version_gate::is_v36_active(share_ver))
+        check_v35_share_info(share, tracker, params);
     if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
     {
         uint256 expected_gentx = generate_share_transaction(share, tracker, params, false, v36_active);
@@ -1704,7 +1853,8 @@ bool share_check(const ShareT& share,
                 static int target_diag = 0;
                 if (target_diag++ < 10) {
                     auto [cst_max_bits, cst_bits] = tracker.compute_share_target(
-                        share.m_prev_hash, share.m_timestamp, uint256());
+                        share.m_prev_hash, share.m_timestamp, uint256(),
+                        static_cast<int64_t>(ShareT::version));
                     auto share_aps = tracker.get_pool_attempts_per_second(
                         share.m_prev_hash, params.target_lookbehind, true);
                     LOG_WARNING << "[GENTX-TARGET] share_bits=0x" << std::hex << share.m_bits
@@ -2070,7 +2220,7 @@ uint256 create_local_share_v35(
     // Compute share target
     auto desired_target = chain::bits_to_target(min_header.m_bits);
     auto [share_max_bits, share_bits] = tracker.compute_share_target(
-        prev_share, share.m_timestamp, desired_target);
+        prev_share, share.m_timestamp, desired_target, /*share_version=*/35);
     share.m_max_bits   = share_max_bits;
     share.m_bits       = share_bits;
     share.m_nonce      = 0;
@@ -2221,12 +2371,22 @@ uint256 create_local_share_v35(
     uint256 hash_ref = Hash(ref_span_v);
     uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
 
-    // Use ref_hash from actual coinbase if available
+    // The mined coinbase commits (its OP_RETURN) to the ref the job froze.
+    // The share made here must carry exactly that ref: when the ref computed
+    // from the share's own fields differs, the share is DECLINED. Taking the
+    // coinbase's ref instead made a share whose
+    // fields python regenerates to another ref ("share PoW invalid", a
+    // PeerMisbehavingError there).
     if (!actual_coinbase_bytes.empty() && actual_coinbase_bytes.size() > 44) {
         uint256 coinbase_ref_hash;
         std::memcpy(coinbase_ref_hash.data(),
                      actual_coinbase_bytes.data() + actual_coinbase_bytes.size() - 44, 32);
-        ref_hash = coinbase_ref_hash;
+        if (coinbase_ref_hash != ref_hash) {
+            LOG_WARNING << "[DGB-MINT] V35 share DECLINED: the ref of its fields ("
+                        << ref_hash.GetHex().substr(0, 16) << ") is not the mined coinbase's ("
+                        << coinbase_ref_hash.GetHex().substr(0, 16) << ")";
+            return uint256();
+        }
     }
 
     // --- Derive hash_link (V35: HashLinkType, no extra_data) ---
@@ -2264,32 +2424,13 @@ uint256 create_local_share_v35(
             }
         }
 
-        std::map<std::vector<unsigned char>, uint64_t> amounts;
-        if (!total_weight.IsNull()) {
-            for (auto& [script, weight] : weights) {
-                // V35: 99.5% to PPLNS — subsidy * 199 * weight / (200 * total_weight)
-                uint64_t amount = (uint288(subsidy) * uint288(199) * weight
-                                   / (uint288(200) * total_weight)).GetLow64();
-                if (amount > 0) amounts[script] = amount;
-            }
-        }
-        // V35: add 0.5% finder fee to the share creator's payout script
-        amounts[payout_script] = (amounts.count(payout_script) ? amounts[payout_script] : 0)
-                                 + subsidy / 200;
-        uint64_t sum_amounts = 0;
-        for (auto& [s, a] : amounts) sum_amounts += a;
-        // V35: no minimum donation enforcement (unlike v36)
-        uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
-
-        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-            amounts.begin(), amounts.end());
-        std::sort(payout_outputs.begin(), payout_outputs.end(),
-            [](const auto& a, const auto& b) {
-                if (a.second != b.second) return a.second < b.second;
-                return a.first < b.first;
-            });
-        if (payout_outputs.size() > 4000)
-            payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - 4000);
+        // V35 amounts (99.5% by weight + the 0.5% finder fee, no >=1-sat
+        // donation rule) and the python output order: the payout split SSOT
+        // the producer and the verifier use (pplns_payout_split.hpp).
+        const auto split = dgb::coin::compute_pplns_payout_split(weights, total_weight, subsidy,
+                                                                 /*use_v36_pplns=*/false, payout_script);
+        const uint64_t donation_amount = split.donation_amount;
+        const auto& payout_outputs = split.payout_outputs;
 
         PackStream gentx;
         { uint32_t v = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&v), 4)); }
@@ -2485,7 +2626,7 @@ uint256 create_local_share(
     // Compute pool-level share target AFTER timestamp clipping (matches ref_hash_fn).
     auto desired_target = chain::bits_to_target(min_header.m_bits);
     auto [share_max_bits, share_bits] = tracker.compute_share_target(
-        prev_share, share.m_timestamp, desired_target);
+        prev_share, share.m_timestamp, desired_target, share_version);
     share.m_max_bits   = share_max_bits;
     share.m_bits       = share_bits;
 
