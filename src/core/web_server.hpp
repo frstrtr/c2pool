@@ -2900,9 +2900,19 @@ public:
     // Best Share card legs only (no ring / counters). Raises the primary
     // all_time / session / round legs and, when update_merged, the merged
     // all_time / round legs. Python p2pool work.py update_best_difficulty.
+    // Each raised leg keeps the network difficulty in effect for the hash:
+    // net_diff_at_share for the primary legs (the difficulty of the job's
+    // block bits; <= 0: the node's network difficulty at record time) and,
+    // for the merged legs, the difficulty of the current aux work (the
+    // target try_submit_merged_blocks compares against).
     void update_best_difficulty(double difficulty, const std::string& miner,
                                 const std::string& pow_hash_hex = "",
-                                bool update_merged = true);
+                                bool update_merged = true,
+                                double net_diff_at_share = 0.0);
+    // Difficulty of compact block bits given as 8-char BE hex (stratum /
+    // GBT "bits"): target_to_difficulty(bits_to_target(bits)), the value the
+    // stratum block check and refresh_work compute. 0 on malformed input.
+    static double bits_hex_to_difficulty(const std::string& nbits_hex);
     // True when update_best_difficulty(difficulty, ..., update_merged) would
     // raise a leg: the cheap gate a caller runs before it rebuilds the share's
     // hash for the card.
@@ -3014,9 +3024,27 @@ private:
         std::string merged_round_miner;
         uint64_t merged_round_ts{0};
         uint64_t merged_round_start{0};
+        // Network difficulty in effect for each leg's hash when it was
+        // recorded (update_best_difficulty); 0 = unknown (an all-time leg
+        // loaded from a sidecar older than v3). pct_of_block reads these.
+        double all_time_net_diff{0.0};
+        double session_net_diff{0.0};
+        double round_net_diff{0.0};
+        double merged_all_time_net_diff{0.0};
+        double merged_round_net_diff{0.0};
     };
     BestDifficulty m_best_difficulty;
     mutable std::mutex m_best_diff_mutex;
+    // Difficulty of the first aux chain's current work (2^224 / target), the
+    // aux network difficulty /best_share serves; 0 without merged mining.
+    // symbol (optional) receives that chain's symbol. Takes the merged
+    // manager's lock: never call with m_best_diff_mutex held.
+    double merged_network_difficulty_now(std::string* symbol = nullptr) const;
+    // One served Best Share leg: difficulty, network_difficulty_at_share,
+    // pct_of_block and pct_basis. pct_of_block is against at_share when it
+    // is known (pct_basis "at_share"), else against live (pct_basis
+    // "current"); 0 when neither is known.
+    static nlohmann::json best_share_leg_json(double difficulty, double at_share, double live);
     // ── ALL-TIME best-share persistence ─────────────────────────────────
     // Measured (primary node, 2026-08-05, uptime 36 min): /local_stats
     // best_share showed all_time == session == round — the "all-time" leg

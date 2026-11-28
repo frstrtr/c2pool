@@ -2058,14 +2058,15 @@ TEST(DashboardData, PreFixLtcBestShareSidecarIsDropped)
         EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 0.0)
             << "a peer's share target came back as this node's record";
         EXPECT_FALSE(bs["has_best_share"].get<bool>());
-        // The first local hash starts the record; the file is rewritten as v2.
+        // The first local hash starts the record; the file is rewritten as
+        // the current version (v3: v2 plus the at-share difficulty).
         best_pseudoshare(mi, 900.0, "w1");
         mi.save_stat_log();
     }
     {
         std::ifstream f(side);
         const auto j = nlohmann::json::parse(f);
-        EXPECT_EQ(j.value("v", 0), 2);
+        EXPECT_EQ(j.value("v", 0), 3);
         EXPECT_DOUBLE_EQ(j.value("difficulty", 0.0), 900.0);
     }
     {
@@ -2075,7 +2076,7 @@ TEST(DashboardData, PreFixLtcBestShareSidecarIsDropped)
         mi.load_stat_log();
         const auto bs = mi.rest_best_share();
         EXPECT_DOUBLE_EQ(bs["all_time"]["difficulty"].get<double>(), 900.0)
-            << "a v2 file is this node's own record";
+            << "a v3 file is this node's own record";
         EXPECT_EQ(bs["all_time"]["miner"].get<std::string>(), "w1");
     }
 

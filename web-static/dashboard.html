@@ -3891,6 +3891,31 @@
             // average under a "Best Share / \u{1F3C6} record" label.
             var hasBest = (bs.has_best_share !== false) &&
                           bs.round && bs.round.difficulty > 0;
+            // pct_of_block is against the network difficulty in effect when
+            // the share was found (network_difficulty_at_share, pct_basis
+            // "at_share"). pct_basis "current" (a record kept from before that
+            // was stored), or no pct_basis (an older node): against the live
+            // difficulty, marked by a tooltip and a dotted underline.
+            var atShare = function(e) {
+                return !!(e && e.pct_basis === 'at_share' && e.network_difficulty_at_share > 0);
+            };
+            var shareNetDiff = function(e, live) {
+                return atShare(e) ? e.network_difficulty_at_share : live;
+            };
+            var markBasis = function(sel, e, shown, title_at, title_current) {
+                var current = shown && !atShare(e);
+                d3.select(sel)
+                  .attr('title', shown ? (current ? title_current : title_at) : null)
+                  .style('text-decoration', current ? 'underline dotted' : null);
+            };
+            var markPct = function(sel, e, shown) {
+                markBasis(sel, e, shown, 'vs network difficulty when the share was found',
+                          'vs current difficulty');
+            };
+            var markNetDiff = function(sel, e, shown) {
+                markBasis(sel, e, shown, 'network difficulty when the share was found',
+                          'current difficulty');
+            };
             if (hasBest) {
                 d3.select('#best_share_round_pct_fancy').html(format_pct_fancy(bs.round.pct_of_block));
                 d3.select('#best_share_round_diff').text(format_difficulty(bs.round.difficulty));
@@ -3900,7 +3925,11 @@
                 d3.select('#best_share_round_diff').text('no record yet');
                 d3.select('#best_share_alltime_pct_fancy').html('\u2014');
             }
-            d3.select('#best_share_net_diff').text(format_difficulty(bs.network_difficulty));
+            markPct('#best_share_round_pct_fancy', bs.round, hasBest);
+            markPct('#best_share_alltime_pct_fancy', bs.all_time, hasBest);
+            d3.select('#best_share_net_diff').text(format_difficulty(
+                hasBest ? shareNetDiff(bs.round, bs.network_difficulty) : bs.network_difficulty));
+            markNetDiff('#best_share_net_diff', bs.round, hasBest);
             // Record-share hash (the exact hash that got closest to a block).
             var recHash = (bs.round && bs.round.hash) ? bs.round.hash
                         : ((bs.all_time && bs.all_time.hash) ? bs.all_time.hash : '');
@@ -3916,13 +3945,19 @@
                 hl.style('display', 'none');
             }
             if (bs.merged) {
+                var mr = bs.merged.round, ma = bs.merged.all_time;
+                var mrShown = !!(mr && mr.difficulty > 0), maShown = !!(ma && ma.difficulty > 0);
                 d3.select('#best_share_merged_round_part').style('display', 'inline');
                 d3.select('#best_share_merged_pct_fancy').html(format_pct_fancy(bs.merged.round.pct_of_block));
+                markPct('#best_share_merged_pct_fancy', mr, mrShown);
                 d3.select('#best_share_merged_record_part').style('display', 'inline');
                 d3.select('#best_share_merged_alltime_pct_fancy').html(format_pct_fancy(bs.merged.all_time.pct_of_block));
+                markPct('#best_share_merged_alltime_pct_fancy', ma, maShown);
                 d3.select('#best_share_merged_diff_part').style('display', 'inline');
                 d3.select('#best_share_merged_round_diff').text(format_difficulty(bs.merged.round.difficulty));
-                d3.select('#best_share_merged_net_diff').text(format_difficulty(bs.merged.network_difficulty));
+                d3.select('#best_share_merged_net_diff').text(format_difficulty(
+                    mrShown ? shareNetDiff(mr, bs.merged.network_difficulty) : bs.merged.network_difficulty));
+                markNetDiff('#best_share_merged_net_diff', mr, mrShown);
             }
             if (bs.median_pct != null) {
                 d3.select('#best_share_median_part').style('display', 'inline');
