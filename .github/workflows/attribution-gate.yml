@@ -38,12 +38,29 @@ jobs:
           # run and reds clean PRs when a runner link drops packets. Bound the
           # fetch to the PR own commits. GitHub Actions expressions have NO
           # arithmetic operators (commits + 1 is a compile-time startup
-          # failure), so we deepen by one commit below to reach the merge base;
-          # the scan step keeps its git log -50 HEAD fallback if unreachable.
+          # failure), so the next step fetches the merge commit's parents and
+          # the base; the scan step keeps its git log -50 HEAD fallback if the
+          # base is unreachable.
           fetch-depth: ${{ github.event.pull_request.commits || 50 }}
 
-      - name: Deepen one commit to reach the PR merge base
-        run: git fetch --deepen=1 || true
+      - name: Fetch the parents of the PR merge commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # The checkout holds only the PR merge commit for a one-commit PR
+          # (fetch-depth 1). A fetch without a refspec deepens origin's
+          # branches, not this detached commit, and `--deepen=1 origin <sha>`
+          # returns 0 without moving its shallow boundary. `--depth=2` on the
+          # merge commit brings both parents: the base it merges into and the
+          # PR head. Only when the first parent is missing, because --depth can
+          # also shorten a deeper history.
+          merge=$(git rev-parse HEAD)
+          if ! git cat-file -e "${merge}^1" 2>/dev/null; then
+            git fetch --no-tags --depth=2 origin "${merge}" || true
+          fi
+          # The PR base, for the commit-message range below.
+          git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
+            || git fetch --no-tags --depth=1 origin "${BASE_SHA}" || true
 
       - name: Scan commits, PR metadata and added lines for AI attribution
         env:
@@ -65,7 +82,7 @@ jobs:
           # parent, the base it merges into.
           merge=$(git rev-parse HEAD)
           if ! git cat-file -e "${merge}^1" 2>/dev/null; then
-            git fetch --deepen=1 || true
+            git fetch --no-tags --depth=2 origin "${merge}" || true
           fi
           diff=""
           if git cat-file -e "${merge}^1" 2>/dev/null; then

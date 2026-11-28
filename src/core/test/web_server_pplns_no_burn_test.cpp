@@ -145,7 +145,8 @@ struct Rig {
                               const core::stratum::PayoutKey&, uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
                               const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
                               const std::vector<uint256>&,
-                              const std::optional<uint16_t>&) {
+                              const std::optional<uint16_t>&,
+                              const std::optional<double>&) {
             MiningInterface::RefHashResult r;
             r.ref_hash.SetHex(std::string(64, '5'));
             r.bits = 0x207fffff;
@@ -382,7 +383,8 @@ TEST(PplnsNoBurn, ConcurrentJobsPayTheirOwnShareAtTheirOwnTemplateValue)
                            const core::stratum::PayoutKey&, uint64_t, uint32_t, uint32_t, bool, const std::string&, const uint256&,
                            const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
                            const std::vector<uint256>&,
-                           const std::optional<uint16_t>&) {
+                           const std::optional<uint16_t>&,
+                           const std::optional<double>&) {
         MiningInterface::RefHashResult r;
         if (busy.load())
             return r;   // the LTC hook: null while the tracker is busy
