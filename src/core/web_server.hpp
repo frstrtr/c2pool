@@ -616,7 +616,10 @@ public:
         const std::vector<uint256>& merkle_branches,
         // The job's share donation (decide_job_payout: a split job); none:
         // the node's own. The ref_hash commits to the one the share carries.
-        const std::optional<uint16_t>& share_donation)>;
+        const std::optional<uint16_t>& share_donation,
+        // The login's "/N" (IWorkSource::build_connection_coinbase_for
+        // desired_share_difficulty); none: no "/N".
+        const std::optional<double>& desired_share_difficulty)>;
     void set_ref_hash_fn(ref_hash_fn_t fn) { m_ref_hash_fn = std::move(fn); }
 
     // Atomically snapshot work-related fields under m_work_mutex.
@@ -638,15 +641,17 @@ public:
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
     // The same for the stratum connection whose login key is `login_key`:
-    // the share target is sized by the local rate of `login_key`, and the
-    // shares carry `share_donation` (decide_job_payout's; none: the node's).
+    // the share target is sized by the local rate of `login_key`, or by the
+    // login's "/N" (`desired_share_difficulty`), and the shares carry
+    // `share_donation` (decide_job_payout's; none: the node's).
     CoinbaseResult build_connection_coinbase_for(
         const core::stratum::PayoutKey& login_key,
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-        const std::optional<uint16_t>& share_donation = std::nullopt) const override;
+        const std::optional<uint16_t>& share_donation = std::nullopt,
+        const std::optional<double>& desired_share_difficulty = std::nullopt) const override;
 
     // Hook: called by mining_submit() pool path to create a share in the tracker.
     // All block template data needed by create_local_share() is passed through.
@@ -2461,12 +2466,14 @@ private:
     std::atomic<uint64_t> m_refresh_without_pplns{0};
     void note_job_held(const char* why) const;
     // build_connection_coinbase(_for): the job's share target is sized by the
-    // local hash rate of `rate_key` (passed to ref_hash_fn).
+    // local hash rate of `rate_key`, or by the login's "/N"
+    // (`desired_share_difficulty`), both passed to ref_hash_fn.
     CoinbaseResult build_job_coinbase(const uint256& prev_share_hash, const std::string& extranonce1_hex,
                                       const std::vector<unsigned char>& payout_script,
                                       const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
                                       const core::stratum::PayoutKey& rate_key,
-                                      const std::optional<uint16_t>& share_donation) const;
+                                      const std::optional<uint16_t>& share_donation,
+                                      const std::optional<double>& desired_share_difficulty) const;
 public:
     uint64_t jobs_held() const { return m_jobs_held.load(std::memory_order_relaxed); }
     uint64_t refreshes_without_pplns() const { return m_refresh_without_pplns.load(std::memory_order_relaxed); }

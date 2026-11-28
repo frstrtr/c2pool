@@ -182,14 +182,22 @@ public:
     /// the job it replaced but for its payout. `share_donation` is the one
     /// decide_job_payout returned for the job (none: the node's own); a work
     /// source whose decide_job_payout sets one commits its shares to it.
-    /// Default: the plain build (the default decide_job_payout sets none).
+    /// `desired_share_difficulty` is the login's "/N" (none: no "/N"), read
+    /// once for the job: p2pool get_user_details' desired_share_target =
+    /// difficulty_to_target(N) (chain::difficulty_to_target), which get_work
+    /// takes in place of its per-miner caps, then clips into the chain's band
+    /// as any desired target. A work source that sizes a job's share target
+    /// per miner uses it; one that does not ignores it.
+    /// Default: the plain build (the default decide_job_payout sets none;
+    /// `desired_share_difficulty` ignored).
     virtual CoinbaseResult build_connection_coinbase_for(
         const PayoutKey& /*login_key*/,
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-        const std::optional<uint16_t>& /*share_donation*/ = std::nullopt) const
+        const std::optional<uint16_t>& /*share_donation*/ = std::nullopt,
+        const std::optional<double>& /*desired_share_difficulty*/ = std::nullopt) const
     {
         return build_connection_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs);
     }

@@ -1478,7 +1478,7 @@ MiningInterface::build_connection_coinbase(
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
 {
     return build_job_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs,
-                              core::stratum::payout_script_key(payout_script), std::nullopt);
+                              core::stratum::payout_script_key(payout_script), std::nullopt, std::nullopt);
 }
 
 MiningInterface::CoinbaseResult
@@ -1488,12 +1488,14 @@ MiningInterface::build_connection_coinbase_for(
     const std::string& extranonce1_hex,
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-    const std::optional<uint16_t>& share_donation) const
+    const std::optional<uint16_t>& share_donation,
+    const std::optional<double>& desired_share_difficulty) const
 {
     // Sized by the login's key, the key its pseudoshares are recorded under
     // (zero for a keyless login): a fee or redistributed job is its miner's.
+    // The login's "/N" goes to ref_hash_fn with it.
     return build_job_coinbase(prev_share_hash, extranonce1_hex, payout_script, merged_addrs, login_key,
-                              share_donation);
+                              share_donation, desired_share_difficulty);
 }
 
 MiningInterface::CoinbaseResult
@@ -1503,7 +1505,8 @@ MiningInterface::build_job_coinbase(
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
     const core::stratum::PayoutKey& rate_key,
-    const std::optional<uint16_t>& share_donation) const
+    const std::optional<uint16_t>& share_donation,
+    const std::optional<double>& desired_share_difficulty) const
 {
     // ── Lock hierarchy: m_work_mutex (1) > sessions_mutex_ (2) > MM::m_mutex (3) ──
     //
@@ -1876,7 +1879,7 @@ MiningInterface::build_job_coinbase(
         prev_share_hash,
         scriptsig_bytes, payout_script, rate_key, subsidy, bits, timestamp,
         ws.segwit_active, ws.witness_commitment, effective_witness_root,
-        merged_addrs, branches_u256, share_donation);
+        merged_addrs, branches_u256, share_donation, desired_share_difficulty);
     LOG_TRACE << "[build_cb] ref_hash_fn returned, bits=" << std::hex << rhr.bits << std::dec;
     if (rhr.ref_hash.IsNull()) {
         // No ref_hash (the tracker is busy): every share of a coinbase

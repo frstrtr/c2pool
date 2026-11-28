@@ -2,6 +2,11 @@
 
 #include <core/uint256.hpp>
 
+#include <cmath>
+#include <cstdint>
+#include <optional>
+#include <string>
+
 namespace chain
 {
 
@@ -104,6 +109,37 @@ inline double target_to_difficulty(const uint288& target)
     uint288 max_target;
     max_target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
     return max_target.getdouble() / target.getdouble();
+}
+
+// p2pool bitcoin/data.py difficulty_to_target for a float difficulty > 0:
+//   min(int((0xffff0000 * 2**(256-64) + 1)/difficulty - 1 + 0.5), 2**256-1)
+// evaluated as python does it: the numerator rounds to the double
+// 0xffff * 2**208, then one IEEE division, "- 1", "+ 0.5", and int()
+// truncates the double exactly. Difficulty 1 is 0x00000000ffff0000...
+// (the same unit as target_to_difficulty). None where python's int() raises
+// (the quotient overflows a double: difficulty below ~1e-241, or not a finite
+// number > 0); p2pool's get_user_details catches that and sets no target.
+inline std::optional<uint256> difficulty_to_target(double difficulty)
+{
+    if (!(difficulty > 0.0) || !std::isfinite(difficulty))
+        return std::nullopt;
+    const double q = std::ldexp(65535.0, 208) / difficulty - 1.0 + 0.5;
+    if (!std::isfinite(q))
+        return std::nullopt;
+    uint256 max_t;
+    max_t.SetHex(std::string(64, 'f'));
+    if (q >= std::ldexp(1.0, 256))
+        return max_t;
+    if (!(q >= 1.0))
+        return uint256();   // int() of a value in (-1, 1)
+    int exp = 0;
+    const double m = std::frexp(q, &exp);   // q = m * 2**exp, 0.5 <= m < 1
+    if (exp <= 64)
+        return uint256(static_cast<uint64_t>(q));
+    // q >= 2**64 is an integer: its 53 significant bits, shifted into place.
+    uint256 t(static_cast<uint64_t>(std::ldexp(m, 64)));
+    t <<= static_cast<unsigned int>(exp - 64);
+    return t;
 }
 
 } // namespace chain
