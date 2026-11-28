@@ -343,6 +343,7 @@ static void segfault_handler(int sig) {
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 #include <btclibs/util/strencodings.h>
+#include <core/sha256_init.hpp>
 
 // Bring the address validation types into scope
 using Blockchain = c2pool::address::Blockchain;
@@ -865,6 +866,9 @@ static int dump_doge_schedule_anchors(const std::string& dir, const std::string&
 }
 
 int main(int argc, char* argv[]) {
+    // SHA-256 implementation (SSE4 / AVX2 / SHA-NI when the CPU has them),
+    // self-tested, before any thread starts: core/sha256_init.hpp.
+    core::init_sha256();
     // --version: a pure query, answered before anything else runs (data dir,
     // crash handlers, logger, the RLIMIT notice, settings, network), so stdout
     // carries exactly this one line on every platform. Same shape as

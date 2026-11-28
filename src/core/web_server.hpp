@@ -526,13 +526,20 @@ public:
 
     // Fully self-contained difficulty calculation: all template data passed in.
     // Does NOT acquire m_work_mutex — safe to call from any thread.
+    // pow_out (optional): receives the 80-byte header hashed and its scrypt
+    // digest (not valid when the header could not be built).
     static double calculate_share_difficulty(
         const std::string& coinb1, const std::string& coinb2,
         const std::string& extranonce1, const std::string& extranonce2,
         const std::string& ntime, const std::string& nonce,
         uint32_t version, const std::string& prevhash_hex,
         const std::string& nbits_hex,
-        const std::vector<std::string>& merkle_branches);
+        const std::vector<std::string>& merkle_branches,
+        core::stratum::SharePow* pow_out = nullptr);
+
+    /// Scrypt computations over a block header in this file's code, since
+    /// process start: the KAT seam that counts the submit path's hashes.
+    static uint64_t header_scrypt_count();
 
     /// IWorkSource virtual override: LTC uses scrypt, so delegate to the
     /// existing scrypt-based static `calculate_share_difficulty` directly.
@@ -548,6 +555,22 @@ public:
         return calculate_share_difficulty(coinb1, coinb2, extranonce1, extranonce2,
                                           ntime, nonce, version, prevhash_hex,
                                           nbits_hex, merkle_branches);
+    }
+
+    /// The same, handing back the header and its scrypt digest, which the
+    /// stratum session passes to mining_submit (JobSnapshot::gate_pow).
+    double compute_share_difficulty_pow(
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches,
+        core::stratum::SharePow& pow) const override
+    {
+        return calculate_share_difficulty(coinb1, coinb2, extranonce1, extranonce2,
+                                          ntime, nonce, version, prevhash_hex,
+                                          nbits_hex, merkle_branches, &pow);
     }
 
     // Hook: returns the best share hash from the share tracker (for prev_hash wiring)
@@ -2180,13 +2203,16 @@ private:
     // Needs only the 80-byte parent header (first 160 hex chars of header_hex),
     // the coinbase parts and the merkle branches — never the block body.
     // Returns true if a merged block was found (for twin block detection)
+    // parent_pow: the header's scrypt digest when the caller has it (used only
+    // for the header bytes it was computed from); else it is computed here.
     bool check_merged_mining(const std::string& header_hex,
                              const std::string& extranonce1,
                              const std::string& extranonce2,
                              const JobSnapshot* job = nullptr,
                              const std::string& miner = "",
                              const uint256& share_hash = uint256(),
-                             const std::vector<unsigned char>& miner_script = {});
+                             const std::vector<unsigned char>& miner_script = {},
+                             const core::stratum::SharePow* parent_pow = nullptr);
     
     // Internal state
     uint64_t m_work_id_counter;

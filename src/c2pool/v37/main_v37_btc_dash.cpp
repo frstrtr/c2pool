@@ -174,6 +174,7 @@
 #include <c2pool/v37/w3_relay.hpp>                    // CarrierRelay
 #include <c2pool/v37/w3_wire_freeze.hpp>              // W3-B5 freeze: boot selfcheck + relay policy gate
 #include <c2pool/v37/v37_drops_wiring.hpp>            // ★ DROPS Step 2: DropsWiring, make_drops_wiring
+#include <core/sha256_init.hpp>
 
 namespace io = boost::asio;
 using namespace c2pool::v37n::btc;
@@ -238,6 +239,9 @@ static void usage() {
 }
 
 int main(int argc, char** argv) {
+    // SHA-256 implementation (SSE4 / AVX2 / SHA-NI when the CPU has them),
+    // self-tested, before any thread starts: core/sha256_init.hpp.
+    core::init_sha256();
     // ── flags ────────────────────────────────────────────────────────────────
     BtcNodeConfig cfg;
     cfg.coin    = BtcFamilyCoin::Dash;

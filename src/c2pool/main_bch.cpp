@@ -68,6 +68,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <core/sha256_init.hpp>
 
 #ifndef C2POOL_VERSION
 #define C2POOL_VERSION "dev"
@@ -831,6 +832,9 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
 
 int main(int argc, char** argv)
 {
+    // SHA-256 implementation (SSE4 / AVX2 / SHA-NI when the CPU has them),
+    // self-tested, before any thread starts: core/sha256_init.hpp.
+    core::init_sha256();
     bool want_help = false;
     bool want_ibd = false;
     bool want_leg_c = false;

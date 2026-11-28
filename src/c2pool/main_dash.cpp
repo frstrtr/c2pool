@@ -53,6 +53,7 @@
 #include <impl/dash/coin/utxo_adapter.hpp>   // must precede subsidy.hpp (dash_txid in scope)
 #include <impl/dash/coin/subsidy.hpp>
 #include <btclibs/crypto/sha256.h>   // SHA256AutoDetect (CPU-dispatched SIMD/SHA-NI transform)
+#include <core/sha256_init.hpp>      // core::init_sha256 (implementation choice + self-test + C2POOL_SHA256)
 
 #include <core/coin_params.hpp>
 #include <core/coinbase_builder.hpp>       // c2pool::MAX_OPERATOR_TEXT_SOLO (--coinbase-text budget SSOT)
@@ -12905,16 +12906,16 @@ int main(int argc, char** argv)
     // SHA-NI where the CPU has it) before any hashing runs. The DASH daemonless
     // replay fold recomputes the full merkleRootMNList / merkleRootQuorums every
     // block as its reward-safety self-check, and that recompute was ~70% scalar
-    // SHA256 (single-thread CPU bound). SHA256AutoDetect() probes CPUID and
-    // installs the fastest transform the running CPU proves correct; the fold's
+    // SHA256 (single-thread CPU bound). core::init_sha256() (the helper every
+    // node binary calls) probes CPUID, installs the fastest transform, runs
+    // SHA256SelfTest() (in every build) and puts the scalar transform back if
+    // it fails; C2POOL_SHA256=standard forces the scalar one. The fold's
     // committed-root byte-compare stays the authority, so a wrong primitive can
     // only fail closed, never mis-fold. Byte-identical output by construction.
     {
-        const std::string sha_backend = SHA256AutoDetect();
-        std::cout << "[init] SHA256 backend: " << sha_backend << "\n";
-        // Release defines NDEBUG, which turns AutoDetect's internal
-        // assert(SelfTest()) into a no-op -- so run an explicit KAT here that
-        // survives NDEBUG. SHA256("abc") exercises the single-block transform
+        core::init_sha256(std::cout);
+        // A second, independent KAT on top of the helper's self-test, also
+        // NDEBUG-proof. SHA256("abc") exercises the single-block transform
         // (the fold's leaf + pairwise-merkle hot path); a double-SHA256 of a
         // 64-byte block exercises the CHash256 merkle-node form. A miscompiled
         // transform aborts startup rather than folding a wrong root.
