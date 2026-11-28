@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
 
@@ -88,6 +89,9 @@ struct JobTargetInputs
     uint64_t dust_threshold{0};      // PoolConfig::dust_threshold()
     uint32_t spread{0};              // PoolConfig::SPREAD
     uint32_t block_bits{0};
+    // The login's "/N" (IWorkSource::build_connection_coinbase_for
+    // desired_share_difficulty), internal units as p2pool's; none: no "/N".
+    std::optional<double> share_difficulty;
 };
 
 // The desired share target of a job, before compute_share_target clips it
@@ -102,8 +106,21 @@ struct JobTargetInputs
 // is 0, below DUST, and the dust target applies (p2pool work.py 3020-3028
 // runs it whatever the rate). No rate and no chain an hour deep: the easiest
 // target (2**256-1, clipped to pre_target3).
+// A login "/N" (share_difficulty) is p2pool's desired_share_target from
+// get_user_details, difficulty_to_target(N): get_work runs neither cap then
+// (both sit under `if desired_share_target is None`), so it is the desired
+// target as it is, clipped into the band like any other. N is in p2pool's
+// units, the same as "+N": difficulty 1 is 0x00000000ffff0000..., not scaled
+// by DUMB_SCRYPT_DIFF (p2pool multiplies only the set_difficulty it sends).
+// An N p2pool's difficulty_to_target raises on (below ~1e-241) sets no
+// target there, so the caps apply.
 inline uint256 job_desired_share_target(const JobTargetInputs& in)
 {
+    if (in.share_difficulty) {
+        if (const auto t = chain::difficulty_to_target(*in.share_difficulty))
+            return *t;
+    }
+
     uint256 desired;
     desired.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 

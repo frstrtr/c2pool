@@ -376,9 +376,11 @@ TEST(RedistributeSplit, TheMintedShareRevealsTheDonationItsJobCommittedTo)
 // here (they are lambdas over the live node), so their code is pinned, with
 // comments and #if 0 blocks removed and whitespace dropped (line breaks
 // inside a call do not matter): the ref_hash lambda takes the job's donation
-// and commits the share to core::job_share_donation(share_donation,
+// and the login's "/N" (desired_share_difficulty, its last two parameters),
+// commits the share to core::job_share_donation(share_donation,
 // dev_donation) (its share target sized with the same), each assigned
-// exactly once and by no other operator (+=, -=, ...); the create_share
+// exactly once and by no other operator (+=, -=, ...), and sizes the share
+// target with the "/N" (target_in.share_difficulty, set once, by =); the create_share
 // lambda mints with core::job_share_donation(p.share_donation, dev_donation);
 // no site builds the --give-author formula by hand or passes std::nullopt for
 // the job's donation; the startup passes --node-owner-address before
@@ -520,9 +522,15 @@ TEST(RedistributeSplit, MainLtcHandsTheJobsDonationToTheRefHashAndTheShare)
     std::stringstream ss;
     ss << in.rdbuf();
     const std::string src = code_without_comments_or_spaces(ss.str());
-    EXPECT_EQ(occurrences(src, "const std::vector<uint256>& merkle_branches, const std::optional<uint16_t>& share_donation) "
+    EXPECT_EQ(occurrences(src, "const std::vector<uint256>& merkle_branches, const std::optional<uint16_t>& share_donation, "
+                               "const std::optional<double>& desired_share_difficulty) "
                                "-> core::MiningInterface::RefHashResult"), 1u)
-        << "the ref_hash lambda receives the job's donation";
+        << "the ref_hash lambda receives the job's donation and the login's \"/N\"";
+    EXPECT_EQ(occurrences(src, "const std::optional<uint16_t>& share_donation) -> core::MiningInterface::RefHashResult"), 0u)
+        << "no ref_hash lambda without the login's \"/N\"";
+    EXPECT_EQ(assignments(src, "target_in.share_difficulty"), 1u) << "the share target's \"/N\" is set once, by =";
+    EXPECT_EQ(occurrences(src, "target_in.share_difficulty = desired_share_difficulty;"), 1u)
+        << "the ref_hash lambda sizes the share target with the login's \"/N\"";
     EXPECT_EQ(assignments(src, "params.donation"), 1u) << "the share's donation is set once, by =";
     EXPECT_EQ(occurrences(src, "params.donation = core::job_share_donation(share_donation, dev_donation);"), 1u);
     EXPECT_EQ(assignments(src, "target_in.donation_percent"), 1u);

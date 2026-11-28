@@ -208,13 +208,16 @@ public:
     // sized by that login's local hash rate (set_local_rate_fn).
     // `share_donation`: decide_job_payout's for the job (a split job), the
     // donation its ref_hash commits to; none: the node's own (--give-author).
+    // `desired_share_difficulty` (the login's "/N") is not used yet: the
+    // share target stays the per-login cap.
     core::stratum::CoinbaseResult        build_connection_coinbase_for(
         const core::stratum::PayoutKey& login_key,
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-        const std::optional<uint16_t>& share_donation = std::nullopt) const override;
+        const std::optional<uint16_t>& share_donation = std::nullopt,
+        const std::optional<double>& desired_share_difficulty = std::nullopt) const override;
 
     /// The local hash rate (attempts/s) of a login key, from the stratum
     /// server's per-address rates (main_dgb: get_local_addr_rates); unset or

@@ -17,6 +17,7 @@
 #include <nlohmann/json.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/stratum_types.hpp>
+#include <core/stratum_username.hpp>
 #include <string>
 #include <sstream>
 #include <cstdint>
@@ -75,7 +76,10 @@ uint32_t apply_version_rolling(uint32_t job_version, uint32_t negotiated_mask,
     return (job_version & ~negotiated_mask) | (miner_bits & negotiated_mask);
 }
 
-// Simulate address separator parsing (matches StratumSession::parse_address_separators)
+// Address separator parsing as StratumSession::handle_authorize does it: the
+// production parser (core::stratum_username::parse_login: "/" tokens, "+N",
+// worker suffixes, where the two-address form splits), then
+// parse_address_separators' split there.
 struct ParseResult {
     std::string primary;
     std::string merged_raw;
@@ -85,69 +89,20 @@ struct ParseResult {
 ParseResult parse_address_separators(const std::string& input)
 {
     ParseResult result;
-    std::string username = input;
-
-    // Strip worker name suffix
-    auto dot_pos = username.rfind('.');
-    if (dot_pos != std::string::npos && dot_pos > 20)
-        username = username.substr(0, dot_pos);
-    auto underscore_pos = username.rfind('_');
-    if (underscore_pos != std::string::npos && underscore_pos > 20)
-        username = username.substr(0, underscore_pos);
-
-    // Slash format
-    auto slash_pos = username.find('/');
-    if (slash_pos != std::string::npos) {
-        result.primary = username.substr(0, slash_pos);
-        std::string remainder = username.substr(slash_pos + 1);
-        std::istringstream ss(remainder);
-        std::string token;
-        while (std::getline(ss, token, '/')) {
-            auto colon = token.find(':');
-            if (colon != std::string::npos && colon > 0 && colon + 1 < token.size()) {
-                try {
-                    uint32_t chain_id = static_cast<uint32_t>(std::stoul(token.substr(0, colon)));
-                    result.explicit_chains[chain_id] = token.substr(colon + 1);
-                } catch (...) {}
-            }
-        }
-        return result;
+    const auto login = core::stratum_username::parse_login(input);
+    result.explicit_chains = login.slash.merged_addresses;
+    result.primary = login.user;
+    if (login.merged_sep != std::string::npos) {
+        result.merged_raw = result.primary.substr(login.merged_sep + 1);
+        result.primary.erase(login.merged_sep);
     }
-
-    // Simple separators: comma, pipe, semicolon, space
-    for (char sep : {',', '|', ';', ' '}) {
-        auto sep_pos = username.find(sep);
-        if (sep_pos != std::string::npos && sep_pos > 20) {
-            result.merged_raw = username.substr(sep_pos + 1);
-            result.primary = username.substr(0, sep_pos);
-            // Strip worker from merged too
-            auto mdot = result.merged_raw.rfind('.');
-            if (mdot != std::string::npos && mdot > 20) result.merged_raw = result.merged_raw.substr(0, mdot);
-            auto mus = result.merged_raw.rfind('_');
-            if (mus != std::string::npos && mus > 20) result.merged_raw = result.merged_raw.substr(0, mus);
-            return result;
-        }
-    }
-
-    result.primary = username;
     return result;
 }
 
-// Parse fixed difficulty suffix
+// The fixed difficulty suffix (+N), as handle_authorize strips it (0: none).
 double parse_fixed_difficulty(std::string& username)
 {
-    auto plus_pos = username.rfind('+');
-    if (plus_pos != std::string::npos && plus_pos + 1 < username.size()) {
-        std::string diff_str = username.substr(plus_pos + 1);
-        try {
-            double d = std::stod(diff_str);
-            if (d > 0.0) {
-                username = username.substr(0, plus_pos);
-                return d;
-            }
-        } catch (...) {}
-    }
-    return 0.0;
+    return core::stratum_username::strip_fixed_diff_suffix(username).value_or(0.0);
 }
 
 } // anonymous namespace

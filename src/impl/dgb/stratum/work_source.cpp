@@ -773,7 +773,8 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase_for(
     const std::string& extranonce1_hex,
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
-    const std::optional<uint16_t>& share_donation) const
+    const std::optional<uint16_t>& share_donation,
+    const std::optional<double>& /*desired_share_difficulty*/) const
 {
     LocalRateFn fn;
     {

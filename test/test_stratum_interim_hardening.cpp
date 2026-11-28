@@ -94,6 +94,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -231,6 +232,28 @@ public:
             r.snapshot.curtime = static_cast<uint32_t>(tmpl_["curtime"].get<uint64_t>());
         }
         return r;
+    }
+
+    // The desired_share_difficulty (the login's "/N") of every
+    // build_connection_coinbase_for call, in order.
+    mutable std::mutex share_difficulty_mu;
+    mutable std::vector<std::optional<double>> share_difficulties;
+    core::stratum::CoinbaseResult build_connection_coinbase_for(
+        const core::stratum::PayoutKey&, const uint256& prev, const std::string& en1,
+        const std::vector<unsigned char>& payout,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged,
+        const std::optional<uint16_t>&, const std::optional<double>& desired_share_difficulty) const override
+    {
+        {
+            std::lock_guard<std::mutex> l(share_difficulty_mu);
+            share_difficulties.push_back(desired_share_difficulty);
+        }
+        return build_connection_coinbase(prev, en1, payout, merged);
+    }
+    std::optional<double> last_share_difficulty() const
+    {
+        std::lock_guard<std::mutex> l(share_difficulty_mu);
+        return share_difficulties.empty() ? std::optional<double>(-1.0) : share_difficulties.back();
     }
 
     nlohmann::json mining_submit(const std::string&, const std::string&,
@@ -1657,6 +1680,61 @@ TEST(StratumVardiff, PlusSuffixOverPasswordOverNothing)
         ASSERT_TRUE(suggest(c, 16384.0, 50));
         EXPECT_DOUBLE_EQ(c.set_diffs.back(), 16384.0) << "a later suggest_difficulty is honoured";
     }
+}
+
+// The login's "/N" (p2pool desired_share_target) reaches the work source with
+// every job (IWorkSource::build_connection_coinbase_for
+// desired_share_difficulty), with "+N" in either order (p2pool
+// get_user_details): "+N/M" gives both, "+N" alone only the fixed difficulty.
+TEST(StratumShareDifficulty, SlashNReachesTheJobPlusNUnchanged)
+{
+    struct Case { const char* suffix; std::optional<double> share; double wire; };
+    const Case cases[] = {
+        {"", std::nullopt, 0.0},
+        {"/512", 512.0, 0.0},
+        {"+1", std::nullopt, 65536.0},
+        {"+1/512", 512.0, 65536.0},
+        {"/512+1", 512.0, 65536.0},
+        {"/abc", std::nullopt, 0.0},
+        {"/1024.rig", std::nullopt, 0.0},
+        {".rig/0.5", 0.5, 0.0},
+    };
+    for (const Case& cc : cases) {
+        SCOPED_TRACE(std::string("sharediffworker") + cc.suffix);
+        ServerHarness h;
+        ASSERT_TRUE(h.start());
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(login(c, std::string("sharediffworker") + cc.suffix));
+        EXPECT_EQ(h.ws->last_share_difficulty(), cc.share);
+        if (cc.wire > 0.0)
+            EXPECT_DOUBLE_EQ(c.diff_at_notify.back(), cc.wire) << "+N is the fixed difficulty, as before";
+    }
+}
+
+// The subscribe-time job (no login yet) has none; a re-authorize sets or
+// clears it for the jobs built after it.
+TEST(StratumShareDifficulty, ReauthorizeSetsAndClearsIt)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    EXPECT_FALSE(h.ws->last_share_difficulty().has_value()) << "the job before any login";
+    size_t n = c.jobs.size();
+    ASSERT_TRUE(c.authorize_with("sharediffreauth/512", "x", 2));
+    ASSERT_TRUE(c.collect_notifies(n + 1, 5000ms));
+    EXPECT_EQ(h.ws->last_share_difficulty(), std::optional<double>(512.0));
+    h.notify_storm(1);
+    ASSERT_TRUE(c.collect_notifies(n + 2, 5000ms));
+    EXPECT_EQ(h.ws->last_share_difficulty(), std::optional<double>(512.0)) << "every job of the login";
+    n = c.jobs.size();
+    ASSERT_TRUE(c.authorize_with("sharediffreauth", "x", 3));
+    h.notify_storm(1);
+    ASSERT_TRUE(c.collect_notifies(n + 1, 5000ms));
+    EXPECT_FALSE(h.ws->last_share_difficulty().has_value()) << "a re-authorize without \"/N\" clears it";
 }
 
 // ════════════════════════════════════════════════════════════════════════════

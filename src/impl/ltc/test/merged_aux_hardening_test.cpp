@@ -2297,6 +2297,7 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
         return r;
     }
     mutable std::vector<std::optional<uint16_t>> build_donations;   // build_connection_coinbase_for
+    mutable std::vector<std::optional<double>> build_share_difficulties;   // its desired_share_difficulty
     std::vector<std::string> warning_updates;   // update_stratum_worker_payout_warning
     void update_stratum_worker_payout_warning(const std::string&, const std::string& w) override
     {
@@ -2307,12 +2308,14 @@ struct RecordingWorkSource : core::stratum::IWorkSource {
         const core::stratum::PayoutKey& login_key, const uint256& prev, const std::string& en1,
         const std::vector<unsigned char>& payout,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged,
-        const std::optional<uint16_t>& share_donation) const override
+        const std::optional<uint16_t>& share_donation,
+        const std::optional<double>& share_difficulty) const override
     {
         {
             std::lock_guard<std::mutex> l(mu);
             login_keys.push_back(login_key);
             build_donations.push_back(share_donation);
+            build_share_difficulties.push_back(share_difficulty);
         }
         return build_connection_coinbase(prev, en1, payout, merged);
     }
@@ -2559,6 +2562,102 @@ TEST(MergedAuxStratumSession, SubmitCarriesWhatTheJobCommittedTo)
                   core::merged_addr::merged_payout_script(core::merged_addr::find_chain(table, 98), ltc))
             << "the job committed to the LTC key's DOGE script";
         EXPECT_EQ(rig.ws->submit_payouts[0], core::address_to_script(ltc));
+    }
+}
+
+// p2pool-merged-v36 at the LTC stratum: a '|', ';' or ' ' after a worker
+// suffix is the worker's (DOGE gets the LTC key, as before), and "D.rig,L"
+// does not swap (p2pool tests the swap on "D.rig"): the LTC payout is
+// hash160(D), DOGE D (case 5), as before; "D,L" still swaps.
+TEST(MergedAuxStratumSession, WorkerSuffixRulesMatchP2pool)
+{
+    const std::string ltc = b58(48, 0x01), doge = b58(30, 0x21);
+    const auto table = core::merged_addr::merged_chain_table(false, kLtcAllNetworks);
+    const auto sc = [&](const std::string& a) {
+        return core::merged_addr::merged_payout_script(core::merged_addr::find_chain(table, 98), a);
+    };
+    struct Case { std::string login; std::string payout; std::string doge_from; };
+    const std::vector<Case> cases = {
+        {ltc + ".rig|" + doge, ltc, ltc},
+        {ltc + ".rig " + doge, ltc, ltc},
+        {ltc + "_rig;" + doge, ltc, ltc},
+        {ltc + ".my rig", ltc, ltc},
+        {ltc + "|" + doge, ltc, doge},          // c2pool's '|' form without a suffix before it
+        {ltc + ".rig," + doge, ltc, doge},      // the comma form: p2pool-merged-v36
+        {doge + ".rig," + ltc, doge, doge},     // no swap: case 5
+        {doge + "," + ltc, ltc, doge},          // swapped order, auto-corrected
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.login);
+        SessionRig rig({98});
+        LineClient cl(rig.port);
+        ASSERT_GE(cl.fd, 0);
+        rig.step(cl, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(cl, 2, "mining.authorize", {c.login, "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        EXPECT_EQ(rig.ws->payouts.back(), core::address_to_script(c.payout));
+        ASSERT_TRUE(rig.ws->builds.back().count(98));
+        EXPECT_EQ(rig.ws->builds.back().at(98), sc(c.doge_from));
+    }
+    // A comma form whose first address is no address and is cut to index 20
+    // or before by its worker suffix: split at the comma as typed, the DOGE
+    // address stays named; the job is the one of any unusable first address
+    // beside it (the LTC payout from the DOGE key, case 4).
+    const std::string doge2 = b58(30, 0x22);
+    const auto job_of = [&](const std::string& login) {
+        SessionRig rig({98}, /*redistribute=*/true);
+        LineClient cl(rig.port);
+        rig.step(cl, 1, "mining.subscribe", nlohmann::json::array());
+        EXPECT_TRUE(rig.step(cl, 2, "mining.authorize", {login, "x"})) << login;
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        return std::make_pair(rig.ws->payouts.back(), rig.ws->builds.back());
+    };
+    const auto unusable_first = job_of(std::string(25, 'x') + "," + doge2);
+    ASSERT_TRUE(unusable_first.second.count(98));
+    EXPECT_EQ(unusable_first.second.at(98), sc(doge2));
+    EXPECT_FALSE(unusable_first.first.empty()) << "case 4";
+    for (const std::string& login : {".|" + doge + "," + doge2, "._x" + std::string(34, 'y') + ".a.b," + doge2}) {
+        SCOPED_TRACE(login);
+        EXPECT_EQ(job_of(login), unusable_first);
+    }
+}
+
+// The login's "/N" on the LTC stratum (p2pool get_user_details): it reaches
+// the job build (build_connection_coinbase_for desired_share_difficulty) with
+// "+N" in either order and with the merged forms, and the payout address is
+// the one p2pool takes.
+TEST(ShareDifficultyStratumSession, SlashNReachesTheLtcJobBuild)
+{
+    const std::string ltc = b58(48, 0x01), doge = b58(30, 0x21);
+    const auto table = core::merged_addr::merged_chain_table(false, kLtcAllNetworks);
+    const auto doge_script = core::merged_addr::merged_payout_script(core::merged_addr::find_chain(table, 98), doge);
+    struct Case { std::string login; std::optional<double> share; bool names_doge; };
+    const std::vector<Case> cases = {
+        {ltc, std::nullopt, false},
+        {ltc + "/512", 512.0, false},
+        {ltc + "+16/512", 512.0, false},
+        {ltc + "/512+16", 512.0, false},
+        {ltc + "+16", std::nullopt, false},
+        {ltc + ".a.b/512", 512.0, false},
+        {ltc + "," + doge + "/512", 512.0, true},          // a "/" token no longer stops the comma form
+        {ltc + "+16/98:" + doge + "/512", 512.0, true},    // "+16" no longer swallows the tokens after it
+        {ltc + "/98:" + doge + ".rig/512", 512.0, true},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.login);
+        SessionRig rig({98});
+        LineClient cl(rig.port);
+        ASSERT_GE(cl.fd, 0);
+        rig.step(cl, 1, "mining.subscribe", nlohmann::json::array());
+        ASSERT_TRUE(rig.step(cl, 2, "mining.authorize", {c.login, "x"}));
+        std::lock_guard<std::mutex> l(rig.ws->mu);
+        ASSERT_FALSE(rig.ws->build_share_difficulties.empty());
+        EXPECT_EQ(rig.ws->build_share_difficulties.back(), c.share);
+        EXPECT_EQ(rig.ws->payouts.back(), core::address_to_script(ltc)) << "the payout address p2pool takes";
+        if (c.names_doge) {
+            ASSERT_TRUE(rig.ws->builds.back().count(98));
+            EXPECT_EQ(rig.ws->builds.back().at(98), doge_script) << "the DOGE address the login named";
+        }
     }
 }
 
