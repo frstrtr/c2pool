@@ -189,6 +189,13 @@ struct EmbeddedWorkInputs {
     // NodeCoinState::make_embedded_work_inputs from set_include_mn_special_txs.
     bool                             include_mn_special_txs{false};
 
+    // --embedded-include-v24-provider-txs (default true): with the superset
+    // above armed and v24 active, false keeps the shared-masternode types
+    // 10-12 and every type 1-4 tx but a parsed v1/v2 ProTx out of selection;
+    // v1/v2 ProTx still ride. Set by
+    // NodeCoinState::make_embedded_work_inputs from set_include_v24_provider_txs.
+    bool                             include_v24_provider_txs{true};
+
     // #143 / Dash Core v24: the type-9 asset unlocks the credit-pool follower
     // admitted for this template (credit_pool_lane.hpp admit: version-2 gate,
     // UnlockLimitV24, quorum signatures). Null => every unlock is excluded.
@@ -378,7 +385,9 @@ inline WorkSelection select_dash_work(
                 // Dash Core's CheckMNHFTx for type-7 signals (null => none rides).
                 emb.mnhf_check_env,
                 // GBT-xcheck label aid (false => nothing kept).
-                emb.want_xcheck_aid);
+                emb.want_xcheck_aid,
+                // v24 provider types 10-12 (true => byte-unchanged).
+                emb.include_v24_provider_txs);
             // Testnet min-difficulty: bits for the template's own curtime.
             if (emb.bits_at_time)
                 if (auto b = emb.bits_at_time(w.m_previous_block, w.m_curtime)) w.m_bits = *b;
