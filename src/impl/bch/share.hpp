@@ -60,7 +60,7 @@ struct BaseShare : chain::BaseShare<uint256, Version>
     // [x]address[>=34] or [x]pubkey_hash[<34]
     uint64_t m_subsidy;                 // subsidy
     uint16_t m_donation;                // donation
-    bch::StaleInfo m_stale_info;        // stale_info
+    bch::StaleInfo m_stale_info{bch::StaleInfo::none}; // stale_info
     uint64_t m_desired_version;         // desired_version
     //
     // [x] segwit_data [if segwit_activated]
