@@ -29,7 +29,7 @@
 #include "rpc_data.hpp"
 #include "transaction.hpp"
 
-#include <btclibs/util/strencodings.h>   // ParseHex
+#include <btclibs/util/strencodings.h>   // ParseHex, IsHex
 
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
@@ -37,7 +37,9 @@
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
+#include <iterator>
 #include <optional>
+#include <stdexcept>
 #include <span>
 #include <string>
 #include <vector>
@@ -91,30 +93,61 @@ struct GbtTxReadReport {
         std::string what;
         bool        used_gbt_hash;   // false: fell back to the SHA256d of the bytes
     };
-    std::vector<Disagreement> disagreements;
-    std::vector<ParseFailure> parse_failures;
+    struct BadHash {                 // a "hash" that is not 64 hex chars: treated as absent
+        size_t      index;
+        std::string value;
+    };
+    struct TxidHashMismatch {        // both "txid" and "hash", and they differ ("hash" served)
+        size_t  index;
+        uint256 txid;
+        uint256 hash;
+    };
+    std::vector<Disagreement>     disagreements;
+    std::vector<ParseFailure>     parse_failures;
+    std::vector<BadHash>          bad_hashes;
+    std::vector<TxidHashMismatch> txid_hash_mismatches;
 };
 
+/// A 32-byte id in display hex (64 hex chars), as getblocktemplate lists it.
+inline std::optional<uint256> gbt_id_field(const nlohmann::json& entry, const char* key)
+{
+    if (!entry.is_object() || !entry.contains(key)) return std::nullopt;
+    const auto& v = entry[key];
+    if (!v.is_string()) return std::nullopt;
+    const std::string& s = v.get_ref<const std::string&>();
+    if (s.size() != 64 || !IsHex(s)) return std::nullopt;
+    return uint256S(s);
+}
+
 /// Append every entry of a getblocktemplate "transactions" array to w. An entry
-/// is an object with "data" (and usually "hash", "fee"), or a bare hex string;
-/// an entry with no bytes is skipped. A tx that fails to deserialize keeps its
-/// slot in m_txs (whatever the codec read) so the four vectors stay
-/// index-aligned.
+/// is an object with "data" (and usually "hash", "fee"), or a bare hex string.
+/// An entry that carries no transaction bytes -- an object without a "data"
+/// string, an empty or non-hex body, any other JSON value -- fails the whole
+/// read (std::runtime_error) and leaves w untouched: a template that silently
+/// dropped one of dashd's txs would no longer be dashd's template. A tx that
+/// fails to deserialize keeps its slot in m_txs (whatever the codec read) so
+/// the four vectors stay index-aligned.
 inline GbtTxReadReport append_gbt_transactions(const nlohmann::json& txs, DashWorkData& w)
 {
     GbtTxReadReport rep;
     if (!txs.is_array()) return rep;
+    std::vector<std::string> data_hexes;
+    std::vector<Transaction> parsed_txs;
+    std::vector<uint256>     hashes;
+    std::vector<uint64_t>    fees;
     for (const auto& entry : txs) {
+        const size_t index = w.m_tx_data_hex.size() + data_hexes.size();
         std::string data_hex;
         if (entry.is_object() && entry.contains("data") && entry["data"].is_string())
             data_hex = entry["data"].get<std::string>();
         else if (entry.is_string())
             data_hex = entry.get<std::string>();
-        if (data_hex.empty())
-            continue;
-
-        const size_t index = w.m_tx_data_hex.size();
-        w.m_tx_data_hex.push_back(data_hex);
+        else
+            throw std::runtime_error("getblocktemplate transaction " + std::to_string(index) +
+                                     " carries no \"data\" string");
+        if (data_hex.empty() || data_hex.size() % 2 != 0 || !IsHex(data_hex))
+            throw std::runtime_error("getblocktemplate transaction " + std::to_string(index) +
+                                     " \"data\" is not a hex transaction");
         const std::vector<unsigned char> raw = ParseHex(data_hex);
 
         // DASH tx codec: the version|(type<<16) field + DIP2 special-tx payload.
@@ -129,15 +162,16 @@ inline GbtTxReadReport append_gbt_transactions(const nlohmann::json& txs, DashWo
         } catch (const std::exception& ex) {
             parse_error = ex.what();
         }
-        w.m_txs.emplace_back(mtx);   // Transaction(MutableTransaction) is explicit
 
-        std::optional<uint256> gbt_hash;
-        if (entry.is_object() && entry.contains("hash") && entry["hash"].is_string())
-            gbt_hash = uint256S(entry["hash"].get<std::string>());
+        const std::optional<uint256> gbt_hash = gbt_id_field(entry, "hash");
+        if (!gbt_hash && entry.is_object() && entry.contains("hash"))
+            rep.bad_hashes.push_back({index, entry["hash"].dump()});
+        if (const auto gbt_txid = gbt_id_field(entry, "txid");
+            gbt_txid && gbt_hash && *gbt_txid != *gbt_hash)
+            rep.txid_hash_mismatches.push_back({index, *gbt_txid, *gbt_hash});
 
         const GbtEntryTxid id = gbt_entry_txid(parsed ? &mtx : nullptr, gbt_hash,
                                                std::span<const unsigned char>(raw));
-        w.m_tx_hashes.push_back(id.txid);
         if (id.hash_disagrees)
             rep.disagreements.push_back({index, *gbt_hash, id.derived});
         if (!parsed)
@@ -147,8 +181,18 @@ inline GbtTxReadReport append_gbt_transactions(const nlohmann::json& txs, DashWo
         uint64_t fee = 0;
         if (entry.is_object() && entry.contains("fee"))
             fee = entry["fee"].get<uint64_t>();
-        w.m_tx_fees.push_back(fee);
+
+        data_hexes.push_back(std::move(data_hex));
+        parsed_txs.emplace_back(mtx);   // Transaction(MutableTransaction) is explicit
+        hashes.push_back(id.txid);
+        fees.push_back(fee);
     }
+    w.m_tx_data_hex.insert(w.m_tx_data_hex.end(), std::make_move_iterator(data_hexes.begin()),
+                           std::make_move_iterator(data_hexes.end()));
+    w.m_txs.insert(w.m_txs.end(), std::make_move_iterator(parsed_txs.begin()),
+                   std::make_move_iterator(parsed_txs.end()));
+    w.m_tx_hashes.insert(w.m_tx_hashes.end(), hashes.begin(), hashes.end());
+    w.m_tx_fees.insert(w.m_tx_fees.end(), fees.begin(), fees.end());
     return rep;
 }
 

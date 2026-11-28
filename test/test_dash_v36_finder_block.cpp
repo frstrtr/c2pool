@@ -21,6 +21,9 @@
 //       with a named cause (v36_finder_block_bodies) and nothing is framed.
 //   F4. A won block rebuilds from the bodies the mint carried after the
 //       frozen-job registry evicted its job (dash::mint::WonBlockBodies).
+//   F5. v36_finder_block_bodies accepts the real bodies of testnet block 1599900,
+//       whose v24 version 2 asset unlocks carry a stable txid that is not the
+//       SHA256d of their bytes; a type-9 body with trailing bytes is refused.
 //
 // Folded into test_dash_node (the same harness and link set as
 // test_dash_v36_flip.cpp).
@@ -32,7 +35,9 @@
 
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/block_producer.hpp>
+#include <impl/dash/coin/dash_txid.hpp>
 #include <impl/dash/coin/reconstruct_won_block.hpp>
+#include <impl/dash/coinbase_builder.hpp>   // merkle_branches_raw
 #include <impl/dash/mint_runloop.hpp>
 
 #include <chrono>
@@ -328,4 +333,75 @@ TEST(DashV36FinderBlock, WonBlockRebuildsAfterItsEntryWasEvicted)
     const dash::mint::WonBlockBodies none;
     EXPECT_FALSE(dash::coin::reconstruct_won_block(child.m_hash, child, rig.t, rig.p, {},
                                                    lookup(none)).has_value());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// F5. Real v2 asset unlock bodies (testnet block 1599900)
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "data/dash_block_testnet_1599900.inc"
+#include "data/dash_block_testnet_txids_1599900_1599924.inc"
+
+namespace {
+
+struct F5Block {
+    dash::coin::BlockType     block;
+    std::vector<std::string>  hex;        // every tx, coinbase first
+    std::vector<uint256>      txids;      // dashd's
+};
+
+F5Block f5_load()
+{
+    F5Block b;
+    std::string h;
+    for (const char* p = kDashBlockTestnet1599900; *p; ++p)
+        if (*p != '\n' && *p != '\r') h.push_back(*p);
+    PackStream ps(ParseHex(h));
+    ps >> b.block;
+    for (const auto& tx : b.block.m_txs) {
+        auto packed = ::pack(tx);
+        auto sp = packed.get_span();
+        b.hex.push_back(HexStr(std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(sp.data()), sp.size())));
+    }
+    for (const char* t : kDashBlockTestnet1599900Txids) b.txids.push_back(uint256S(t));
+    return b;
+}
+
+} // namespace
+
+TEST(DashV36FinderBlock, FinderBodiesAcceptRealV2Unlocks)
+{
+    const F5Block b = f5_load();
+    ASSERT_EQ(b.hex.size(), b.txids.size());
+    size_t v2 = 0;
+    for (const auto& tx : b.block.m_txs) v2 += dash::coin::is_asset_unlock_with_stable_txid(tx) ? 1 : 0;
+    ASSERT_EQ(v2, 11u);
+
+    // The share's merkle link: the stratum branch over [coinbase placeholder] ++
+    // dashd's txids, ascended from the block's own coinbase txid.
+    const uint256 gentx_txid = sha256d_bytes(ParseHex(b.hex[0]));
+    std::vector<uint256> leaves{uint256::ZERO};
+    leaves.insert(leaves.end(), b.txids.begin() + 1, b.txids.end());
+    dash::DashV36Share share;
+    share.m_merkle_link.m_branch = dash::coinbase::merkle_branches_raw(leaves);
+    share.m_merkle_link.m_index  = 0;
+    ASSERT_EQ(dash::check_merkle_link(gentx_txid, share.m_merkle_link), b.block.m_merkle_root);
+
+    FinderTemplateBodies fb;
+    fb.tx_hashes.assign(b.txids.begin() + 1, b.txids.end());
+    fb.tx_data_hex = std::make_shared<const std::vector<std::string>>(b.hex.begin() + 1, b.hex.end());
+    std::string why;
+    const auto bodies = dash::coin::v36_finder_block_bodies(share, gentx_txid, fb, &why);
+    ASSERT_TRUE(bodies.has_value()) << why;
+    ASSERT_EQ(bodies->size(), fb.tx_hashes.size());
+    for (size_t i = 0; i < bodies->size(); ++i)
+        EXPECT_EQ(HexStr((*bodies)[i]), (*fb.tx_data_hex)[i]) << "tx " << i;
+
+    // A type-9 body with trailing bytes is not the committed tx.
+    auto hex = *fb.tx_data_hex;
+    hex[4] += "00";
+    FinderTemplateBodies trailing{fb.tx_hashes, std::make_shared<const std::vector<std::string>>(hex)};
+    EXPECT_FALSE(dash::coin::v36_finder_block_bodies(share, gentx_txid, trailing, &why).has_value());
+    EXPECT_NE(why.find("trailing bytes"), std::string::npos) << why;
 }

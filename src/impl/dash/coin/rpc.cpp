@@ -11,9 +11,9 @@
 #include <util/strencodings.h>   // ParseHex / HexStr
 
 #include <algorithm>             // std::min (sync-reconnect backoff)
-#include <atomic>
 #include <mutex>
 #include <set>
+#include <vector>
 
 #ifndef _WIN32
 #include <sys/socket.h>          // setsockopt SO_SND/RCVTIMEO (Send() deadline)
@@ -34,27 +34,40 @@ namespace coin
 namespace
 {
 
-// A getblocktemplate entry whose "hash" differs from the dash_txid of its own
+// getblocktemplate entries whose "hash" differs from the dash_txid of their own
 // bytes: dashd's "hash" is served (Core's GetHash of those bytes, the id the
-// validator recomputes), so the disagreement means a defect in dash_txid --
-// the embedded build and every other hash site of the node derive ids with it.
-// Logged as an error once per dashd txid (the template is re-read every few
-// seconds; the remembered set is bounded), with the running count of
-// disagreeing entries read since start.
-void log_gbt_txid_disagreement_once(const uint256& gbt_hash, const uint256& derived,
-                                    uint32_t height, uint64_t total)
+// validator recomputes), so a disagreement means a defect in dash_txid -- the
+// embedded build and every other hash site of the node derive ids with it.
+// One summary error per template read that has any (the template is re-read
+// every few seconds), plus one detail line per dashd txid the first time it is
+// seen. The remembered set stops growing at its cap instead of being cleared,
+// so a systemic defect cannot flood the log; the summary keeps counting.
+void log_gbt_txid_disagreements(const std::vector<GbtTxReadReport::Disagreement>& ds,
+                                uint32_t height)
 {
+    if (ds.empty()) return;
+    static constexpr size_t kDetailCap = 4096;
     static std::mutex mu;
     static std::set<uint256> logged;
+    static uint64_t total = 0;
+    std::vector<const GbtTxReadReport::Disagreement*> fresh;
+    uint64_t total_now = 0;
     {
         std::lock_guard<std::mutex> lk(mu);
-        if (logged.size() >= 4096) logged.clear();
-        if (!logged.insert(gbt_hash).second) return;
+        total += ds.size();
+        total_now = total;
+        for (const auto& d : ds) {
+            if (logged.size() >= kDetailCap) break;
+            if (logged.insert(d.gbt_hash).second) fresh.push_back(&d);
+        }
     }
-    LOG_ERROR << "[GBT-TXID] getblocktemplate h=" << height << " hash=" << gbt_hash.GetHex()
-              << " but dash_txid of its bytes=" << derived.GetHex()
-              << " -- serving dashd's hash; dash_txid is wrong for this tx (disagreements so far: "
-              << total << ")";
+    LOG_ERROR << "[GBT-TXID] getblocktemplate h=" << height << ": " << ds.size()
+              << " entr" << (ds.size() == 1 ? "y" : "ies")
+              << " whose \"hash\" differs from dash_txid of the bytes -- serving dashd's hash"
+              << " (disagreeing entries read since start: " << total_now << ")";
+    for (const auto* d : fresh)
+        LOG_ERROR << "[GBT-TXID]   index " << d->index << " hash=" << d->gbt_hash.GetHex()
+                  << " dash_txid=" << d->derived_txid.GetHex();
 }
 
 } // namespace
@@ -455,10 +468,13 @@ DashWorkData NodeRPC::getwork()
             LOG_WARNING << "getwork: tx deserialize failed at index " << f.index << ": " << f.what
                         << (f.used_gbt_hash ? " -- using dashd's \"hash\" as its txid"
                                             : " -- no \"hash\" either: txid = SHA256d of its bytes");
-        static std::atomic<uint64_t> disagreements_total{0};
-        for (const auto& d : rep.disagreements)
-            log_gbt_txid_disagreement_once(d.gbt_hash, d.derived_txid, w.m_height,
-                                           disagreements_total.fetch_add(1, std::memory_order_relaxed) + 1);
+        for (const auto& b : rep.bad_hashes)
+            LOG_WARNING << "getwork: tx " << b.index << " \"hash\" " << b.value.substr(0, 80)
+                        << " is not a 64-char hex id -- treated as absent";
+        for (const auto& m : rep.txid_hash_mismatches)
+            LOG_WARNING << "getwork: tx " << m.index << " lists txid=" << m.txid.GetHex()
+                        << " and hash=" << m.hash.GetHex() << " -- serving \"hash\"";
+        log_gbt_txid_disagreements(rep.disagreements, w.m_height);
     }
 
     // ----- DASH masternode + superblock + platform payments -----

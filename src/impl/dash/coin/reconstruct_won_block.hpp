@@ -75,7 +75,10 @@
 #include <core/uint256.hpp>
 #include <btclibs/util/strencodings.h>   // HexStr
 
+#include "dash_txid.hpp"                // dash_txid (v24 stable txid of a v2 asset unlock)
 #include "gentx_coinbase.hpp"
+#include "rpc_data.hpp"                 // txid_may_omit_body_bytes
+#include "transaction.hpp"
 #include "won_block_dispatch.hpp"       // dash::coin::ReconstructedWonBlock
 #include "../share.hpp"
 #include "../share_check.hpp"            // generate_share_transaction, check_merkle_link
@@ -109,7 +112,12 @@ using FinderBodiesLookup =
 // v36_finder_block_bodies (pure): the non-coinbase bodies of a v36 won block, in
 // template order, or nullopt (with the cause in *why) unless ALL of:
 //   * one body per tx hash, at least one;
-//   * sha256d(body[i]) == tx_hashes[i] (the body IS the committed tx);
+//   * body[i] IS the committed tx: its txid is tx_hashes[i]. That is
+//     sha256d(body[i]) for every tx whose txid covers all of its bytes; for a
+//     body whose txid may leave bytes out (txid_may_omit_body_bytes: every
+//     type-9 body; a v24 version 2 asset unlock's stable txid zeroes its quorum
+//     signing info) the body must parse completely and dash_txid of it is the
+//     txid;
 //   * the merkle root over [gentx_txid] ++ tx_hashes (dashcore's fold: duplicate
 //     the last node of an odd layer; a CVE-2012-2459 duplicate-pair mutation is
 //     refused) equals check_merkle_link(gentx_txid, share.m_merkle_link) -- the
@@ -141,7 +149,21 @@ v36_finder_block_bodies(const DashV36Share& share,
         std::vector<unsigned char> body = ParseHex((*fb.tx_data_hex)[i]);
         if (body.empty() || body.size() * 2 != (*fb.tx_data_hex)[i].size())
             return fail("tx " + std::to_string(i) + " body is not valid hex");
-        const uint256 txid = Hash(std::span<const unsigned char>(body.data(), body.size()));
+        uint256 txid;
+        if (txid_may_omit_body_bytes((*fb.tx_data_hex)[i])) {
+            MutableTransaction tx;
+            try {
+                PackStream ps(body);
+                ps >> tx;
+                if (!ps.empty())
+                    return fail("tx " + std::to_string(i) + " body has trailing bytes");
+            } catch (const std::exception& ex) {
+                return fail("tx " + std::to_string(i) + " body does not parse: " + ex.what());
+            }
+            txid = dash_txid(tx);
+        } else {
+            txid = Hash(std::span<const unsigned char>(body.data(), body.size()));
+        }
         if (txid != fb.tx_hashes[i])
             return fail("tx " + std::to_string(i) + " body hashes to " +
                         txid.GetHex().substr(0, 16) + ", template lists " +

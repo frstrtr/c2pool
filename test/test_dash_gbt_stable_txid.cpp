@@ -25,12 +25,17 @@
 //     body root as the reader's, so the embedded-vs-dashd tx-root xcheck
 //     compares like with like;
 //   * TemplateBodiesMemo never serves a re-signed unlock (same stable txid,
-//     other bytes) with its previous instance's bytes.
+//     other bytes) with its previous instance's bytes, and ProducerJobCache
+//     never serves a gentx whose CbTx committed the previous instance;
+//   * entries without bytes fail the read; a malformed "hash" is treated as
+//     absent; a "txid" that differs from "hash" is reported.
 
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/block_producer.hpp>    // compute_merkle_root, coinbase_txid
+#include <impl/dash/coin/cbtx_asset_unlocks.hpp> // compute_merkle_root_asset_unlocks
+#include <impl/dash/coin/vendor/cbtx.hpp>        // CCbTx, parse_cbtx
 #include <impl/dash/coin/dash_txid.hpp>
 #include <impl/dash/coin/gbt_transactions.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
@@ -44,8 +49,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <span>
 #include <string>
 #include <vector>
@@ -344,14 +352,73 @@ TEST(DashGbtStableTxid, DisagreeingHashIsReportedAndDashdHashDecides)
     EXPECT_FALSE(r2.hash_disagrees);
 }
 
-TEST(DashGbtStableTxid, BareStringEntriesAndEmptyDataAreHandled)
+TEST(DashGbtStableTxid, BareStringEntriesReadAndEntriesWithoutBytesFailTheRead)
 {
     const auto& rb = block_1599900();
+    {
+        DashWorkData w;
+        dash::coin::append_gbt_transactions(nlohmann::json::array({rb.tx_hex[5]}), w);
+        ASSERT_EQ(w.m_tx_hashes.size(), 1u);
+        EXPECT_EQ(w.m_tx_hashes[0], rb.dashd_txids[5]);
+    }
+    // An entry without bytes is never skipped: the read fails and w is untouched.
+    const nlohmann::json good = {{"data", rb.tx_hex[1]}, {"hash", rb.dashd_txids[1].GetHex()}};
+    const std::vector<nlohmann::json> bad = {
+        nlohmann::json{{"hash", rb.dashd_txids[5].GetHex()}},   // no "data"
+        nlohmann::json{{"data", 5}},                             // "data" not a string
+        nlohmann::json{{"data", ""}},                            // empty body
+        nlohmann::json{{"data", rb.tx_hex[5] + "0"}},            // odd length
+        nlohmann::json{{"data", "zz" + rb.tx_hex[5]}},           // not hex
+        nlohmann::json(nullptr),                                 // not an entry
+    };
+    for (const auto& b : bad) {
+        DashWorkData w;
+        EXPECT_THROW(dash::coin::append_gbt_transactions(nlohmann::json::array({good, b}), w),
+                     std::runtime_error) << b.dump();
+        EXPECT_TRUE(w.m_tx_hashes.empty() && w.m_tx_data_hex.empty() && w.m_txs.empty() &&
+                    w.m_tx_fees.empty()) << b.dump();
+    }
+}
+
+// A "hash" that is not a 64-char hex id is treated as absent (the bytes decide)
+// and reported.
+TEST(DashGbtStableTxid, MalformedHashIsTreatedAsAbsentAndReported)
+{
+    const auto& rb = block_1599900();
+    const std::string full = rb.dashd_txids[5].GetHex();
+    const std::vector<nlohmann::json> malformed = {
+        nlohmann::json("00"), nlohmann::json(full.substr(0, 63)), nlohmann::json(full + "00"),
+        nlohmann::json("g" + full.substr(1)), nlohmann::json(7)};
+    for (const auto& h : malformed) {
+        DashWorkData w;
+        const auto rep = dash::coin::append_gbt_transactions(
+            nlohmann::json::array({{{"data", rb.tx_hex[5]}, {"hash", h}}}), w);
+        ASSERT_EQ(w.m_tx_hashes.size(), 1u) << h.dump();
+        EXPECT_EQ(w.m_tx_hashes[0], rb.dashd_txids[5]) << h.dump();
+        ASSERT_EQ(rep.bad_hashes.size(), 1u) << h.dump();
+        EXPECT_EQ(rep.bad_hashes[0].index, 0u);
+        EXPECT_TRUE(rep.disagreements.empty()) << h.dump();
+    }
+}
+
+// "txid" next to a differing "hash" is reported; "hash" is served.
+TEST(DashGbtStableTxid, TxidThatDiffersFromHashIsReportedHashServed)
+{
+    const auto& rb = block_1599900();
+    const uint256 instance = sha256d_bytes(ParseHex(rb.tx_hex[5]));
     DashWorkData w;
-    nlohmann::json txs = nlohmann::json::array({rb.tx_hex[5], {{"data", ""}}, {{"hash", "00"}}});
-    dash::coin::append_gbt_transactions(txs, w);
-    ASSERT_EQ(w.m_tx_hashes.size(), 1u);   // the two entries without bytes are skipped
+    const auto rep = dash::coin::append_gbt_transactions(
+        nlohmann::json::array({
+            {{"data", rb.tx_hex[5]}, {"hash", rb.dashd_txids[5].GetHex()}, {"txid", instance.GetHex()}},
+            {{"data", rb.tx_hex[1]}, {"hash", rb.dashd_txids[1].GetHex()}, {"txid", rb.dashd_txids[1].GetHex()}}}),
+        w);
+    ASSERT_EQ(w.m_tx_hashes.size(), 2u);
     EXPECT_EQ(w.m_tx_hashes[0], rb.dashd_txids[5]);
+    EXPECT_EQ(w.m_tx_hashes[1], rb.dashd_txids[1]);
+    ASSERT_EQ(rep.txid_hash_mismatches.size(), 1u);
+    EXPECT_EQ(rep.txid_hash_mismatches[0].index, 0u);
+    EXPECT_EQ(rep.txid_hash_mismatches[0].txid, instance);
+    EXPECT_EQ(rep.txid_hash_mismatches[0].hash, rb.dashd_txids[5]);
 }
 
 // ── The embedded-vs-dashd tx-root xcheck compares like with like ─────────────
@@ -449,6 +516,69 @@ TEST(DashGbtStableTxid, TemplateStoreReuseRejectsAResignedUnlock)
     ASSERT_EQ(prev.m_tx_hashes, next.m_tx_hashes);
     EXPECT_TRUE(dash::coin::template_tx_hex_reusable(prev, same));
     EXPECT_FALSE(dash::coin::template_tx_hex_reusable(prev, next));
+}
+
+// ── ProducerJobCache: a re-signed unlock at the same tip is a miss ──────────
+// The cached gentx's CbTx commits the unlock instances it was built over
+// (merkleRootAssetUnlocks). A template on the same tip with the same txids but
+// a re-signed unlock carries another CbTx payload: the cache must not serve the
+// old gentx with the new bodies.
+TEST(DashGbtStableTxid, ProducerJobCacheMissesOnAResignedUnlock)
+{
+    using dash::mint::ProducerJobCache;
+    using namespace std::chrono_literals;
+    const auto& rb = block_1599900();
+
+    // The real CbTx v4 payload of block 1599900 commits the instance hashes.
+    const auto& cb = rb.block.m_txs[0];
+    dash::coin::vendor::CCbTx cbtx;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(cb.extra_payload, cbtx));
+    ASSERT_GE(cbtx.nVersion, dash::coin::vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS);
+    EXPECT_EQ(cbtx.merkleRootAssetUnlocks,
+              dash::coin::compute_merkle_root_asset_unlocks(rb.block.m_txs));
+
+    // The same block with unlock 5 re-signed: same txids, another unlock root.
+    auto resigned_txs = rb.block.m_txs;
+    { PackStream s(ParseHex(resigned(rb.tx_hex[5]))); s >> resigned_txs[5]; }
+    const uint256 new_root = dash::coin::compute_merkle_root_asset_unlocks(resigned_txs);
+    ASSERT_NE(new_root, cbtx.merkleRootAssetUnlocks);
+    std::vector<unsigned char> payload_new(cb.extra_payload.begin(), cb.extra_payload.end());
+    {
+        const auto* old_b = cbtx.merkleRootAssetUnlocks.data();
+        auto it = std::search(payload_new.begin(), payload_new.end(), old_b, old_b + 32);
+        ASSERT_NE(it, payload_new.end());
+        std::copy(new_root.data(), new_root.data() + 32, it);
+    }
+
+    std::vector<std::string> bodies_old(rb.tx_hex.begin() + 1, rb.tx_hex.end());
+    std::vector<std::string> bodies_new = bodies_old;
+    bodies_new[4] = resigned(rb.tx_hex[5]);
+    DashWorkData wd_old = template_with(bodies_old);
+    DashWorkData wd_new = template_with(bodies_new);
+    ASSERT_EQ(wd_old.m_tx_hashes, wd_new.m_tx_hashes);
+    for (DashWorkData* w : {&wd_old, &wd_new}) {
+        w->m_previous_block = rb.block.m_previous_block;
+        w->m_height         = 1599900;
+        w->m_payment_amount = 12345;
+    }
+    wd_old.m_coinbase_payload.assign(cb.extra_payload.begin(), cb.extra_payload.end());
+    wd_new.m_coinbase_payload.assign(payload_new.begin(), payload_new.end());
+
+    auto build = std::make_shared<dash::mint::ProducerJobBuild>();
+    build->frozen.payment_amount    = wd_old.m_payment_amount;
+    build->frozen.desired_tx_hashes = wd_old.m_tx_hashes;
+    build->frozen.coinbase_payload.assign(wd_old.m_coinbase_payload.begin(),
+                                          wd_old.m_coinbase_payload.end());
+    const auto t0 = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    const ProducerJobCache::Key key{uint256S("11"), {0x76, 0xa9}};
+
+    ProducerJobCache cache;
+    cache.store(key, build, wd_old.m_previous_block, wd_old.m_height, t0);
+    EXPECT_EQ(cache.find(key, wd_new, t0 + 1s).outcome, ProducerJobCache::Outcome::drift)
+        << "a re-signed unlock at the same tip must not hit the old gentx";
+    cache.store(key, build, wd_old.m_previous_block, wd_old.m_height, t0);
+    EXPECT_EQ(cache.find(key, wd_old, t0 + 1s).outcome, ProducerJobCache::Outcome::hit)
+        << "the template the gentx was built over still hits";
 }
 
 } // namespace
